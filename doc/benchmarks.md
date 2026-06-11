@@ -27,9 +27,18 @@ the deployment most apps run today.
   plaintext 26-37% lower while leaving Puma's number unchanged.
 - Identical app for every server (`bench/bench_app.rb`), Ractor-shareable
   so Kino's `:ractor` mode can run it unmodified.
-- Topology held equal: Puma 8 forked workers × 3 threads vs Kino
-  8 workers × 3 threads in one process.
-- Follow-up studies (`bench/studies.sh`): CPU recipe, topology sweep,
+- Topology: each server at its shipped defaults—Puma 8 forked workers
+  × 3 threads (24 slots) vs Kino 8 workers in one process (× 1 thread
+  in ractor modes, the default since 0.1.1; × 3 threads in threaded
+  mode). Equal-topology numbers (Kino at 8×3) are in the studies below.
+- The headline tables also carry an io-tuned column (`workers 32,
+  threads 1`)—not a default, labeled as such—because the /io rows are
+  a slot-count story (see below).
+- The dataset spans three identical boxes: the original measurements,
+  a full re-measure at the 0.1.1 defaults, and the final headline
+  sweep. Equal-config numbers reproduced across boxes within ~1-2%
+  throughout.
+- Follow-up studies (`bench/studies.sh`): CPU tuning, topology sweep,
   /io worker scaling, logging costs, and memory—run in the same session
   as the headline tables.
 - The harness waits for the port to be genuinely free between targets.
@@ -46,41 +55,51 @@ the deployment most apps run today.
 ## Reading the headline tables
 
 - **Plaintext/10k**: Kino's tokio front-end clears the fork cluster by
-  1.4-2× (lanes plaintext 241,501 vs Puma 117,838 = 2.05×; the smallest
-  margin is threaded /10k at 1.44×). The cross-ractor handoff shows up
-  as ractor (201k) trailing threaded (218k) on trivial handlers—nothing
-  in them needs parallel Ruby—and lane dispatch reverses that (241k).
-- **CPU (recursive fib)**: ractor mode does **5× its own GVL-bound
-  threaded mode** (66,735 vs 13,298)—that's the entire point of
-  ractors—and beats the fork cluster outright: +15% with stock
-  defaults, +21% with lanes (70,373 vs 58,207).
-- **Memory**: serving the same loaded bench app, Kino held **57 MB
-  (ractor) / 50 MB (threaded)** where the 8-worker cluster held
-  **1,078 MB**—a fork per core pays one full copy of the VM, the app,
-  and its YJIT-compiled code per worker. On the Rails hello-world:
-  Kino 97 MB vs cluster 797 MB.
+  1.5-2.1× (lanes plaintext 244,340 vs Puma 118,190 = 2.07×; the
+  smallest margin is threaded /10k at 1.49×). At the old 3-thread
+  topology the cross-ractor handoff showed up as ractor trailing
+  threaded on trivial handlers; the 1-thread default reverses that
+  (ractor 230k vs threaded 218k) and lanes widen it (244k).
+- **CPU (recursive fib)**: ractor mode does **5.7× its own GVL-bound
+  threaded mode** (76,922 vs 13,499)—that's the entire point of
+  ractors—and beats the fork cluster outright: +32% with stock
+  defaults (+25% with lanes, 73,136 vs 58,337). Even the io-tuned
+  `workers 32` topology stays ahead of the cluster on CPU (62,406).
+- **Memory**: after serving the full endpoint battery, Kino held
+  **80 MB** (ractor or lanes, default topology) where the 8-worker
+  cluster held **1,256 MB**—a fork per core pays one full copy of the
+  VM, the app, and its YJIT-compiled code per worker. On the Rails
+  hello-world: Kino 97 MB vs cluster 797 MB. Threaded mode under the
+  same battery needs a malloc note; see
+  [Memory under load](#memory-under-load-and-the-glibc-arena-footgun).
 - **I/O (5 ms wait)**: all dispatch models tie within ~4% at equal slot
-  counts; the lever that matters is slot count, see
-  [below](#why-io-lags-in-ractor-mode-on-linux).
+  counts, so the default columns show the ractor modes behind on /io
+  (8 slots vs the cluster's 24), and the `workers 32` column shows the
+  same engine winning (+27%, +34% via `Kino.sleep`) once it has more
+  slots than the cluster. The lever is slot count, and Kino slots are
+  cheap: see [below](#why-io-lags-in-ractor-mode-on-linux).
 
 ## CPU-bound tuning
 
-On real hardware, Kino's stock defaults already lead the cluster on
-pure CPU—same-session studies run:
+On real hardware, Kino's stock defaults lead the cluster on pure
+CPU—and the old tuning recipe is now obsolete. Same-session studies
+run:
 
 | config | /cpu req/s |
 |---|---:|
-| Puma cluster (reference) | 58,376 |
-| Kino `workers 8, threads 3`, tokio auto (the default at the time) | 68,257 |
-| Kino `workers 8, threads 1, tokio_threads 1` (recipe) | 68,629 |
+| Puma cluster (reference) | 58,505 |
+| Kino `workers 8, threads 3` (the default before 0.1.1) | 67,111 |
+| Kino `workers 8, threads 1, tokio_threads 1` (the old recipe) | 68,638 |
+| Kino `workers 8, threads 1`, tokio auto (**the default**) | **78,175** |
 
-The tuned recipe is a wash (+0.5%)—and it still costs plaintext
-(112,815 vs ~200k) and /io (1,532, 8 slots): on this hardware there is
-no reason to use it. **This is a finding that changed with the
-environment**: in the earlier Docker-on-Mac runs the recipe was worth
-+12%, because tokio threads and wake churn competed for oversubscribed
-virtualized cores. If you deploy into a constrained/virtualized
-environment, the recipe may still pay; measure there.
+The `threads 1` half of the old recipe became the default; the
+`tokio_threads 1` half now *costs* −12% on /cpu (and still costs
+plaintext: 107,743 vs 230k). Don't pin tokio threads. **The recipe's
+history is an environment story**: in the earlier Docker-on-Mac runs it
+was worth +12%, because tokio threads and wake churn competed for
+oversubscribed virtualized cores; on dedicated cores the same pin
+starves the I/O front-end instead. If you deploy into a
+constrained/virtualized environment, measure there.
 
 Two findings that survived the environment change:
 
@@ -99,8 +118,9 @@ Parallelism for CPU-bound Ruby comes from ractors or forks, nothing else.
 
 ## Why /io lags in ractor mode on Linux
 
-On bare metal the gap is small: ractor /io 4,527 vs threaded 4,715
-(−4%). In Docker it was −18%, and a pure-Ruby probe there measured
+On bare metal the gap is small at equal slot counts: ractor /io 4,531
+vs threaded 4,725 (−4%, both at 8×3). In Docker it was −18%, and a
+pure-Ruby probe there measured
 `sleep(0.005)` waking +2.3-2.8 ms late inside ractors vs +1.8 ms on the
 main ractor—non-main-ractor timer wakeups are coarser in Ruby 4.0, but
 how much that costs depends heavily on the kernel/virtualization stack.
@@ -110,14 +130,19 @@ A follow-up probe showed `IO.select`-style waits are tighter than
 **Mitigation 1—`Kino.sleep`:** releases the GVL and waits on the OS
 clock directly (chunked, so `Thread#kill`/shutdown stay responsive). The
 `/io_native` endpoint (same 5 ms wait via `Kino.sleep` when available)
-erases the remaining ractor gap on this box: 4,714 vs 4,527 plain sleep.
+erases the remaining ractor gap on this box: 4,721 vs 4,531 plain sleep.
 
-**Mitigation 2—add workers; they're nearly free.** Wait-bound
-throughput is simply `slots ÷ effective wait`, and Kino's slots cost ~a
-thread each, not a forked process: `workers 32, threads 1` measured
-**5,922 /io (+27% over the 24-thread cluster's 4,672) and 6,254
-/io_native (+34%)**, still one small process. A fork cluster buying the
-same 32 slots pays for them in full copies of the app.
+**Mitigation 2—add workers; they're nearly free.** The headline tables
+show default ractor-mode /io at 1,548: that's 8 slots (the 1-thread
+default) against the cluster's 24, because wait-bound throughput is
+simply `slots ÷ effective wait`. Kino's slots cost ~a thread each, not
+a forked process: the `workers 32, threads 1` column measured **5,935
+/io (+27% over the 24-thread cluster's 4,687) and 6,289 /io_native
+(+34%)**, still one small process, and still +7% ahead of the cluster
+on pure CPU. Its cost is the CPU-light rows (156k plaintext vs 230k at
+8×1: 32 ractors oversubscribe 8 cores). A fork cluster buying the same
+32 slots pays for them in full copies of the app; Kino pays in
+scheduler churn only where the cores are already saturated.
 
 ## The ractor-pool-wrapper comparison
 
@@ -127,11 +152,11 @@ already run. `bench/ractor_wrapper.rb` is that experiment, benchmarked on
 Puma and Falcon—not as a comparison of those servers, but to measure
 what the Rack-level hop itself costs (c7a.2xlarge, same session):
 
-| endpoint   | Kino :ractor | Puma + wrapper | Falcon + wrapper |
-|------------|-------------:|---------------:|-----------------:|
-| /plaintext |      201,472 |         19,425 |          100,624 |
-| /cpu (fib) |       66,735 |         17,106 |           49,083 |
-| /io (5 ms) |        4,527 |          1,447 |            1,549 |
+| endpoint   | Kino :ractor (8×3) | Puma + wrapper | Falcon + wrapper |
+|------------|-------------------:|---------------:|-----------------:|
+| /plaintext |            199,032 |         19,532 |          100,342 |
+| /cpu (fib) |             68,238 |         17,323 |           48,561 |
+| /io (5 ms) |              4,531 |          1,452 |            1,544 |
 
 Inside the Rack contract, the wrapper must reduce the env to a shareable
 subset, copy it to the worker ractor, copy the response back, and hold a
@@ -190,6 +215,32 @@ needs its `disable_initial_exec_tls` build flag just to load (dlopen +
 initial-exec TLS = `cannot allocate memory in static TLS block`)—one
 more reason to prefer mimalloc in dlopen'd extensions.
 
+## Memory under load (and the glibc arena footgun)
+
+RSS after serving the full endpoint battery (8 s each of /plaintext,
+/10k, /cpu, /io—a "warmed production process", not a fresh boot, which
+measures 26-27 MB for every Kino mode):
+
+| config | RSS loaded |
+|---|---:|
+| Kino :ractor 8×1 (default) | **80 MB** |
+| Kino lanes 8×1 | **80 MB** |
+| Kino :ractor 8×3 | 115 MB |
+| Kino :threaded 8×3 | 612 MB¹ |
+| Puma cluster 8×3 | 1,256 MB |
+
+¹ Not a leak: glibc malloc arena bloat. One 8-second /10k round takes
+threaded mode from 69 MB to ~800 MB and it never returns—24 threads
+churning 10 KB strings through one process heap is the textbook glibc
+arena-fragmentation case (the reason Rails ops set `MALLOC_ARENA_MAX=2`;
+Heroku ships that default). With `MALLOC_ARENA_MAX=2` the same battery
+ends at **151 MB** with throughput unchanged (165,993 vs 157,177 /10k,
+if anything faster). Ractor mode sidesteps the worst of it without any
+env tweak—objects live in per-ractor heaps, and repeated runs landed at
+80-124 MB regardless of arena settings. Puma's 1,256 MB barely moves
+under the cap (1,237 MB): its cost is eight full copies of the warmed
+VM, not arenas.
+
 ## Run-to-run variance (a.k.a. "is this a regression?")
 
 Rule of thumb from chasing this twice: never compare numbers from
@@ -197,21 +248,32 @@ different sessions; interleave A/B rounds in one session instead. The
 Docker-on-Mac environment swung ±10% on /cpu between sessions with the
 VM's mood; the dedicated c7a box is far steadier (same-session repeats
 land within ~1-2%), but the discipline stays—every comparative claim in
-these docs comes from same-session pairs.
+these docs comes from same-session pairs. Cross-box repeatability got
+its own test: the dataset was measured across three identical
+c7a.2xlarge boxes, and equal-config throughput numbers matched within
+~1-2% (loaded-RSS measurements swing far more with heap-growth
+timing—treat memory numbers as ballpark). The same discipline caught one fluke: a sweep round once
+posted threaded plaintext 28% low; interleaved re-runs minutes later
+put it back—suspect cells get re-measured, not published.
 
 ## Topology notes
 
-Measured on c7a.2xlarge, plaintext, ractor mode, same session: `8×3`
-(workers×threads) = 199,470, `8×1` = **232,469 (+17%)**, `16×1` =
-214,284. Threads inside one ractor share its lock, so every request
-handled by a 3-thread ractor pays a lock handoff that a 1-thread ractor
-doesn't (`perf` in the earlier Docker sessions attributed ~10% of cycles
-to `rb_native_mutex_unlock`/`thread_sched_wakeup_next_thread` at 8×3;
-the +17% reproduces exactly on real hardware). Threads-per-ractor exist
-for handlers that block on I/O; if yours don't, run `threads 1` and let
-workers = cores do the parallelism. (16×1 being worse than 8×1 also says
-the shared MPMC queue is *not* the bottleneck—8 extra parked consumers
-just add scheduler churn.)
+Measured on c7a.2xlarge, plaintext, ractor mode, same session (three
+interleaved rounds, medians): `8×3` (workers×threads) = 200,048, `8×1`
+= **232,173 (+16%)**, `16×1` = 214,570. Threads inside one ractor share
+its lock, so every request handled by a 3-thread ractor pays a lock
+handoff that a 1-thread ractor doesn't (`perf` in the earlier Docker
+sessions attributed ~10% of cycles to
+`rb_native_mutex_unlock`/`thread_sched_wakeup_next_thread` at 8×3; the
+gain reproduced on two separate boxes, +16-17% each). **This is why
+`threads` defaults to 1 in ractor mode since 0.1.1** (/cpu gains +18%
+the same way: 80,409 vs 68,132). The trade-off is /io at low worker
+counts: 1,534 at 8×1 vs 4,486 at 8×3—threads-per-ractor exist for
+handlers that block on I/O. If yours wait a lot, raise `workers`
+instead (32×1 beats even the 24-slot cluster, see above); slots are
+cheap. (16×1 being worse than 8×1 on plaintext also says the shared
+MPMC queue is *not* the bottleneck—8 extra parked consumers just add
+scheduler churn.)
 
 ## What profiling tried and rejected
 
@@ -239,23 +301,27 @@ safeguards: lane depth is capped at 4, and workers steal from siblings
 before parking (plus on every park tick), so a slow request can't strand
 its lane's backlog.
 
-Same-session A/B on c7a.2xlarge (ractor mode):
+Same-session A/B on c7a.2xlarge, ractor mode at the default topology
+(8×1):
 
 | endpoint | shared queue | lanes | delta |
 |----------|-------------:|------:|------:|
-| /plaintext | 201,472 | **241,501** | **+20%** |
-| /10k | 156,635 | 183,564 | +17% |
-| /cpu | 66,735 | 70,373 | +5% |
-| /io | 4,527 | 4,530 | flat |
+| /plaintext | 230,547 | **250,395** | **+9%** |
+| /10k | 182,788 | 198,301 | +8% |
+| /cpu | **78,175** | 73,345 | −6% |
+| /io | 1,550 | 1,550 | flat |
 
-On this hardware lanes make ractor mode the fastest Kino configuration
-outright—+11% over threaded mode's plaintext, where the shared queue
-trails it. (On loopback-bound macOS, lanes lose a few percent instead;
-see the secondary table below.) It stays opt-in for now because overload
-semantics differ from the shared queue (`queue_depth` doesn't apply;
-capacity is lanes × 4 with brief dispatcher retries up to
-`queue_timeout` before the 503), and crash semantics, stealing fairness,
-and drain behavior have spec coverage but not production mileage.
+Lanes' margin shrank with the move to 1-thread workers (at the old 8×3
+it was +21% plaintext: 240,193 vs 199,032 in the same session)—most of
+the futex pain lanes were built to avoid came from thread handoffs
+inside each ractor, and the new default removes those for everyone. At
+the default, lanes still post the fastest plaintext/10k of any Kino
+configuration, but plain shared-queue now takes /cpu. It stays opt-in because overload semantics differ from the
+shared queue (`queue_depth` doesn't apply; capacity is lanes × 4 with
+brief dispatcher retries up to `queue_timeout` before the 503), and
+crash semantics, stealing fairness, and drain behavior have spec
+coverage but not production mileage. (On loopback-bound macOS, lanes
+lose a few percent instead; see the secondary table below.)
 
 ## Logging costs
 
@@ -265,11 +331,11 @@ typical costs):
 
 | case (8×3, same session) | req/s |
 |---|---:|
-| threaded, no logging | 217,113 |
-| threaded, `log_requests true` (native access log) | 193,200 (−11%) |
-| ractor, access log off / on | 198,624 / 183,565 (−8%) |
-| app logs 1 line/req via shared `::Logger` (file) | **62,962** |
-| app logs 1 line/req via `Kino::Logger` (file) | **150,810 (2.4×)** |
+| threaded, no logging | 217,377 |
+| threaded, `log_requests true` (native access log) | 193,493 (−11%) |
+| ractor, access log off / on | 200,478 / 184,357 (−8%) |
+| app logs 1 line/req via shared `::Logger` (file) | **62,917** |
+| app logs 1 line/req via `Kino::Logger` (file) | **149,237 (2.4×)** |
 
 The shared-`::Logger` cost is the mutex: 24 worker threads serialize
 through one lock plus a write syscall per line. `Kino::Logger` hands the
