@@ -6,6 +6,7 @@
 --embed-mixins
 lib/**/*.rb
 -
+doc/why-kino.md
 doc/architecture.md
 doc/benchmarks.md
 doc/rails-on-ractors.md
