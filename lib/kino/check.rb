@@ -20,7 +20,7 @@ module Kino
 
     # One named blocker: a path into the object graph plus what is wrong
     # there.
-    Finding = Struct.new(:path, :message, keyword_init: true) do
+    Finding = Struct.new(:path, :message) do
       # @return [String] "path — message", as printed by the CLI
       def to_s
         "#{path} — #{message}"
