@@ -71,7 +71,7 @@ pure CPU—same-session studies run:
 | config | /cpu req/s |
 |---|---:|
 | Puma cluster (reference) | 58,376 |
-| Kino `workers 8, threads 3`, tokio auto (default) | 68,257 |
+| Kino `workers 8, threads 3`, tokio auto (the default at the time) | 68,257 |
 | Kino `workers 8, threads 1, tokio_threads 1` (recipe) | 68,629 |
 
 The tuned recipe is a wash (+0.5%)—and it still costs plaintext

@@ -12,7 +12,7 @@ module Kino
       bind: "127.0.0.1",
       port: 0,
       workers: nil, # resolved to Etc.nprocessors in #to_h
-      threads: 3,
+      threads: nil, # resolved per mode in Server: 1 in :ractor, 3 in :threaded
       mode: :auto,
       queue_depth: 1024,
       queue_timeout: 1.0,
@@ -144,7 +144,8 @@ module Kino
       # Worker count (ractors in :ractor mode); defaults to CPU cores.
       def workers(count) = @config.set(:workers, Integer(count))
 
-      # Threads per worker (I/O concurrency inside one ractor).
+      # Threads per worker (I/O concurrency inside one ractor); default is
+      # mode-dependent: 1 in :ractor mode, 3 in :threaded.
       def threads(count) = @config.set(:threads, Integer(count))
 
       # Dispatch mode: :auto, :ractor, or :threaded.

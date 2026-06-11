@@ -21,8 +21,30 @@ RSpec.describe Kino::Configuration do
 
     expect(config[:bind]).to eq("127.0.0.1")
     expect(config[:port]).to eq(0)
-    expect(config[:threads]).to eq(3)
+    expect(config[:threads]).to be_nil # resolved per mode in Server
     expect(config[:mode]).to eq(:auto)
+  end
+
+  describe "mode-dependent threads default" do
+    it "defaults to 1 thread per worker in :ractor mode" do
+      app = Ractor.shareable_proc { |_env| [200, {}, []] }
+      server = Kino::Server.new(app, mode: :ractor)
+
+      expect(server.stats[:threads]).to eq(1)
+    end
+
+    it "defaults to 3 threads per worker in :threaded mode" do
+      server = Kino::Server.new(->(_env) { [200, {}, []] }, mode: :threaded)
+
+      expect(server.stats[:threads]).to eq(3)
+    end
+
+    it "lets an explicit threads setting win in any mode" do
+      app = Ractor.shareable_proc { |_env| [200, {}, []] }
+      server = Kino::Server.new(app, mode: :ractor, threads: 4)
+
+      expect(server.stats[:threads]).to eq(4)
+    end
   end
 
   it "loads a Puma-style DSL file" do

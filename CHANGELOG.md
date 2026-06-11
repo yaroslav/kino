@@ -1,3 +1,10 @@
+## [0.1.1] - Unreleased
+
+- Mode-dependent `threads` default: 1 per worker in :ractor mode (threads
+  inside a ractor share its lock and cost a per-request handoff; measured
+  ~+20% on fast handlers), 3 in :threaded mode. Explicit `threads` always
+  wins; waiting-heavy ractor apps should raise `workers` instead.
+
 ## [0.1.0] - 2026-06-11
 
 Initial release.

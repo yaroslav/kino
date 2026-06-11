@@ -41,8 +41,12 @@ module Kino
       @bind = settings[:bind]
       @requested_port = settings[:port]
       @workers = Integer(settings[:workers])
-      @threads = Integer(settings[:threads])
       @mode = resolve_mode(settings[:mode])
+      # Default threads per mode: 1 in :ractor (threads inside a ractor
+      # share its lock; a measured +17% on fast handlers; raise `workers`
+      # for I/O concurrency instead), 3 in :threaded (threads ARE the
+      # concurrency there).
+      @threads = Integer(settings[:threads] || ((@mode == :ractor) ? 1 : 3))
       @queue_depth = Integer(settings[:queue_depth])
       @queue_timeout_ms = (Float(settings[:queue_timeout]) * 1000).round
       @request_timeout_ms = settings[:request_timeout] ? (Float(settings[:request_timeout]) * 1000).round : 0
