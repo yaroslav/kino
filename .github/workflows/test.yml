@@ -1,0 +1,43 @@
+name: Test
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    name: Ruby ${{ matrix.ruby }} on ${{ matrix.os }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        # No Windows: Kino's signal handling (SIGUSR1 stats, INT/TERM drain)
+        # and Ractor scheduling are only exercised on POSIX platforms.
+        os: [ubuntu-latest, macos-latest]
+        ruby: ["4.0"]
+
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Set up Ruby & Rust
+        uses: oxidize-rb/actions/setup-ruby-and-rust@v1
+        with:
+          ruby-version: ${{ matrix.ruby }}
+          bundler-cache: true
+          cargo-cache: true
+
+      - name: Compile native extension
+        run: bundle exec rake compile
+
+      - name: Run Rust unit tests
+        run: bundle exec rake cargo_test
+
+      - name: Run specs
+        run: bundle exec rake spec
+
+      - name: Validate RBS signatures
+        run: bundle exec rake rbs_validate

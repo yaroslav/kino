@@ -1,0 +1,10 @@
+# frozen_string_literal: true
+
+source "https://rubygems.org"
+
+# Edge Rails: the Ractor-shareability work (shims merged 2026-05, AR
+# freeze/constantize in progress) only exists on main.
+gem "rails", github: "rails/rails", branch: "main"
+
+gem "kino", path: "../.."
+gem "puma"

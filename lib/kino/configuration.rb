@@ -1,0 +1,190 @@
+# frozen_string_literal: true
+
+require "etc"
+
+module Kino
+  # Server settings with Puma-style precedence:
+  #   explicit Server.new kwargs > config file DSL > defaults.
+  class Configuration
+    # Every setting and its default; the full reference lives in the
+    # generated sample config (`kino --init`).
+    DEFAULTS = {
+      bind: "127.0.0.1",
+      port: 0,
+      workers: nil, # resolved to Etc.nprocessors in #to_h
+      threads: 3,
+      mode: :auto,
+      queue_depth: 1024,
+      queue_timeout: 1.0,
+      request_timeout: nil,
+      batch: 1,
+      lanes: false,
+      log_requests: false,
+      shutdown_timeout: 30,
+      tokio_threads: nil,
+      tls: nil,
+      environment: nil,
+      pidfile: nil,
+      rackup: nil
+    }.freeze
+
+    # The known setting names.
+    SETTINGS = DEFAULTS.keys.freeze
+
+    # Source template for {.sample}.
+    SAMPLE_TEMPLATE = File.expand_path("templates/kino.rb.tt", __dir__)
+
+    # The fully-commented sample config (see `kino --init`).
+    # @return [String]
+    def self.sample
+      File.read(SAMPLE_TEMPLATE)
+    end
+
+    # Write the sample config to +path+. Refuses to clobber an existing
+    # file unless force: true.
+    #
+    # @param path [String]
+    # @param force [Boolean] overwrite an existing file
+    # @return [String] the path written
+    # @raise [Kino::Error] when the file exists and force is false
+    def self.write_sample(path, force: false)
+      if File.exist?(path) && !force
+        raise Error, "#{path} already exists (use force: true to overwrite)"
+      end
+
+      File.write(path, sample)
+      path
+    end
+
+    def initialize
+      @values = {}
+    end
+
+    # @param key [Symbol] a key from DEFAULTS
+    # @return [Object] the explicit value, or the default
+    def [](key)
+      @values.fetch(key) { DEFAULTS.fetch(key) }
+    end
+
+    # @param key [Symbol] a key from DEFAULTS
+    # @param value [Object]
+    # @raise [ArgumentError] for unknown settings
+    def set(key, value)
+      raise ArgumentError, "unknown setting #{key.inspect}" unless DEFAULTS.key?(key)
+
+      @values[key] = value
+    end
+
+    # @return [Boolean] whether the key was explicitly set
+    def set?(key)
+      @values.key?(key)
+    end
+
+    # Load a config file (Ruby DSL) into this configuration.
+    # @param path [String]
+    # @return [self]
+    # @raise [Kino::Error] when the file does not exist
+    def load_file(path)
+      raise Error, "config file not found: #{path}" unless File.exist?(path)
+
+      DSL.new(self).instance_eval(File.read(path), path, 1)
+      self
+    end
+
+    # Explicit kwargs win over everything already set.
+    # @param options [Hash{Symbol => Object}]
+    # @return [self]
+    def merge!(options)
+      options.each { |key, value| set(key, value) }
+      self
+    end
+
+    # @return [Hash{Symbol => Object}] every setting, defaults filled in
+    def to_h
+      SETTINGS.to_h { |key| [key, self[key]] }.tap do |h|
+        h[:workers] ||= Etc.nprocessors
+      end
+    end
+
+    # The settings Server.new accepts: everything except the keys only the
+    # CLI consumes (rackup file selection, RACK_ENV).
+    # @return [Hash{Symbol => Object}]
+    def server_options
+      to_h.except(:rackup, :environment)
+    end
+
+    # The config-file DSL, deliberately Puma-shaped:
+    #
+    #   # kino.rb
+    #   bind "0.0.0.0"
+    #   port 9292
+    #   workers 8           # ractors (or thread groups in :threaded mode)
+    #   threads 3           # threads per worker
+    #   mode :ractor        # :auto | :ractor | :threaded
+    #   queue_depth 2048
+    #   queue_timeout 0.5
+    #   shutdown_timeout 15
+    #   tokio_threads 4
+    #   tls cert: "cert.pem", key: "key.pem"
+    #
+    # Every directive is documented in the generated sample config
+    # (`kino --init`); the one-liners here only state the value each
+    # directive expects.
+    class DSL
+      def initialize(config)
+        @config = config
+      end
+
+      # Address to listen on ("0.0.0.0" accepts non-local connections).
+      def bind(host) = @config.set(:bind, host)
+
+      # Port to listen on; 0 picks an ephemeral port.
+      def port(port) = @config.set(:port, Integer(port))
+
+      # Worker count (ractors in :ractor mode); defaults to CPU cores.
+      def workers(count) = @config.set(:workers, Integer(count))
+
+      # Threads per worker (I/O concurrency inside one ractor).
+      def threads(count) = @config.set(:threads, Integer(count))
+
+      # Dispatch mode: :auto, :ractor, or :threaded.
+      def mode(mode) = @config.set(:mode, mode.to_sym)
+
+      # Bounded request-queue depth; overflow earns clients a 503.
+      def queue_depth(depth) = @config.set(:queue_depth, Integer(depth))
+
+      # Seconds a request may wait for queue space before the 503.
+      def queue_timeout(seconds) = @config.set(:queue_timeout, Float(seconds))
+
+      # Seconds the app gets before the client receives a 504; nil = off.
+      def request_timeout(seconds) = @config.set(:request_timeout, seconds && Float(seconds))
+
+      # Requests a worker may grab per queue visit (default 1).
+      def batch(count) = @config.set(:batch, Integer(count))
+
+      # EXPERIMENTAL per-worker lane dispatch.
+      def lanes(enabled) = @config.set(:lanes, !!enabled)
+
+      # Native access log: one status-colored line per request to stdout.
+      def log_requests(enabled) = @config.set(:log_requests, !!enabled)
+
+      # Graceful-shutdown drain deadline in seconds.
+      def shutdown_timeout(seconds) = @config.set(:shutdown_timeout, seconds)
+
+      # Threads for the tokio (Rust I/O) runtime; default: one per core.
+      def tokio_threads(count) = @config.set(:tokio_threads, Integer(count))
+
+      # TLS termination; file paths or inline PEM strings.
+      def tls(cert:, key:) = @config.set(:tls, {cert: cert, key: key})
+
+      # Sets RACK_ENV (unless already set) before the CLI loads the app.
+      def environment(env) = @config.set(:environment, env.to_s)
+
+      # Write the master PID here on start.
+      def pidfile(path) = @config.set(:pidfile, path.to_s)
+
+      # Rackup file the `kino` CLI loads (positional argument wins).
+      def rackup(path) = @config.set(:rackup, path.to_s)
+    end
+  end
+end

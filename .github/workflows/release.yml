@@ -1,0 +1,240 @@
+name: Release
+
+# Triggered manually. Builds every platform gem from the current commit, and
+# (only if every build succeeds) creates a git tag, GitHub Release with
+# changelog and gems, and publishes to RubyGems.
+#
+# All precompiled gems are produced by rake-compiler-dock inside
+# ubuntu-latest runners; Darwin targets use the rake-compiler-dock osxcross
+# image. No Windows target: Kino's signal handling and Ractor scheduling
+# are POSIX-only.
+on:
+  workflow_dispatch:
+
+jobs:
+  # Read version from version.rb.
+  version:
+    runs-on: ubuntu-latest
+    outputs:
+      tag: ${{ steps.version.outputs.tag }}
+      version: ${{ steps.version.outputs.version }}
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Read version
+        id: version
+        run: |
+          VERSION=$(ruby -e "require_relative 'lib/kino/version'; print Kino::VERSION")
+          echo "tag=v${VERSION}" >> "$GITHUB_OUTPUT"
+          echo "version=${VERSION}" >> "$GITHUB_OUTPUT"
+
+  # Pure-Ruby source gem. Falls back to local Rust compile via extconf.rb
+  # when a user is on a platform without a precompiled gem.
+  source:
+    needs: version
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          ref: ${{ github.sha }}
+
+      - uses: ruby/setup-ruby@v1
+        with:
+          ruby-version: "4.0"
+          bundler-cache: true
+
+      - name: Build source gem
+        run: bundle exec rake build
+
+      - name: Smoke-test installed gem
+        run: |
+          cat > smoke.rb << 'EOF'
+          require "kino"
+          require "net/http"
+
+          app = ->(_env) { [200, {"content-type" => "text/plain"}, ["smoke"]] }
+          server = Kino::Server.new(app, mode: :threaded, workers: 1, threads: 1).start
+          response = Net::HTTP.get_response("127.0.0.1", "/", server.port)
+          unless response.code == "200" && response.body == "smoke" && response["server"] == "Kino"
+            abort "unexpected: #{response.code} #{response.body.inspect}"
+          end
+          server.shutdown
+          puts "smoke test passed"
+          EOF
+          gem install pkg/kino-*.gem
+          ruby smoke.rb
+
+      - uses: actions/upload-artifact@v7
+        with:
+          name: gems-source
+          path: pkg/*.gem
+
+  # Cross-compile every precompiled target inside rake-compiler-dock
+  # containers. Kino requires Ruby >= 4.0, so each gem carries one binary.
+  cross:
+    name: Cross ${{ matrix.platform }}
+    needs: version
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        platform:
+          - x86_64-linux
+          - aarch64-linux
+          - x86_64-linux-musl
+          - aarch64-linux-musl
+          - arm64-darwin
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          ref: ${{ github.sha }}
+
+      # Do NOT use `bundler-cache: true` here: it would populate
+      # ./vendor/bundle with gems compiled against the runner's glibc, which
+      # the older-glibc manylinux container then tries (and fails) to reuse.
+      # cross-gem installs `rb_sys` itself via `gem install`, so a host
+      # bundler cache is unnecessary.
+      - uses: ruby/setup-ruby@v1
+        with:
+          ruby-version: "4.0"
+
+      - uses: oxidize-rb/actions/cross-gem@v1
+        id: cross-gem
+        with:
+          platform: ${{ matrix.platform }}
+          ruby-versions: "4.0"
+
+      - uses: actions/upload-artifact@v7
+        with:
+          name: gems-${{ matrix.platform }}
+          path: ${{ steps.cross-gem.outputs.gem-path }}
+
+  # Smoke-test every precompiled gem on a matching runner/container: install
+  # it, boot a real server, make an HTTP request.
+  verify:
+    name: Verify ${{ matrix.platform }}
+    needs: cross
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - platform: x86_64-linux
+            runs_on: ubuntu-latest
+          - platform: aarch64-linux
+            runs_on: ubuntu-latest
+            docker_image: ruby:4.0-slim
+            docker_platform: linux/arm64
+          - platform: x86_64-linux-musl
+            runs_on: ubuntu-latest
+            docker_image: ruby:4.0-alpine
+            docker_platform: linux/amd64
+          - platform: aarch64-linux-musl
+            runs_on: ubuntu-latest
+            docker_image: ruby:4.0-alpine
+            docker_platform: linux/arm64
+          - platform: arm64-darwin
+            runs_on: macos-latest
+    runs-on: ${{ matrix.runs_on }}
+    steps:
+      - uses: actions/download-artifact@v8
+        with:
+          name: gems-${{ matrix.platform }}
+          path: pkg
+
+      # binfmt_misc handlers for QEMU: only needed when the docker platform
+      # differs from the ubuntu runner's native arch (linux/amd64).
+      - uses: docker/setup-qemu-action@v4
+        if: matrix.docker_platform == 'linux/arm64'
+        with:
+          platforms: arm64
+
+      - uses: ruby/setup-ruby@v1
+        if: ${{ !matrix.docker_image }}
+        with:
+          ruby-version: "4.0"
+
+      - name: Write smoke test
+        shell: bash
+        run: |
+          cat > smoke.rb << 'EOF'
+          require "kino"
+          require "net/http"
+
+          app = ->(_env) { [200, {"content-type" => "text/plain"}, ["smoke"]] }
+          server = Kino::Server.new(app, mode: :threaded, workers: 1, threads: 1).start
+          response = Net::HTTP.get_response("127.0.0.1", "/", server.port)
+          unless response.code == "200" && response.body == "smoke" && response["server"] == "Kino"
+            abort "unexpected: #{response.code} #{response.body.inspect}"
+          end
+          server.shutdown
+          puts "smoke test passed"
+          EOF
+
+      - name: Smoke-test gem (native)
+        if: ${{ !matrix.docker_image }}
+        shell: bash
+        run: |
+          gem install pkg/*.gem
+          ruby smoke.rb
+
+      - name: Smoke-test gem (docker)
+        if: ${{ matrix.docker_image }}
+        shell: bash
+        run: |
+          docker run --rm --platform=${{ matrix.docker_platform }} \
+            -v "$PWD:/work" -w /work \
+            ${{ matrix.docker_image }} \
+            sh -c 'gem install pkg/*.gem && ruby smoke.rb'
+
+  # Publish: create git tag + GitHub Release (atomic) + push to RubyGems via OIDC.
+  publish:
+    needs: [version, source, cross, verify]
+    runs-on: ubuntu-latest
+    environment: release
+    permissions:
+      contents: write
+      id-token: write
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          ref: ${{ github.sha }}
+
+      - uses: ruby/setup-ruby@v1
+        with:
+          ruby-version: "4.0"
+          bundler-cache: true
+
+      - uses: actions/download-artifact@v8
+        with:
+          pattern: gems-*
+          path: pkg
+          merge-multiple: true
+
+      - name: Extract changelog for this version
+        run: |
+          VERSION="${{ needs.version.outputs.version }}"
+          awk "/^## \[${VERSION}\]/{found=1; next} /^## \[/{if(found) exit} found{print}" \
+            CHANGELOG.md > /tmp/release_notes.md
+          cat /tmp/release_notes.md
+
+      # Creates the git tag at github.sha and the GitHub Release in one call.
+      # If this step fails, no tag is pushed; no orphan-tag risk.
+      - name: Create git tag and GitHub Release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh release create "${{ needs.version.outputs.tag }}" \
+            --target "${{ github.sha }}" \
+            --title "Kino ${{ needs.version.outputs.version }}" \
+            --notes-file /tmp/release_notes.md \
+            pkg/*.gem
+
+      - name: Configure RubyGems credentials
+        uses: rubygems/configure-rubygems-credentials@main
+
+      - name: Push gems to RubyGems
+        run: |
+          for gem in pkg/*.gem; do
+            echo "Pushing ${gem}"
+            gem push "${gem}"
+          done

@@ -1,0 +1,10 @@
+.git
+target
+tmp
+pkg
+doc
+examples
+lib/kino/*.bundle
+lib/kino/*.so
+*.log
+.rspec_status

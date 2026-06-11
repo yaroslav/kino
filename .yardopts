@@ -1,0 +1,13 @@
+--readme README.md
+--markup markdown
+--title "Kino"
+--output-dir doc/api
+--no-private
+--embed-mixins
+lib/**/*.rb
+-
+doc/architecture.md
+doc/benchmarks.md
+doc/rails-on-ractors.md
+CHANGELOG.md
+LICENSE.txt

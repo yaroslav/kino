@@ -1,0 +1,49 @@
+[package]
+name = "kino"
+version = "0.1.1"
+edition = "2021"
+authors = ["Yaroslav Markin <yaroslav@markin.net>"]
+license = "MIT"
+publish = false
+
+[lib]
+# rlib in addition to cdylib so `cargo test` can link unit tests.
+crate-type = ["cdylib", "rlib"]
+
+
+[dependencies]
+magnus = { version = "0.8.2", features = ["rb-sys"] }
+rb-sys = { version = "0.9", features = ["stable-api-compiled-fallback"] }
+flume = "0.11"
+parking_lot = "0.12"
+ahash = "0.8"
+smallvec = "1"
+lru = "0.12"
+mimalloc = { version = "0.1", default-features = false }
+tokio = { version = "1.45", features = ["rt-multi-thread", "net", "time", "sync", "io-util", "macros"] }
+hyper = { version = "1.6", features = ["http1", "server"] }
+hyper-util = { version = "0.1", features = ["server", "tokio", "http1"] }
+http = "1"
+http-body-util = "0.1"
+bytes = "1"
+httpdate = "1"
+# ring (not the default aws-lc-rs) as the rustls crypto provider: it
+# cross-compiles cleanly in rb-sys-dock containers, while aws-lc-sys wants
+# cmake and a per-target C toolchain.
+tokio-rustls = { version = "0.26", default-features = false, features = ["ring", "logging", "tls12"] }
+rustls-pemfile = "2.2"
+
+# musl's loader rejects initial-exec TLS in dlopen'd libraries ("initial-exec
+# TLS resolves to dynamic definition"); build the same mimalloc with the
+# local-dynamic TLS model there. glibc keeps the faster initial-exec model.
+[target.'cfg(target_env = "musl")'.dependencies]
+mimalloc = { version = "0.1", default-features = false, features = ["local_dynamic_tls"] }
+
+[build-dependencies]
+rb-sys-env = "0.2.2"
+
+[dev-dependencies]
+# Test binaries must resolve libruby symbols that the cdylib leaves
+# undefined (the host process provides them at runtime); feature
+# unification turns this on only for `cargo test`.
+rb-sys = { version = "0.9", features = ["link-ruby"] }

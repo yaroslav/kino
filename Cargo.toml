@@ -1,0 +1,15 @@
+# This Cargo.toml is here to let externals tools (IDEs, etc.) know that this is
+# a Rust project. Your extensions dependencies should be added to the Cargo.toml
+# in the ext/ directory.
+
+[workspace]
+members = ["./ext/kino"]
+resolver = "2"
+
+[profile.release]
+# Keep debug symbols in release builds so the final binary stays debuggable.
+debug = true
+opt-level = 3
+lto = "fat"
+codegen-units = 1
+incremental = false

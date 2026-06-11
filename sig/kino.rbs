@@ -1,0 +1,178 @@
+# Public interfaces only. Internals (Kino::Worker, Kino::RactorSupervisor,
+# Kino::Input, Kino::NullInput, Kino::ErrorsStream, Kino::Stream,
+# Kino::Native) are deliberately unsigned: they are implementation detail
+# and may change without notice.
+module Kino
+  VERSION: String
+
+  # Any Rack 3 application: responds to #call(env) with [status, headers, body].
+  type rack_app = untyped
+
+  type stats_hash = Hash[Symbol, untyped]
+
+  class Error < StandardError
+  end
+
+  # Raised when mode: :ractor is forced but the app is not Ractor-shareable.
+  class UnshareableAppError < Error
+  end
+
+  # High-resolution sleep on the OS clock with the GVL released.
+  def self.sleep: (Numeric seconds) -> nil
+
+  class Server
+    attr_reader port: Integer?
+    attr_reader mode: Symbol
+    attr_reader bind: String
+
+    def tls?: () -> bool
+
+    # Settings precedence: explicit kwargs > config_file DSL > defaults.
+    def initialize: (rack_app app, ?config_file: String?, **untyped options) -> void
+
+    def start: () -> self
+
+    # Graceful shutdown: drain to the deadline, then abort stragglers.
+    def shutdown: (?timeout: Numeric?) -> nil
+
+    def wait: () -> untyped
+
+    # Live snapshot: config echo plus native counters (queued, in_flight,
+    # served, rejected, timeouts, respawns, lane_depths when lanes are on).
+    def stats: () -> stats_hash
+
+    # Production entry point: start, banner, signal traps, block until done.
+    def self.run: (rack_app app, **untyped opts) -> Server
+
+    # INT/TERM drain gracefully (second signal force-exits); USR1 prints stats.
+    def self.trap_signals: (Server server) -> void
+  end
+
+  class Configuration
+    DEFAULTS: Hash[Symbol, untyped]
+    SETTINGS: Array[Symbol]
+    SAMPLE_TEMPLATE: String
+
+    # The fully commented sample config (see `kino --init`).
+    def self.sample: () -> String
+
+    # Write the sample config to path; raises Kino::Error if it exists
+    # unless force. Returns the path.
+    def self.write_sample: (String path, ?force: bool) -> String
+
+    def initialize: () -> void
+
+    def []: (Symbol key) -> untyped
+
+    # Raises ArgumentError for keys outside DEFAULTS.
+    def set: (Symbol key, untyped value) -> untyped
+
+    def set?: (Symbol key) -> bool
+
+    # Evaluate a Puma-style Ruby DSL config file into this configuration.
+    def load_file: (String path) -> self
+
+    def merge!: (Hash[Symbol, untyped] options) -> self
+
+    def to_h: () -> Hash[Symbol, untyped]
+
+    # to_h minus the CLI-only keys (:rackup, :environment); what Server.new
+    # accepts.
+    def server_options: () -> Hash[Symbol, untyped]
+
+    # The config-file DSL: one method per directive.
+    class DSL
+      def initialize: (Configuration config) -> void
+
+      def bind: (String host) -> untyped
+      def port: (int port) -> untyped
+      def workers: (int count) -> untyped
+      def threads: (int count) -> untyped
+      def mode: (Symbol | String mode) -> untyped
+      def queue_depth: (int depth) -> untyped
+      def queue_timeout: (Numeric seconds) -> untyped
+      def request_timeout: (Numeric? seconds) -> untyped
+      def batch: (int count) -> untyped
+      def lanes: (boolish enabled) -> untyped
+      def log_requests: (boolish enabled) -> untyped
+      def shutdown_timeout: (Numeric seconds) -> untyped
+      def tokio_threads: (int count) -> untyped
+      def tls: (cert: String, key: String) -> untyped
+      def environment: (String | Symbol env) -> untyped
+      def pidfile: (String path) -> untyped
+      def rackup: (String path) -> untyped
+    end
+  end
+
+  # The `kino` executable plus startup presentation shared with Server.run.
+  module CLI
+    MOTD: String
+
+    # Parse argv, then init/check/serve. Returns the process exit status
+    # (-v and -h print and exit in place per optparse convention).
+    def self.start: (Array[String] argv) -> Integer
+
+    # True when output to io may use ANSI styling.
+    def self.color?: (?IO io) -> bool
+
+    # Wrap text in an SGR code, resetting at the end; plain on non-color io.
+    def self.paint: (String code, String text, ?io: IO) -> String
+
+    def self.dim: (String text, ?io: IO) -> String
+
+    def self.bold: (String text, ?io: IO) -> String
+
+    def self.red: (String text, ?io: IO) -> String
+
+    # The banner with a vertical grayscale gradient.
+    def self.motd: (?color: bool) -> String
+
+    # One-line stats dump (the SIGUSR1 handler's output).
+    def self.stats_line: (stats_hash stats) -> String
+
+    # The two banner halves around Server#start.
+    def self.opening_credits: () -> void
+    def self.action!: (Server server) -> void
+
+    # Print a bold "Fin." when the process ends (idempotent).
+    def self.fin_at_exit: () -> void
+  end
+
+  # The shareability doctor behind `kino --check`.
+  module Check
+    MAX_FINDINGS: Integer
+    MAX_NODES: Integer
+
+    class Finding < ::Struct[untyped]
+      attr_accessor path: String
+      attr_accessor message: String
+
+      def to_s: () -> String
+    end
+
+    def self.report: (rack_app app) -> { shareable: bool, findings: Array[Finding] }
+
+    # Pretty-printed report; true when the app is ractor-ready.
+    def self.print_report: (rack_app app, ?io: IO) -> bool
+  end
+
+  # A ::Logger writing through the native async sink.
+  class Logger < ::Logger
+    # path: a file (created/appended) or nil for stdout.
+    def initialize: (?String? path, **untyped options) -> void
+
+    # The raw IO-like device: frozen and Ractor-shareable, one device can
+    # serve every worker.
+    class Device
+      def initialize: (?String? path) -> void
+
+      def write: (untyped message) -> void
+
+      alias << write
+
+      def close: () -> void
+
+      def reopen: (*untyped) -> self
+    end
+  end
+end
