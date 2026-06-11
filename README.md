@@ -55,7 +55,10 @@ app. Ractors do not have this limit: each one has its own lock, so one
 process can run Ruby in parallel. What was missing is a server that
 dispatches requests to them. Ruby 4.0 reworked Ractors (`Ractor::Port`,
 `shareable_proc`, less lock contention) and made this worth building.
-The design notes live in [doc/architecture.md](doc/architecture.md).
+
+Why a Ractor server has to be built this way, and which Rust parts make
+Ractors fast here: [doc/why-kino.md](doc/why-kino.md). The full design
+notes live in [doc/architecture.md](doc/architecture.md).
 
 ## Benchmarks
 
