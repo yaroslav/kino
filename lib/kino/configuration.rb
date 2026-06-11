@@ -15,7 +15,7 @@ module Kino
       threads: nil, # resolved per mode in Server: 1 in :ractor, 3 in :threaded
       mode: :auto,
       queue_depth: 1024,
-      queue_timeout: 1.0,
+      queue_timeout: 5.0,
       request_timeout: nil,
       batch: 1,
       lanes: false,

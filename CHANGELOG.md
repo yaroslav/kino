@@ -4,6 +4,8 @@
   inside a ractor share its lock and cost a per-request handoff; measured
   ~+20% on fast handlers), 3 in :threaded mode. Explicit `threads` always
   wins; waiting-heavy ractor apps should raise `workers` instead.
+- `queue_timeout` default raised from 1 to 5 seconds: a brief burst now
+  waits out the spike instead of shedding 503s within a second.
 
 ## [0.1.0] - 2026-06-11
 

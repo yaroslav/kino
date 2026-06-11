@@ -174,10 +174,10 @@ server = Kino::Server.new(app,
   bind: "127.0.0.1",
   port: 9292,                 # 0 = ephemeral; read back via server.port
   workers: Etc.nprocessors,   # ractors (parallelism)
-  threads: 3,                 # threads per ractor (I/O concurrency, Puma-style)
+  threads: 1,                 # per worker; ractor default 1, threaded default 3
   mode: :auto,                # :auto | :ractor | :threaded
   queue_depth: 1024,          # bounded queue; overflow → 503
-  queue_timeout: 1.0,         # seconds before 503 on a full queue
+  queue_timeout: 5.0,         # seconds before 503 on a full queue
   request_timeout: nil,       # seconds before a slow response becomes a 504 (nil = off)
   shutdown_timeout: 30,       # drain deadline
   tls: { cert: "cert.pem", key: "key.pem" },  # file paths or inline PEM
@@ -210,7 +210,7 @@ kwargs and CLI flags > config file > defaults.
 # kino.rb
 port 9292
 workers 8
-threads 3
+threads 1
 mode :ractor
 ```
 
@@ -266,7 +266,7 @@ cost):
 
 ```ruby
 server.stats
-# => {mode: :ractor, lanes: false, workers: 8, threads: 3, batch: 1,
+# => {mode: :ractor, lanes: false, workers: 8, threads: 1, batch: 1,
 #     respawns: 0, queued: 0, in_flight: 2, served: 1041, rejected: 0,
 #     timeouts: 0}
 # plus lane_depths: [...] when lane dispatch is on
@@ -276,7 +276,7 @@ From the outside, `kill -USR1 <pid>` prints the same snapshot as one line
 (pair it with `pidfile` to find the pid):
 
 ```
-Kino stats: mode=:ractor lanes=false workers=8 threads=3 batch=1 respawns=0 queued=0 in_flight=2 served=1041 rejected=0 timeouts=0
+Kino stats: mode=:ractor lanes=false workers=8 threads=1 batch=1 respawns=0 queued=0 in_flight=2 served=1041 rejected=0 timeouts=0
 ```
 
 ## Logging
