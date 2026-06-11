@@ -28,12 +28,6 @@ and a threaded fallback mode runs everything else, Rails included.
 * **Puma-shaped.** The same `workers × threads` topology, a familiar
   config DSL, a `kino` CLI. If you can run Puma, you can run Kino.
 
-```sh
-bundle add kino            # or: gem install kino
-echo 'run ->(env) { [200, {"content-type" => "text/plain"}, ["Action!"]] }' > config.ru
-bundle exec kino
-```
-
 **N.B.:** Ractors are officially **experimental** in Ruby 4.0, and so is this server. The threaded mode is solid. Still, Kino aims to be the best way to experiment with Ractors today—and the best Ractor server when they become stable.
 
 ---
@@ -52,9 +46,6 @@ bundle exec kino
 - [Timer waits](#timer-waits)
 - [Rack 3 compliance](#rack-3-compliance)
 - [Rails](#rails)
-- [Development](#development)
-- [Contributing](#contributing)
-- [License](#license)
 
 ## Why
 
