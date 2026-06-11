@@ -288,7 +288,8 @@ channel to a Rust flusher thread, so request threads never take a log
 mutex and never make a write syscall:
 
 - **Access log** (`log_requests true`): one line per request to stdout,
-  including the 503s that never reach your app. On color terminals the
+  including the 503s that never reach your app. Recommended in
+  development; cheap enough for production. On color terminals the
   lines are tinted by status class: 2xx green, 3xx yellow, 4xx maroon,
   5xx bright red:
 
