@@ -14,9 +14,8 @@ and a threaded fallback mode runs everything else, Rails included.
 * **Fast.** On a real 8-core server, every Kino mode is **1.5-2×**
   ahead of a Puma fork cluster on I/O-light endpoints. Ractor mode also
   wins on pure CPU, **30%+**. [Benchmarks](#benchmarks) below.
-* **A fraction of the memory.** One process instead of a fork per core:
-  about **15× less memory** than the Puma cluster under the same load,
-  and 8× less when serving the Rails hello-world.
+* **A fraction of the memory.** Aabout **~7×** on the simplistic bench 
+  Ractor app, and about **4× less memory** than a Puma cluster serving Rails in fallback threaded mode.
 * **Parallel without forking.** Ractor mode runs CPU work **more than
   5× faster** than Kino's own GVL-bound threaded mode, in the same
   small process.
@@ -64,36 +63,55 @@ notes live in [doc/architecture.md](doc/architecture.md).
 ## Benchmarks
 
 Measured on a real server: AWS **c7a.2xlarge** (8-core AMD EPYC 9R14,
-16 GB, Amazon Linux 2023). This is a realistic app-server size. The same
-Ractor-shareable app runs on every server, Ruby 4.0.5 with YJIT, every
-server at its defaults: Puma forks 8 workers × 3 threads, Kino stays in
-one process (8 workers; 1 thread each in ractor modes, 3 in threaded).
-Numbers are req/s by wrk (8-second windows, 64 connections, same host).
-Methodology and the analysis behind every column:
+16 GB, Amazon Linux 2023). This is a realistic app-server size.
+
+**These tables run a tiny synthetic Rack app**—plaintext, a 10 KB body,
+a CPU-bound `fib`, a 5 ms wait—deliberately small, to measure the server
+rather than an app. It is Ractor-shareable, so Kino runs it in `:ractor`
+mode (and `:threaded` for comparison). **A real Rails app is a different
+story:** it is *not* Ractor-shareable, so it runs only in Kino's
+`:threaded` fallback, with its own numbers—see [Rails](#rails) below.
+Ruby 4.0.5 with YJIT, every server at its defaults: Puma forks 8 workers ×
+3 threads, Kino stays in one process (8 workers; 1 thread each in ractor
+modes, 3 in threaded). Numbers are req/s by wrk (8-second windows, 64
+connections, same host). Methodology:
 [doc/benchmarks.md](doc/benchmarks.md).
 
 | endpoint    | Kino :ractor | + lanes | :ractor, `workers 32`² | Kino :threaded | Puma (cluster) |
 |-------------|-------------:|--------:|-----------------------:|---------------:|---------------:|
-| /plaintext  |      229,565 | **244,340** |         156,118 |        217,619 |        118,190 |
-| /10k        |      179,119 | **188,258** |         134,457 |        157,147 |        105,588 |
-| /cpu (fib)  |   **76,922**¹|  73,136 |          62,406 |         13,499 |         58,337 |
-| /io (5 ms)  |        1,548 |   1,548 |       **5,935** |          4,715 |          4,687 |
-| /io_native  |        1,570 |   1,571 |       **6,289** |          4,717 |          4,695 |
+| /plaintext  |      229,534 | **250,222** |         182,997 |        216,994 |        118,176 |
+| /10k        |      178,083 | **189,862** |         151,034 |        160,400 |        106,768 |
+| /cpu (fib)  |   **77,999**¹|  70,885 |          66,100 |         13,429 |         58,006 |
+| /io (5 ms)  |        1,552 |   1,551 |       **5,888** |          4,709 |          4,693 |
+| /io_native  |        1,570 |   1,571 |       **6,274** |          4,695 |          4,691 |
 
-Memory on the same box, RSS after sustained load:
+Memory tells two different stories depending on the app, both by **PSS**
+(proportional set size; see note) after sustained load.
 
-| serving               | Kino (one process) | Puma cluster (8 workers) |
-|-----------------------|-------------------:|-------------------------:|
-| bench app, :ractor    |          **80 MB** |                 1,256 MB |
-| bench app, :threaded  |         **151 MB**³|                 1,256 MB |
-| Rails hello-world     |          **97 MB** |                   797 MB |
+**The tiny benchmark app** (Ractor-shareable, so Kino runs it in `:ractor`
+or `:threaded`). Kino is **~7× lighter in :ractor mode, ~10× in :threaded**
+than the Puma cluster — the gap stays large because a trivial app is almost
+all private per-worker heap, which copy-on-write can't share:
+
+| tiny app, Kino  | Kino (one process) | Puma cluster (8 workers) | ratio |
+|-----------------|-------------------:|-------------------------:|------:|
+| :ractor (8×1)   |         **148 MB** |                 1,068 MB |  ~7×  |
+| :threaded (8×3) |         **107 MB**³|                 1,068 MB | ~10×  |
+
+**A real Rails app** (not Ractor-shareable—Kino's `:threaded` fallback
+only, [below](#rails)). The gap is **~4×**, smaller because Rails' large
+framework *is* shared copy-on-write across Puma's forks:
+
+| Rails hello-world | Kino :threaded | Puma cluster (8 workers) | ratio |
+|-------------------|---------------:|-------------------------:|------:|
+| **PSS**           |      **92 MB** |               **389 MB** |  ~4×  |
 
 "+ lanes" is the experimental per-worker-queue dispatcher (`lanes true`).
 It posts the fastest plaintext/10k of any configuration here. Details:
 [doc/benchmarks.md](doc/benchmarks.md#lane-dispatch-experimental-lanes-true).
 
 ¹ Stock settings, no tuning. Ractor mode beats the fork cluster on pure
-CPU by +32% (+25% with lanes). Threaded mode shows the GVL ceiling that
+CPU by +34% (+22% with lanes). Threaded mode shows the GVL ceiling that
 every single-process Ruby server hits. The old CPU-tuning recipe is
 retired: its `threads 1` half **is** the default now, and its
 `tokio_threads 1` half costs −12% on real hardware; see
@@ -102,7 +120,7 @@ retired: its `threads 1` half **is** the default now, and its
 ² Wait-bound throughput is slots ÷ wait, and the default columns bring
 8 single-thread workers against the cluster's 24 threads. Kino slots
 are threads, not processes—when your app waits a lot, raise `workers`.
-The `workers 32` column is that tuning: **+27% over the cluster on /io
+The `workers 32` column is that tuning: **+25% over the cluster on /io
 (+34% via `Kino.sleep`)** while still ahead of it on pure CPU, all in
 one small process. The cost is the CPU-light rows (32 ractors
 oversubscribe 8 cores); pick the topology your app's wait profile
@@ -111,7 +129,7 @@ needs. See
 
 ³ With `MALLOC_ARENA_MAX=2` (the standard Ruby deployment setting;
 Heroku's default). Without it, 24 threads churning 10 KB responses
-through one glibc heap balloon to ~600 MB—an arena-fragmentation
+through one glibc heap balloon to ~670 MB—an arena-fragmentation
 footgun, not a leak, and ractor mode sidesteps it. See
 [doc/benchmarks.md](doc/benchmarks.md#memory-under-load-and-the-glibc-arena-footgun).
 
@@ -121,14 +139,30 @@ doc):
 
 | endpoint   | Kino :ractor (8×3) | Puma + ractor wrapper | Falcon + ractor wrapper |
 |------------|-------------------:|----------------------:|------------------------:|
-| /plaintext |        **199,032** |                19,532 |                 100,342 |
-| /cpu (fib) |         **68,238** |                17,323 |                  48,561 |
-| /io (5 ms) |          **4,531** |                 1,452 |                   1,544 |
+| /plaintext |        **193,826** |                19,480 |                  99,776 |
+| /cpu (fib) |         **68,061** |                17,755 |                  48,721 |
+| /io (5 ms) |          **4,530** |                 1,454 |                   1,549 |
 
-In short: ractor mode beats fork-level CPU parallelism (**5.7×** Kino's
-own GVL-bound threaded mode, +32% over the cluster) in one process, at
-about 1/16th of the cluster's memory. Every Kino mode is 1.5-2.1×
-ahead of the cluster on I/O-light endpoints. The macOS numbers
+### Rails
+
+Rails is not Ractor-shareable today, so Kino serves it in `:threaded`
+fallback — one GVL-bound process. On the same box (`examples/rails-hello`,
+edge Rails, production, 8×5):
+
+| Rails hello-world            |  req/s | memory (PSS) |
+|------------------------------|-------:|-------------:|
+| Kino :threaded (one process) |  2,637 |    **92 MB** |
+| Puma cluster (8 workers)     | 12,138 |       389 MB |
+
+The honest trade-off: Puma's fork cluster uses all 8 cores, so it serves
+~4.6× the throughput — at ~4× the memory. Ractor-mode Rails would close
+the throughput gap at one-process memory cost; the upstream blockers are
+tracked in [doc/rails-on-ractors.md](doc/rails-on-ractors.md).
+
+In short: on the tiny synthetic app, ractor mode beats fork-level CPU parallelism (**5.8×** Kino's
+own GVL-bound threaded mode, +34% over the cluster) in one process, at
+about 1/7th of the cluster's memory by PSS (~4× on a real Rails app).
+Every Kino mode is 1.5-2.1× ahead of the cluster on I/O-light endpoints. The macOS numbers
 (secondary; everything there hits the loopback ceiling) and the
 YJIT × Ractors gotcha are in [doc/benchmarks.md](doc/benchmarks.md).
 

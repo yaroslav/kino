@@ -7,10 +7,11 @@
 Rails 8.2.0.alpha boots and serves with `mode :threaded` (see the
 example's `kino.rb`; just `bundle exec kino` in that directory). Measured
 on the hello-world (c7a.2xlarge, 8 cores, production mode, 8×5):
-~2.3k req/s in 97 MB, single process. The 8-worker Puma cluster reaches
-~11.9k in 797 MB by parallelizing across forks—Rails-on-Ractors is
-interesting precisely because it could offer that ~5× parallelism at
-~1/8th of the memory.
+~2.6k req/s in 92 MB PSS, single process. The 8-worker Puma cluster
+reaches ~12.1k by parallelizing across forks, at 389 MB PSS (794 MB RSS,
+but its forks share the framework copy-on-write, so PSS is the fair
+figure)—Rails-on-Ractors is interesting precisely because it could offer
+that ~4.6× parallelism at ~1/4th of the memory.
 
 Pair it with production-style Rails settings: eager load, no code
 reloading, database pool ≥ workers × threads, logger to stdout or another

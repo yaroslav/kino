@@ -6,7 +6,7 @@ FROM ruby:4.0-slim
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
       build-essential curl ca-certificates clang libclang-dev apache2-utils wrk \
-      pkg-config libssl-dev libyaml-dev psmisc \
+      pkg-config libssl-dev libyaml-dev psmisc procps \
     && rm -rf /var/lib/apt/lists/*
 
 RUN curl -sSf https://sh.rustup.rs | sh -s -- -y --profile minimal
