@@ -1,4 +1,4 @@
-## [Unreleased]
+## [0.1.2] - 2026-06-22
 
 - Drop a connection that has not sent its complete request headers
   within 15 seconds. Closes a slowloris hole: hyper's built-in header-read
