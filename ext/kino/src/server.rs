@@ -254,6 +254,12 @@ fn content_length(headers: &http::HeaderMap) -> Option<u64> {
         .ok()
 }
 
+/// Idle deadline between request-body frames. A client that stalls mid-body
+/// would otherwise hold a worker slot indefinitely (the worker blocks in
+/// read_body). Generous: a real upload sends steadily and resets this each
+/// frame, so only a silent client trips it. Fixed, like the header timeout.
+const BODY_READ_TIMEOUT: Duration = Duration::from_secs(30);
+
 async fn handle_request(
     server: Arc<ServerInner>,
     remote_addr: SocketAddr,
@@ -291,15 +297,28 @@ async fn handle_request(
     // skip the forwarder task entirely: dropping the sender IS the EOF.
     let (body_tx, body_rx) = flume::bounded::<bytes::Bytes>(8);
     let body_overflow = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let body_timeout = Arc::new(std::sync::atomic::AtomicBool::new(false));
     if oversize || hyper::body::Body::is_end_stream(&body) {
         drop(body_tx);
     } else {
         let overflow = body_overflow.clone();
+        let timed_out = body_timeout.clone();
         tokio::spawn(async move {
             let mut body = body;
             let mut total: u64 = 0;
-            while let Some(frame) = body.frame().await {
-                let Ok(frame) = frame else { break };
+            loop {
+                // Idle deadline between frames: a client that stalls mid-body
+                // would otherwise pin a worker blocked in read_body. Only the
+                // client's silence trips this; a slow APP blocks the forwarder
+                // in send_async below instead, which is not timed.
+                let frame = match tokio::time::timeout(BODY_READ_TIMEOUT, body.frame()).await {
+                    Ok(Some(Ok(frame))) => frame,
+                    Ok(Some(Err(_))) | Ok(None) => break, // body error or clean EOF
+                    Err(_) => {
+                        timed_out.store(true, Ordering::Relaxed);
+                        break;
+                    }
+                };
                 if let Ok(data) = frame.into_data() {
                     total += data.len() as u64;
                     if max_body > 0 && total > max_body as u64 {
@@ -328,6 +347,7 @@ async fn handle_request(
         https: server.https,
         body_rx,
         body_overflow,
+        body_timeout,
         leftover: None,
         slot: None,
         responder,

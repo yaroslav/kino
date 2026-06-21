@@ -28,6 +28,9 @@ pub struct RequestCtx {
     /// Set by the body forwarder when the body exceeded max_body_size: turns
     /// the next read into an error instead of a (truncated) clean EOF.
     pub body_overflow: Arc<std::sync::atomic::AtomicBool>,
+    /// Set by the body forwarder when the client stalled past the idle
+    /// deadline: the next read raises so the worker reclaims its slot.
+    pub body_timeout: Arc<std::sync::atomic::AtomicBool>,
     /// When a frame is bigger than read_body's max_len, the rest waits here.
     pub leftover: Option<Bytes>,
     /// The owning worker slot (set at admit time, queue.rs); its interrupt
@@ -69,6 +72,13 @@ fn body_too_large_error(ruby: &Ruby) -> Error {
     Error::new(
         ruby.exception_runtime_error(),
         "Kino: request body exceeded max_body_size",
+    )
+}
+
+fn body_timeout_error(ruby: &Ruby) -> Error {
+    Error::new(
+        ruby.exception_runtime_error(),
+        "Kino: request body read timed out",
     )
 }
 
@@ -250,9 +260,12 @@ impl Request {
                     Some(Some(bytes)) => bytes,
                     Some(None) => {
                         // Disconnected: a clean EOF, unless the forwarder
-                        // aborted the body for exceeding max_body_size.
+                        // abandoned the body (too large, or the client stalled).
                         if ctx.body_overflow.load(std::sync::atomic::Ordering::Relaxed) {
                             return Err(body_too_large_error(ruby));
+                        }
+                        if ctx.body_timeout.load(std::sync::atomic::Ordering::Relaxed) {
+                            return Err(body_timeout_error(ruby));
                         }
                         return Ok(None); // EOF
                     }
@@ -381,6 +394,7 @@ pub fn test_ctx() -> crate::registry::BoxedCtx {
         https: false,
         body_rx,
         body_overflow: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        body_timeout: Arc::new(std::sync::atomic::AtomicBool::new(false)),
         leftover: None,
         slot: None,
         responder: Arc::new(Responder::new(head_tx)),

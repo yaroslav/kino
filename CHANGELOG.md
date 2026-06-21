@@ -19,6 +19,11 @@
   oversized or endless upload. A truthful oversize Content-Length is refused
   with a 413 before the app runs; a chunked or lying client is cut off
   mid-stream once it passes the cap.
+- Bound the idle time between request-body frames to 30 seconds. A client that
+  began a request then stalled mid-body would otherwise keep a worker blocked
+  in `rack.input.read` indefinitely; now the read raises and the worker
+  reclaims its slot. Only a silent client trips it: a steadily-sent body resets
+  the deadline each frame, so slow-but-active uploads are unaffected.
 
 ## [0.1.1] - 2026-06-11
 
