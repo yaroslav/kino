@@ -131,6 +131,14 @@ pub fn server_start(ruby: &Ruby, config: magnus::RHash) -> Result<(u64, u16), Er
     Ok((id, local_port))
 }
 
+/// Slowloris guard for TLS: a client that completes the TCP connect but then
+/// stalls the handshake would otherwise hold a connection slot indefinitely
+/// (the per-request and header-read deadlines only start once hyper is
+/// serving, i.e. after the handshake). A handshake is a few round trips, so
+/// this is generous even for a high-latency client. Fixed, like the header
+/// timeout: not a knob.
+const TLS_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
+
 async fn accept_loop(
     listener: tokio::net::TcpListener,
     acceptor: Option<tokio_rustls::TlsAcceptor>,
@@ -170,9 +178,11 @@ async fn accept_loop(
             let _permit = permit;
             match acceptor {
                 Some(acceptor) => {
-                    // Handshake failures (port scans, plain HTTP to a
-                    // TLS port) just drop the connection.
-                    let Ok(tls) = acceptor.accept(stream).await else { return };
+                    // Handshake failures (port scans, plain HTTP to a TLS
+                    // port) and stalled handshakes (slowloris) just drop the
+                    // connection; the timeout bounds the latter.
+                    let handshake = tokio::time::timeout(TLS_HANDSHAKE_TIMEOUT, acceptor.accept(stream));
+                    let Ok(Ok(tls)) = handshake.await else { return };
                     serve_connection(tls, server, remote_addr, local_addr).await;
                 }
                 None => serve_connection(stream, server, remote_addr, local_addr).await,

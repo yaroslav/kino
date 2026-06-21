@@ -9,6 +9,10 @@
   flood exhausts file descriptors or memory. Defaults to most of the process
   open-file limit (`ulimit -n`), so it scales with the OS limit and only
   engages under a flood.
+- Bound the TLS handshake to 10 seconds. A client that completed the TCP
+  connect but stalled the handshake could otherwise hold a connection slot
+  indefinitely, since the request and header-read deadlines only begin once
+  the handshake finishes.
 
 ## [0.1.1] - 2026-06-11
 
