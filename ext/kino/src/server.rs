@@ -163,6 +163,13 @@ async fn accept_loop(
     }
 }
 
+/// Slowloris guard: drop a connection that has not sent its complete request
+/// headers within this window. Long enough never to trip a real client (even
+/// on a slow mobile link), short enough to reap a stalled one. Deliberately a
+/// constant, not a config knob: fine-tuning intake limits is the fronting
+/// proxy's job; the actual hazard was having no default at all.
+const HEADER_READ_TIMEOUT: Duration = Duration::from_secs(15);
+
 async fn serve_connection<I>(
     io: I,
     server: Arc<ServerInner>,
@@ -176,7 +183,13 @@ async fn serve_connection<I>(
     // No auto Date header: it costs a clock read per response (together
     // with timer reads, ~7% of tokio-side cycles in the profile); it's a
     // SHOULD not a MUST, and apps that need it can set it themselves.
+    //
+    // The timer is installed so header_read_timeout actually fires: hyper's
+    // slow-header guard is inert without one. It arms only while the request
+    // head is being read, so it adds no per-response cost on the hot path.
     let _ = hyper::server::conn::http1::Builder::new()
+        .timer(hyper_util::rt::TokioTimer::new())
+        .header_read_timeout(HEADER_READ_TIMEOUT)
         .auto_date_header(false)
         .serve_connection(TokioIo::new(io), service)
         .await;

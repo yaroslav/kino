@@ -1,4 +1,12 @@
+## [Unreleased]
+
+- Drop a connection that has not sent its complete request headers
+  within 15 seconds. Closes a slowloris hole: hyper's built-in header-read
+  timeout was inert because the server installed no timer, so a slow-header
+  client could tie up a connection (and its tokio task) indefinitely.
+
 ## [0.1.1] - 2026-06-11
+
 - Mode-dependent `threads` default: 1 per worker in :ractor mode (threads
   inside a ractor share its lock and cost a per-request handoff; +16-18%
   on fast handlers, measured on dedicated hardware), 3 in :threaded mode.
