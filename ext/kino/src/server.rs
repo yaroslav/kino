@@ -51,6 +51,7 @@ pub fn server_start(ruby: &Ruby, config: magnus::RHash) -> Result<(u64, u16), Er
     let queue_depth: usize = cfg(ruby, config, "queue_depth")?;
     let queue_timeout_ms: u64 = cfg(ruby, config, "queue_timeout_ms")?;
     let request_timeout_ms: u64 = cfg_opt::<u64>(ruby, config, "request_timeout_ms")?.unwrap_or(0);
+    let max_connections: usize = cfg_opt::<usize>(ruby, config, "max_connections")?.unwrap_or(1024);
     let tokio_threads: usize = cfg_opt::<usize>(ruby, config, "tokio_threads")?.unwrap_or(0);
     let tls_cert: Option<String> = cfg_opt(ruby, config, "tls_cert")?;
     let tls_key: Option<String> = cfg_opt(ruby, config, "tls_key")?;
@@ -120,6 +121,7 @@ pub fn server_start(ruby: &Ruby, config: magnus::RHash) -> Result<(u64, u16), Er
         tokio_listener,
         acceptor,
         server.clone(),
+        max_connections,
         shutdown_rx,
     ));
     *server.runtime.lock() = Some(runtime);
@@ -133,33 +135,49 @@ async fn accept_loop(
     listener: tokio::net::TcpListener,
     acceptor: Option<tokio_rustls::TlsAcceptor>,
     server: Arc<ServerInner>,
+    max_connections: usize,
     mut shutdown_rx: tokio::sync::watch::Receiver<bool>,
 ) {
+    // Bound concurrent connections: unbounded, a flood spawns a task and holds
+    // a socket per connection until file descriptors or memory run out. One
+    // permit per live connection; acquiring BEFORE accept leaves the excess in
+    // the kernel backlog (backpressure) rather than accepting then dropping.
+    let conn_limit = Arc::new(tokio::sync::Semaphore::new(max_connections));
     loop {
-        tokio::select! {
+        let permit = tokio::select! {
             _ = shutdown_rx.changed() => break,
-            accepted = listener.accept() => {
-                let Ok((stream, remote_addr)) = accepted else { continue };
-                // Small responses must not wait on Nagle + delayed ACK.
-                let _ = stream.set_nodelay(true);
-                let local_addr = stream
-                    .local_addr()
-                    .unwrap_or_else(|_| SocketAddr::from(([0, 0, 0, 0], 0)));
-                let server = server.clone();
-                let acceptor = acceptor.clone();
-                tokio::spawn(async move {
-                    match acceptor {
-                        Some(acceptor) => {
-                            // Handshake failures (port scans, plain HTTP to a
-                            // TLS port) just drop the connection.
-                            let Ok(tls) = acceptor.accept(stream).await else { return };
-                            serve_connection(tls, server, remote_addr, local_addr).await;
-                        }
-                        None => serve_connection(stream, server, remote_addr, local_addr).await,
-                    }
-                });
+            permit = conn_limit.clone().acquire_owned() => match permit {
+                Ok(permit) => permit,
+                Err(_) => break, // semaphore closed
+            },
+        };
+        let (stream, remote_addr) = tokio::select! {
+            _ = shutdown_rx.changed() => break,
+            accepted = listener.accept() => match accepted {
+                Ok(pair) => pair,
+                Err(_) => continue, // transient accept error; permit drops, retry
+            },
+        };
+        // Small responses must not wait on Nagle + delayed ACK.
+        let _ = stream.set_nodelay(true);
+        let local_addr = stream
+            .local_addr()
+            .unwrap_or_else(|_| SocketAddr::from(([0, 0, 0, 0], 0)));
+        let server = server.clone();
+        let acceptor = acceptor.clone();
+        tokio::spawn(async move {
+            // Held for the connection's lifetime; dropping it frees a slot.
+            let _permit = permit;
+            match acceptor {
+                Some(acceptor) => {
+                    // Handshake failures (port scans, plain HTTP to a
+                    // TLS port) just drop the connection.
+                    let Ok(tls) = acceptor.accept(stream).await else { return };
+                    serve_connection(tls, server, remote_addr, local_addr).await;
+                }
+                None => serve_connection(stream, server, remote_addr, local_addr).await,
             }
-        }
+        });
     }
 }
 

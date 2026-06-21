@@ -4,6 +4,11 @@
   within 15 seconds. Closes a slowloris hole: hyper's built-in header-read
   timeout was inert because the server installed no timer, so a slow-header
   client could tie up a connection (and its tokio task) indefinitely.
+- Cap concurrent connections (new `max_connections` directive). Past the cap,
+  new connections wait in the kernel backlog instead of piling up until a
+  flood exhausts file descriptors or memory. Defaults to most of the process
+  open-file limit (`ulimit -n`), so it scales with the OS limit and only
+  engages under a flood.
 
 ## [0.1.1] - 2026-06-11
 

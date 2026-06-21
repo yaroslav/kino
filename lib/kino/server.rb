@@ -50,6 +50,7 @@ module Kino
       @queue_depth = Integer(settings[:queue_depth])
       @queue_timeout_ms = (Float(settings[:queue_timeout]) * 1000).round
       @request_timeout_ms = settings[:request_timeout] ? (Float(settings[:request_timeout]) * 1000).round : 0
+      @max_connections = settings[:max_connections] ? Integer(settings[:max_connections]) : default_max_connections
       @batch = [Integer(settings[:batch]), 1].max
       @lanes = !!settings[:lanes]
       @log_requests = !!settings[:log_requests]
@@ -74,6 +75,7 @@ module Kino
         bind: @bind, port: @requested_port,
         queue_depth: @queue_depth, queue_timeout_ms: @queue_timeout_ms,
         request_timeout_ms: @request_timeout_ms,
+        max_connections: @max_connections,
         tokio_threads: @tokio_threads,
         tls_cert: @tls&.fetch(:cert), tls_key: @tls&.fetch(:key),
         lanes: @lanes, log_requests: @log_requests
@@ -212,6 +214,18 @@ module Kino
 
     def monotonic_now
       Process.clock_gettime(Process::CLOCK_MONOTONIC)
+    end
+
+    # Default connection cap: most of the process open-file limit. A
+    # connection flood's failure mode is descriptor exhaustion, and in
+    # :ractor/:threaded mode the app's own sockets and files share this
+    # process's table, so leave headroom. Scales with `ulimit -n`; raise the
+    # OS limit (or set max_connections) to allow more.
+    def default_max_connections
+      soft, = Process.getrlimit(Process::RLIMIT_NOFILE)
+      return 65_536 if soft == Process::RLIM_INFINITY
+
+      [soft * 8 / 10, 64].max
     end
 
     def join_workers(deadline)

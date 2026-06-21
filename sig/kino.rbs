@@ -92,6 +92,7 @@ module Kino
       def queue_depth: (int depth) -> untyped
       def queue_timeout: (Numeric seconds) -> untyped
       def request_timeout: (Numeric? seconds) -> untyped
+      def max_connections: (int count) -> untyped
       def batch: (int count) -> untyped
       def lanes: (boolish enabled) -> untyped
       def log_requests: (boolish enabled) -> untyped

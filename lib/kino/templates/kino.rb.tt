@@ -55,6 +55,12 @@
 # above your slowest legitimate endpoint.
 # request_timeout 30
 
+# Most connections to serve at once. Past this, new connections wait in
+# the kernel backlog instead of piling up until the server runs out of
+# file descriptors. Defaults to most of the open-file limit (ulimit -n),
+# so it scales with the OS limit and only bites under a flood.
+# max_connections 8192
+
 # How many requests a worker grabs from the line at once. Leave at 1
 # unless all your endpoints are uniformly fast.
 # batch 1

@@ -17,6 +17,7 @@ module Kino
       queue_depth: 1024,
       queue_timeout: 5.0,
       request_timeout: nil,
+      max_connections: nil, # nil = derive from the open-file limit
       batch: 1,
       lanes: false,
       log_requests: false,
@@ -159,6 +160,10 @@ module Kino
 
       # Seconds the app gets before the client receives a 504; nil = off.
       def request_timeout(seconds) = @config.set(:request_timeout, seconds && Float(seconds))
+
+      # Max connections served at once; beyond it, new connections wait in
+      # the kernel backlog. Defaults to most of the open-file limit.
+      def max_connections(count) = @config.set(:max_connections, Integer(count))
 
       # Requests a worker may grab per queue visit (default 1).
       def batch(count) = @config.set(:batch, Integer(count))
