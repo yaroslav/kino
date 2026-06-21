@@ -13,6 +13,12 @@
   connect but stalled the handshake could otherwise hold a connection slot
   indefinitely, since the request and header-read deadlines only begin once
   the handshake finishes.
+- Cap the request body at 50 MB by default (new `max_body_size` directive,
+  configurable; nil or 0 disables and delegates to a fronting proxy). An app
+  that reads `rack.input` could otherwise be driven to run out of memory by an
+  oversized or endless upload. A truthful oversize Content-Length is refused
+  with a 413 before the app runs; a chunked or lying client is cut off
+  mid-stream once it passes the cap.
 
 ## [0.1.1] - 2026-06-11
 

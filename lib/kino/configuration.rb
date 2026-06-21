@@ -18,6 +18,7 @@ module Kino
       queue_timeout: 5.0,
       request_timeout: nil,
       max_connections: nil, # nil = derive from the open-file limit
+      max_body_size: 50 * 1024 * 1024, # 50 MB; nil/0 = unlimited
       batch: 1,
       lanes: false,
       log_requests: false,
@@ -164,6 +165,10 @@ module Kino
       # Max connections served at once; beyond it, new connections wait in
       # the kernel backlog. Defaults to most of the open-file limit.
       def max_connections(count) = @config.set(:max_connections, Integer(count))
+
+      # Max request-body bytes before a 413; nil disables (delegate to a
+      # fronting proxy). Default 50 MB.
+      def max_body_size(bytes) = @config.set(:max_body_size, bytes && Integer(bytes))
 
       # Requests a worker may grab per queue visit (default 1).
       def batch(count) = @config.set(:batch, Integer(count))

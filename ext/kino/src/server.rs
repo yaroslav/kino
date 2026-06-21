@@ -51,6 +51,7 @@ pub fn server_start(ruby: &Ruby, config: magnus::RHash) -> Result<(u64, u16), Er
     let queue_depth: usize = cfg(ruby, config, "queue_depth")?;
     let queue_timeout_ms: u64 = cfg(ruby, config, "queue_timeout_ms")?;
     let request_timeout_ms: u64 = cfg_opt::<u64>(ruby, config, "request_timeout_ms")?.unwrap_or(0);
+    let max_body_size: usize = cfg_opt::<usize>(ruby, config, "max_body_size")?.unwrap_or(0);
     let max_connections: usize = cfg_opt::<usize>(ruby, config, "max_connections")?.unwrap_or(1024);
     let tokio_threads: usize = cfg_opt::<usize>(ruby, config, "tokio_threads")?.unwrap_or(0);
     let tls_cert: Option<String> = cfg_opt(ruby, config, "tls_cert")?;
@@ -105,6 +106,7 @@ pub fn server_start(ruby: &Ruby, config: magnus::RHash) -> Result<(u64, u16), Er
         rejected: std::sync::atomic::AtomicU64::new(0),
         queue_timeout_ms,
         request_timeout_ms,
+        max_body_size,
         timeouts: std::sync::atomic::AtomicU64::new(0),
         https: acceptor.is_some(),
         access_log: log_requests.then(|| crate::logsink::Sink::new(std::io::stdout())),
@@ -239,6 +241,19 @@ fn branded(mut response: HyperResponse) -> HyperResponse {
     response
 }
 
+/// A single valid Content-Length as a byte count. hyper has already rejected
+/// conflicting/duplicate values, so the first is authoritative; anything
+/// unparseable yields None and the streaming cap still applies.
+fn content_length(headers: &http::HeaderMap) -> Option<u64> {
+    headers
+        .get(http::header::CONTENT_LENGTH)?
+        .to_str()
+        .ok()?
+        .trim()
+        .parse()
+        .ok()
+}
+
 async fn handle_request(
     server: Arc<ServerInner>,
     remote_addr: SocketAddr,
@@ -262,19 +277,37 @@ async fn handle_request(
         )
     });
 
+    // Body-size guard: an honestly-declared oversize body is refused with a
+    // 413 below, before any worker runs. Chunked or lying clients are caught
+    // by the forwarder, which caps cumulative bytes and flags an overflow so
+    // read_body raises instead of letting the app buffer without bound.
+    let max_body = server.max_body_size;
+    let oversize =
+        max_body > 0 && content_length(&parts.headers).is_some_and(|len| len > max_body as u64);
+
     // Stream the request body through a bounded channel: hyper is polled
     // only as fast as the Ruby side consumes (inbound backpressure), and the
     // forwarder dropping the sender is EOF. Bodyless requests (most GETs)
     // skip the forwarder task entirely: dropping the sender IS the EOF.
     let (body_tx, body_rx) = flume::bounded::<bytes::Bytes>(8);
-    if hyper::body::Body::is_end_stream(&body) {
+    let body_overflow = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    if oversize || hyper::body::Body::is_end_stream(&body) {
         drop(body_tx);
     } else {
+        let overflow = body_overflow.clone();
         tokio::spawn(async move {
             let mut body = body;
+            let mut total: u64 = 0;
             while let Some(frame) = body.frame().await {
                 let Ok(frame) = frame else { break };
                 if let Ok(data) = frame.into_data() {
+                    total += data.len() as u64;
+                    if max_body > 0 && total > max_body as u64 {
+                        // Past the cap: flag it and stop pulling. Dropping the
+                        // sender unblocks read_body, which then raises.
+                        overflow.store(true, Ordering::Relaxed);
+                        break;
+                    }
                     if body_tx.send_async(data).await.is_err() {
                         break; // request handle dropped; stop pulling
                     }
@@ -294,6 +327,7 @@ async fn handle_request(
         local_addr,
         https: server.https,
         body_rx,
+        body_overflow,
         leftover: None,
         slot: None,
         responder,
@@ -314,6 +348,9 @@ async fn handle_request(
 
     // Single exit point so the access log sees every outcome, 503s included.
     let response: HyperResponse = 'resp: {
+        if oversize {
+            break 'resp plain_response(413, "Payload Too Large\n");
+        }
         if server.lanes {
             if !dispatch_to_lane(&server, ctx).await {
                 break 'resp unavailable(&server);

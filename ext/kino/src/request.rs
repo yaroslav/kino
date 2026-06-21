@@ -25,6 +25,9 @@ pub struct RequestCtx {
     /// Request body, streamed from hyper through a bounded channel: hyper is
     /// only polled as Ruby consumes, so inbound backpressure is free.
     pub body_rx: flume::Receiver<Bytes>,
+    /// Set by the body forwarder when the body exceeded max_body_size: turns
+    /// the next read into an error instead of a (truncated) clean EOF.
+    pub body_overflow: Arc<std::sync::atomic::AtomicBool>,
     /// When a frame is bigger than read_body's max_len, the rest waits here.
     pub leftover: Option<Bytes>,
     /// The owning worker slot (set at admit time, queue.rs); its interrupt
@@ -59,6 +62,13 @@ fn interrupted_error(ruby: &Ruby) -> Error {
     Error::new(
         ruby.exception_runtime_error(),
         "Kino: request interrupted during shutdown",
+    )
+}
+
+fn body_too_large_error(ruby: &Ruby) -> Error {
+    Error::new(
+        ruby.exception_runtime_error(),
+        "Kino: request body exceeded max_body_size",
     )
 }
 
@@ -238,7 +248,14 @@ impl Request {
                 });
                 match outcome {
                     Some(Some(bytes)) => bytes,
-                    Some(None) => return Ok(None), // EOF
+                    Some(None) => {
+                        // Disconnected: a clean EOF, unless the forwarder
+                        // aborted the body for exceeding max_body_size.
+                        if ctx.body_overflow.load(std::sync::atomic::Ordering::Relaxed) {
+                            return Err(body_too_large_error(ruby));
+                        }
+                        return Ok(None); // EOF
+                    }
                     None => return Err(interrupted_error(ruby)),
                 }
             }
@@ -363,6 +380,7 @@ pub fn test_ctx() -> crate::registry::BoxedCtx {
         local_addr: "127.0.0.1:9292".parse().expect("static addr"),
         https: false,
         body_rx,
+        body_overflow: Arc::new(std::sync::atomic::AtomicBool::new(false)),
         leftover: None,
         slot: None,
         responder: Arc::new(Responder::new(head_tx)),

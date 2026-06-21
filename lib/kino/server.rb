@@ -51,6 +51,7 @@ module Kino
       @queue_timeout_ms = (Float(settings[:queue_timeout]) * 1000).round
       @request_timeout_ms = settings[:request_timeout] ? (Float(settings[:request_timeout]) * 1000).round : 0
       @max_connections = settings[:max_connections] ? Integer(settings[:max_connections]) : default_max_connections
+      @max_body_size = Integer(settings[:max_body_size] || 0)
       @batch = [Integer(settings[:batch]), 1].max
       @lanes = !!settings[:lanes]
       @log_requests = !!settings[:log_requests]
@@ -76,6 +77,7 @@ module Kino
         queue_depth: @queue_depth, queue_timeout_ms: @queue_timeout_ms,
         request_timeout_ms: @request_timeout_ms,
         max_connections: @max_connections,
+        max_body_size: @max_body_size,
         tokio_threads: @tokio_threads,
         tls_cert: @tls&.fetch(:cert), tls_key: @tls&.fetch(:key),
         lanes: @lanes, log_requests: @log_requests

@@ -61,6 +61,11 @@
 # so it scales with the OS limit and only bites under a flood.
 # max_connections 8192
 
+# Reject request bodies larger than this many bytes with a 413, so an
+# oversized or endless upload can't drive your app to run out of memory.
+# Set to nil to disable and let a fronting proxy handle it. Default: 50 MB.
+# max_body_size 50 * 1024 * 1024
+
 # How many requests a worker grabs from the line at once. Leave at 1
 # unless all your endpoints are uniformly fast.
 # batch 1

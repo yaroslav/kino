@@ -41,6 +41,9 @@ pub struct ServerInner {
     /// 0 = no request timeout; otherwise the response head must arrive
     /// within this many ms or the client gets a 504.
     pub request_timeout_ms: u64,
+    /// 0 = unlimited; otherwise the max request-body bytes accepted before a
+    /// 413 (truthful Content-Length) or a mid-stream abort (chunked/lying).
+    pub max_body_size: usize,
     pub timeouts: AtomicU64,
     pub https: bool,
     /// Native access log sink (None unless log_requests is on).
@@ -180,6 +183,7 @@ pub fn test_server(lanes: bool, queue_depth: usize) -> Arc<ServerInner> {
         rejected: AtomicU64::new(0),
         queue_timeout_ms: 10,
         request_timeout_ms: 0,
+        max_body_size: 0,
         timeouts: AtomicU64::new(0),
         https: false,
         access_log: None,
