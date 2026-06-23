@@ -14,7 +14,7 @@ and a threaded fallback mode runs everything else, Rails included.
 * **Fast.** On a real 8-core server, every Kino mode is **1.5-2×**
   ahead of a Puma fork cluster on I/O-light endpoints. Ractor mode also
   wins on pure CPU, **30%+**. [Benchmarks](#benchmarks) below.
-* **A fraction of the memory.** Aabout **~7×** on the simplistic bench 
+* **A fraction of the memory.** About **~7×** on the simplistic bench 
   Ractor app, and about **4× less memory** than a Puma cluster serving Rails in fallback threaded mode.
 * **Parallel without forking.** Ractor mode runs CPU work **more than
   5× faster** than Kino's own GVL-bound threaded mode, in the same
