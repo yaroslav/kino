@@ -79,6 +79,14 @@
 # never saw, such as 503s. Recommended in development.
 # log_requests false
 
+# Called when a worker catches an app or delivery error, after the client
+# got its 500. This is the only place that sees errors raised while the
+# response was being written (bad header, body that died mid-stream):
+# they happen after your middleware returned, so only the server can
+# report them. Wire your error tracker here. In :ractor mode the handler
+# must be Ractor-shareable (build it with Ractor.shareable_proc).
+# on_error ->(error, env) { ExceptionService.capture(error) }
+
 ## Lifecycle
 
 # On shutdown, give in-flight requests this many seconds to finish.

@@ -9,12 +9,13 @@ module Kino
   class RactorSupervisor
     attr_reader :respawns
 
-    def initialize(server_id, app, workers:, threads:, batch: 1)
+    def initialize(server_id, app, workers:, threads:, batch: 1, on_error: nil)
       @server_id = server_id
       @app = app
       @workers = workers
       @threads = threads
       @batch = batch
+      @on_error = on_error
       @respawns = 0
       @draining = false
       @lock = Mutex.new
@@ -83,13 +84,13 @@ module Kino
     # old slot.
     def spawn_worker
       worker_ids = Array.new(@threads) { Native.register_worker(@server_id) }
-      ractor = Ractor.new(@server_id, worker_ids, @app, @batch) do |server_id, ids, app, batch|
+      ractor = Ractor.new(@server_id, worker_ids, @app, @batch, @on_error) do |server_id, ids, app, batch, on_error|
         ids.map do |id|
           Thread.new do
             # Crashes surface via Ractor#value in the supervisor; don't also
             # spray the backtrace to stderr from inside the dying ractor.
             Thread.current.report_on_exception = false
-            Kino::Worker.run(server_id, id, app, batch)
+            Kino::Worker.run(server_id, id, app, batch, on_error)
           end
         end.each(&:join)
       end

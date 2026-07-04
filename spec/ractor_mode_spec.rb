@@ -57,6 +57,34 @@ RSpec.describe "ractor mode" do
       expect { Kino::Server.new(unshareable, mode: :ractor) }
         .to raise_error(Kino::UnshareableAppError, /Ractor-shareable/)
     end
+
+    it "raises when :ractor is forced with an unshareable on_error hook" do
+      sink = [] # captured mutable state makes the proc unshareable
+      hook = ->(error, _env) { sink << error }
+      expect { Kino::Server.new(shareable_app, mode: :ractor, on_error: hook) }
+        .to raise_error(Kino::Error, /Ractor-shareable on_error/)
+    end
+
+    it "delivers worker errors to a shareable on_error hook" do
+      Dir.mktmpdir("kino-on-error") do |dir|
+        log = File.join(dir, "errors.log").freeze
+        hook = Ractor.shareable_proc do |error, env|
+          File.write(log, "#{error.class}: #{error.message} at #{env["PATH_INFO"]}\n", mode: "a")
+        end
+        app = Ractor.shareable_proc do |env|
+          raise "ractor kaput" if env["PATH_INFO"] == "/boom-soft"
+
+          [200, {"content-type" => "text/plain"}, ["ok"]]
+        end
+
+        with_server(app, mode: :ractor, workers: 1, threads: 1, on_error: hook) do |host, port|
+          expect(Net::HTTP.get_response(host, "/boom-soft", port).code).to eq("500")
+          expect(Net::HTTP.get_response(host, "/", port).body).to eq("ok")
+        end
+
+        expect(File.read(log)).to include("RuntimeError: ractor kaput at /boom-soft")
+      end
+    end
   end
 
   it "serves requests from non-main ractors" do

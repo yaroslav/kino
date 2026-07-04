@@ -22,6 +22,7 @@ module Kino
       batch: 1,
       lanes: false,
       log_requests: false,
+      on_error: nil,
       shutdown_timeout: 30,
       tokio_threads: nil,
       tls: nil,
@@ -178,6 +179,11 @@ module Kino
 
       # Native access log: one status-colored line per request to stdout.
       def log_requests(enabled) = @config.set(:log_requests, !!enabled)
+
+      # Called with (exception, env) when a worker catches an app or
+      # delivery error; wire your error tracker here. Takes a callable
+      # or a block. Must be Ractor-shareable in :ractor mode.
+      def on_error(handler = nil, &block) = @config.set(:on_error, handler || block)
 
       # Graceful-shutdown drain deadline in seconds.
       def shutdown_timeout(seconds) = @config.set(:shutdown_timeout, seconds)

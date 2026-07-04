@@ -1,3 +1,20 @@
+## [Unreleased]
+
+- Non-String response header names and values (booleans, numbers, symbols)
+  are now serialized with `to_s`, matching Puma, instead of failing the
+  request with a `TypeError`.
+- New `on_error` directive: a callable invoked with `(exception, env)` when
+  a worker catches an app or delivery error, after the client got its 500.
+  Delivery errors (unserializable header, a body that raised mid-stream)
+  happen after the middleware stack returned, so this hook is the only
+  place an error tracker can see them. Handler failures are logged and
+  swallowed; in :ractor mode the handler must be Ractor-shareable.
+- Worker error log lines now include the exception backtrace (first 12
+  frames), not just the exception class and message.
+- A streaming body that raises mid-stream now aborts the connection
+  instead of finishing the chunked response cleanly, so a client can no
+  longer mistake a truncated response for a complete one.
+
 ## [0.1.2] - 2026-06-22
 
 - Drop a connection that has not sent its complete request headers

@@ -97,6 +97,7 @@ module Kino
       def batch: (int count) -> untyped
       def lanes: (boolish enabled) -> untyped
       def log_requests: (boolish enabled) -> untyped
+      def on_error: (?^(Exception, Hash[String, untyped]) -> void handler) ?{ (Exception, Hash[String, untyped]) -> void } -> untyped
       def shutdown_timeout: (Numeric seconds) -> untyped
       def tokio_threads: (int count) -> untyped
       def tls: (cert: String, key: String) -> untyped

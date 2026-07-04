@@ -41,6 +41,7 @@ module Kino
       @bind = settings[:bind]
       @requested_port = settings[:port]
       @workers = Integer(settings[:workers])
+      @on_error = validate_on_error(settings[:on_error])
       @mode = resolve_mode(settings[:mode])
       # Default threads per mode: 1 in :ractor (threads inside a ractor
       # share its lock; a measured +17% on fast handlers; raise `workers`
@@ -84,11 +85,12 @@ module Kino
       )
       File.write(@pidfile, "#{Process.pid}\n") if @pidfile
       if @mode == :ractor
-        @supervisor = RactorSupervisor.new(@id, @app, workers: @workers, threads: @threads, batch: @batch).start
+        @supervisor = RactorSupervisor.new(@id, @app, workers: @workers, threads: @threads,
+          batch: @batch, on_error: @on_error).start
       else
         @worker_threads = (@workers * @threads).times.map do
           worker_id = Native.register_worker(@id)
-          Thread.new { Worker.run(@id, worker_id, @app, @batch) }
+          Thread.new { Worker.run(@id, worker_id, @app, @batch, @on_error) }
         end
       end
       @started = true
@@ -214,6 +216,15 @@ module Kino
       {cert: String(tls[:cert]), key: String(tls[:key])}
     end
 
+    def validate_on_error(handler)
+      return nil if handler.nil?
+      unless handler.respond_to?(:call)
+        raise ArgumentError, "on_error must respond to #call (got #{handler.class})"
+      end
+
+      handler
+    end
+
     def monotonic_now
       Process.clock_gettime(Process::CLOCK_MONOTONIC)
     end
@@ -275,13 +286,21 @@ module Kino
             "Ractor.shareable_proc endpoints); try Ractor.make_shareable(app) " \
             "or mode: :threaded"
         end
+        unless @on_error.nil? || Ractor.shareable?(@on_error)
+          raise Error,
+            "mode: :ractor requires a Ractor-shareable on_error handler " \
+            "(build it with Ractor.shareable_proc, or use mode: :threaded)"
+        end
         :ractor
       when :auto
-        if Ractor.shareable?(@app)
-          :ractor
-        else
+        if !Ractor.shareable?(@app)
           warn "Kino: app is not Ractor-shareable; falling back to mode: :threaded"
           :threaded
+        elsif !(@on_error.nil? || Ractor.shareable?(@on_error))
+          warn "Kino: on_error handler is not Ractor-shareable; falling back to mode: :threaded"
+          :threaded
+        else
+          :ractor
         end
       else
         raise ArgumentError, "mode must be :auto, :ractor, or :threaded (got #{requested.inspect})"

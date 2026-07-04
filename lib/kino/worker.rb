@@ -18,13 +18,13 @@ module Kino
 
     module_function
 
-    def run(server_id, worker_id, app, batch_size = 1)
+    def run(server_id, worker_id, app, batch_size = 1, on_error = nil)
       if batch_size <= 1
         env = Native.take_one(server_id, worker_id)
-        env = handle_one(env, server_id, worker_id, app) while env
+        env = handle_one(env, server_id, worker_id, app, on_error) while env
       else
         batch = Native.take_batch(server_id, worker_id, batch_size)
-        batch = process(batch, server_id, worker_id, app, batch_size) while batch
+        batch = process(batch, server_id, worker_id, app, batch_size, on_error) while batch
       end
     end
 
@@ -34,8 +34,8 @@ module Kino
     NOT_FUSED = Object.new.freeze
 
     # Handle one request; returns the next env (fused take) or nil.
-    def handle_one(env, server_id, worker_id, app)
-      result = serve(env, app) do |request, status, headers, chunks|
+    def handle_one(env, server_id, worker_id, app, on_error)
+      result = serve(env, app, on_error) do |request, status, headers, chunks|
         request.respond_and_take_one(server_id, worker_id, status, headers, chunks)
       end
       result.equal?(NOT_FUSED) ? Native.take_one(server_id, worker_id) : result
@@ -43,10 +43,10 @@ module Kino
 
     # Handle every env in the batch; returns the next batch (the last
     # simple response rides the fused respond_and_take) or nil on shutdown.
-    def process(batch, server_id, worker_id, app, batch_size)
+    def process(batch, server_id, worker_id, app, batch_size, on_error)
       last = batch.size - 1
       batch.each_with_index do |env, index|
-        result = serve(env, app) do |request, status, headers, chunks|
+        result = serve(env, app, on_error) do |request, status, headers, chunks|
           if index == last
             request.respond_and_take(server_id, worker_id, batch_size,
               status, headers, chunks)
@@ -66,7 +66,7 @@ module Kino
     # here and return NOT_FUSED. App errors must never kill the worker;
     # hard crashes (Exception) are the supervisor's job; and `abort` does
     # the right thing whether or not the response head already went out.
-    def serve(env, app)
+    def serve(env, app, on_error)
       request = env[KINO_REQUEST]
       env[RACK_INPUT] ||= Input.new(request)
       status, headers, body = app.call(env)
@@ -80,9 +80,30 @@ module Kino
         NOT_FUSED
       end
     rescue => e
-      Native.log_error("#{e.class}: #{e.message}")
+      # Abort before the hook: the client's 500 must never wait on a
+      # reporting round-trip. The hook is the app's only window onto
+      # delivery errors (they happen after app.call returned, so no
+      # middleware can see them); its own failures are logged, not raised,
+      # because nothing may escape this block and kill the worker.
+      Native.log_error(error_log_line(e))
       request.abort
+      if on_error
+        begin
+          on_error.call(e, env)
+        rescue => hook_error
+          Native.log_error("on_error hook raised #{hook_error.class}: #{hook_error.message}")
+        end
+      end
       NOT_FUSED
+    end
+
+    # First frames only: the raise site is at the top, and Rails stacks
+    # run hundreds of middleware frames deep. Hooks get the full exception.
+    BACKTRACE_FRAMES = 12
+
+    def error_log_line(error)
+      ["#{error.class}: #{error.message}",
+        *(error.backtrace || []).first(BACKTRACE_FRAMES)].join("\n  ")
     end
 
     def deliver_streaming(request, status, headers, body, input)
@@ -99,10 +120,13 @@ module Kino
         end
       else
         # Enumerable body: chunked transfer unless the app set content-length.
+        # finish only on success: a body that raised must abort the
+        # connection (serve's rescue), not fake a clean end of stream that
+        # the client cannot tell from a complete response.
         begin
           body.each { |chunk| request.write_chunk(chunk) }
-        ensure
           request.finish
+        ensure
           body.close if body.respond_to?(:close)
         end
       end
@@ -119,6 +143,6 @@ module Kino
     end
 
     private_class_method :handle_one, :process, :serve, :deliver_streaming,
-      :join_chunks
+      :join_chunks, :error_log_line
   end
 end

@@ -9,7 +9,8 @@ use std::sync::Arc;
 
 use bytes::Bytes;
 use magnus::r_hash::ForEach;
-use magnus::{Error, RArray, RHash, RString, Ruby, TryConvert, Value};
+use magnus::value::ReprValue;
+use magnus::{Error, RArray, RHash, RString, Ruby, Value};
 
 use crate::gvl;
 use crate::response::{full_body, BodyFrame, Responder};
@@ -348,7 +349,8 @@ impl Request {
 /// copies the bytes immediately.
 fn build_head(status: u16, headers: RHash) -> Result<hyper::http::response::Builder, Error> {
     let mut builder = Some(hyper::Response::builder().status(status));
-    headers.foreach(|name: RString, value: Value| {
+    headers.foreach(|name: Value, value: Value| {
+        let name = coerce_str(name)?;
         let take = |b: &mut Option<hyper::http::response::Builder>, v: RString| {
             let next = b
                 .take()
@@ -358,14 +360,25 @@ fn build_head(status: u16, headers: RHash) -> Result<hyper::http::response::Buil
         };
         if let Some(values) = RArray::from_value(value) {
             for i in 0..values.len() {
-                take(&mut builder, values.entry::<RString>(i as isize)?);
+                take(&mut builder, coerce_str(values.entry(i as isize)?)?);
             }
         } else {
-            take(&mut builder, RString::try_convert(value)?);
+            take(&mut builder, coerce_str(value)?);
         }
         Ok(ForEach::Continue)
     })?;
     Ok(builder.expect("builder always present"))
+}
+
+/// Rack SPEC says header names and values are Strings, but real apps set
+/// booleans, numbers, and symbols, and Puma serves them via to_s. Match
+/// that: Strings pass through untouched (the hot path), anything else pays
+/// one to_s call back into Ruby.
+fn coerce_str(value: Value) -> Result<RString, Error> {
+    match RString::from_value(value) {
+        Some(s) => Ok(s),
+        None => value.funcall("to_s", ()),
+    }
 }
 
 fn split_host_port(host: &str, default_port: u16) -> (String, u16) {
