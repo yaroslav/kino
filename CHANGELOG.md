@@ -1,4 +1,4 @@
-## [Unreleased]
+## [0.1.3] - 2026-07-04
 
 - Non-String response header names and values (booleans, numbers, symbols)
   are now serialized with `to_s`, matching Puma, instead of failing the
@@ -106,3 +106,5 @@ Initial release.
 - Request timeouts: `request_timeout: seconds` (off by default) returns an
   immediate 504 when the app misses the deadline; the late response is
   dropped and the handler is never killed. Counted as `stats[:timeouts]`.
+
+[#3]: https://github.com/yaroslav/kino/issues/3
