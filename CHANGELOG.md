@@ -1,4 +1,4 @@
-## [0.1.4] - Unreleased
+## [0.2.0] - 2026-07-13
 
 - Strip debug info from release builds.
 - A panic in the native layer now raises a RuntimeError on the affected
