@@ -183,7 +183,7 @@ bundle add kino      # or: gem install kino (outside a bundle)
 or put it in the `Gemfile` yourself:
 
 ```ruby
-gem "kino", "~> 0.1"
+gem "kino", "~> 0.2"
 ```
 
 Then generate a config and serve:
