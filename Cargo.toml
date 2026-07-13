@@ -7,8 +7,12 @@ members = ["./ext/kino"]
 resolver = "2"
 
 [profile.release]
-# Keep debug symbols in release builds so the final binary stays debuggable.
-debug = true
+# Ship lean artifacts: no debug info, and leftover debug sections (e.g.
+# from the precompiled std) are stripped. The symbol table stays, so
+# crash backtraces keep function names. For a debuggable local build,
+# compile with RB_SYS_CARGO_PROFILE=dev.
+debug = false
+strip = "debuginfo"
 opt-level = 3
 lto = "fat"
 codegen-units = 1

@@ -1,3 +1,7 @@
+## [0.1.4] - Unreleased
+
+- Strip debug info from release builds.
+
 ## [0.1.3] - 2026-07-04
 
 - Non-String response header names and values (booleans, numbers, symbols)
