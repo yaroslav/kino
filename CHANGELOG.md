@@ -4,6 +4,10 @@
 - A panic in the native layer now raises a RuntimeError on the affected
   worker (visible to `on_error` and the error log) instead of killing the
   server process.
+- The pidfile is claimed exclusively: starting refuses (instead of silently
+  overwriting) while the pidfile's owner is alive, a leftover file from a
+  dead process is replaced, symlinks are never followed, and shutdown
+  removes the file only while it still holds our pid.
 
 ## [0.1.3] - 2026-07-04
 

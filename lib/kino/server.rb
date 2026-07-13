@@ -73,17 +73,25 @@ module Kino
     def start
       raise Error, "server already started" if @started
 
-      @id, @port = Native.server_start(
-        bind: @bind, port: @requested_port,
-        queue_depth: @queue_depth, queue_timeout_ms: @queue_timeout_ms,
-        request_timeout_ms: @request_timeout_ms,
-        max_connections: @max_connections,
-        max_body_size: @max_body_size,
-        tokio_threads: @tokio_threads,
-        tls_cert: @tls&.fetch(:cert), tls_key: @tls&.fetch(:key),
-        lanes: @lanes, log_requests: @log_requests
-      )
-      File.write(@pidfile, "#{Process.pid}\n") if @pidfile
+      # Claim the pidfile before binding: refusing to start (another
+      # instance is alive) must not leave a booted native runtime behind.
+      write_pidfile if @pidfile
+      booted = false
+      begin
+        @id, @port = Native.server_start(
+          bind: @bind, port: @requested_port,
+          queue_depth: @queue_depth, queue_timeout_ms: @queue_timeout_ms,
+          request_timeout_ms: @request_timeout_ms,
+          max_connections: @max_connections,
+          max_body_size: @max_body_size,
+          tokio_threads: @tokio_threads,
+          tls_cert: @tls&.fetch(:cert), tls_key: @tls&.fetch(:key),
+          lanes: @lanes, log_requests: @log_requests
+        )
+        booted = true
+      ensure
+        remove_pidfile if @pidfile && !booted
+      end
       if @mode == :ractor
         @supervisor = RactorSupervisor.new(@id, @app, workers: @workers, threads: @threads,
           batch: @batch, on_error: @on_error).start
@@ -135,7 +143,7 @@ module Kino
       Native.shutdown_runtime(@id, 1_000)
       @worker_threads.clear
       @started = false
-      File.delete(@pidfile) if @pidfile && File.exist?(@pidfile)
+      remove_pidfile if @pidfile
       nil
     end
 
@@ -239,6 +247,67 @@ module Kino
       return 65_536 if soft == Process::RLIM_INFINITY
 
       [soft * 8 / 10, 64].max
+    end
+
+    # Claim the pidfile for this process. O_EXCL creation fails on ANY
+    # existing directory entry (regular file, symlink, even a dangling
+    # one), so a live instance's pidfile is never overwritten and a
+    # symlink is never followed. A leftover entry whose owner is gone is
+    # replaced; one that does not hold a pid is refused, not clobbered.
+    def write_pidfile
+      claim_pidfile
+    rescue Errno::EEXIST
+      refuse_unless_stale
+      begin
+        # Unlink removes the entry itself; a symlink's target is untouched.
+        File.unlink(@pidfile)
+      rescue Errno::ENOENT
+        # Vanished on its own; the claim below settles any remaining race.
+      end
+      begin
+        claim_pidfile
+      rescue Errno::EEXIST
+        raise Error, "lost the race for #{@pidfile}: another instance is starting"
+      end
+    end
+
+    def claim_pidfile
+      File.open(@pidfile, File::WRONLY | File::CREAT | File::EXCL, 0o644) do |file|
+        file.write("#{Process.pid}\n")
+      end
+    end
+
+    # @raise [Kino::Error] when the pidfile's owner is still alive, or the
+    #   file does not look like a pidfile at all
+    def refuse_unless_stale
+      content = begin
+        File.read(@pidfile)
+      rescue Errno::ENOENT
+        return # already gone; nothing to refuse
+      end
+      pid = Integer(content.strip, exception: false)
+      unless pid&.positive?
+        raise Error, "refusing to overwrite #{@pidfile}: does not hold a pid"
+      end
+      raise Error, "already running (pid #{pid}, per #{@pidfile})" if process_alive?(pid)
+    end
+
+    def process_alive?(pid)
+      Process.kill(0, pid)
+      true
+    rescue Errno::ESRCH
+      false
+    rescue Errno::EPERM
+      true # exists, just not ours to signal
+    end
+
+    # Delete only a pidfile that is still ours: by shutdown time the path
+    # may belong to a replacement instance, or an operator may have
+    # repointed it at something that is not a pidfile at all.
+    def remove_pidfile
+      File.unlink(@pidfile) if File.read(@pidfile) == "#{Process.pid}\n"
+    rescue Errno::ENOENT
+      nil
     end
 
     def join_workers(deadline)

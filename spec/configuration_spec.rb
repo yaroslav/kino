@@ -110,6 +110,65 @@ RSpec.describe Kino::Configuration do
     expect(File.exist?(pidfile)).to be(false)
   end
 
+  describe "pidfile safety" do
+    let(:app) { ->(_env) { [200, {}, []] } }
+    let(:pidfile) { File.join(@dir, "kino.pid") }
+
+    def new_server
+      Kino::Server.new(app, workers: 1, threads: 1, mode: :threaded, pidfile: pidfile)
+    end
+
+    def dead_pid
+      pid = Process.spawn("true")
+      Process.wait(pid)
+      pid
+    end
+
+    it "refuses to start while the pidfile's owner is alive" do
+      File.write(pidfile, "#{Process.pid}\n") # our own pid: guaranteed alive
+
+      expect { new_server.start }
+        .to raise_error(Kino::Error, /already running \(pid #{Process.pid}/)
+      expect(File.read(pidfile)).to eq("#{Process.pid}\n")
+    end
+
+    it "replaces a pidfile left behind by a dead process" do
+      File.write(pidfile, "#{dead_pid}\n")
+
+      server = new_server.start
+      expect(File.read(pidfile).strip).to eq(Process.pid.to_s)
+      server.shutdown
+    end
+
+    it "refuses to overwrite a file that does not hold a pid" do
+      File.write(pidfile, "precious data\n")
+
+      expect { new_server.start }
+        .to raise_error(Kino::Error, /does not hold a pid/)
+      expect(File.read(pidfile)).to eq("precious data\n")
+    end
+
+    it "replaces a stale pidfile symlink without touching its target" do
+      target = File.join(@dir, "target.pid")
+      stale = "#{dead_pid}\n"
+      File.write(target, stale)
+      File.symlink(target, pidfile)
+
+      server = new_server.start
+      expect(File.symlink?(pidfile)).to be(false) # the link itself was replaced
+      expect(File.read(target)).to eq(stale) # its target was not written through
+      server.shutdown
+    end
+
+    it "leaves the pidfile alone on shutdown once it is no longer ours" do
+      server = new_server.start
+      File.write(pidfile, "424242\n") # a successor took the path over
+
+      server.shutdown
+      expect(File.read(pidfile)).to eq("424242\n")
+    end
+  end
+
   it "raises on an unknown setting" do
     expect { described_class.new.set(:nope, 1) }.to raise_error(ArgumentError, /unknown setting/)
   end
