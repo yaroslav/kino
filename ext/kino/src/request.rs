@@ -37,6 +37,9 @@ pub struct RequestCtx {
     /// The owning worker slot (set at admit time, queue.rs); its interrupt
     /// flag makes blocked body reads/writes interruptible like the queue pop.
     pub slot: Option<Arc<crate::registry::WorkerSlot>>,
+    /// The server's zero-copy roots: large response bodies are pinned
+    /// here and ride to hyper without a copy (pin.rs).
+    pub pin_slab: Arc<crate::pin::PinSlab>,
     pub responder: Arc<Responder>,
 }
 
@@ -228,11 +231,21 @@ pub fn respond_simple(
 ) -> Result<bool, Error> {
     let ctx = request.0.borrow();
     let builder = build_head(status, headers)?;
-    let bytes = Bytes::copy_from_slice(unsafe { body.as_slice() });
+    let bytes = body_bytes(&ctx, body);
     let response = builder
         .body(full_body(bytes))
         .map_err(|e| invalid_response(ruby, e))?;
     Ok(ctx.responder.send_response(response))
+}
+
+/// Body bytes for hyper: large bodies are pinned in place (zero-copy),
+/// everything else is copied out of the Ruby string, which may be
+/// mutated or collected the moment we return.
+fn body_bytes(ctx: &RequestCtx, body: RString) -> Bytes {
+    if let Some(bytes) = crate::pin::pinned_bytes(&ctx.pin_slab, body) {
+        return bytes;
+    }
+    Bytes::copy_from_slice(unsafe { body.as_slice() })
 }
 
 impl Request {
@@ -306,7 +319,7 @@ impl Request {
                 "Kino: response stream not started or already finished",
             ));
         };
-        let bytes = Bytes::copy_from_slice(unsafe { chunk.as_slice() });
+        let bytes = body_bytes(&ctx, chunk);
         let mut pending = Some(Ok(BodyFrame::data(bytes)));
 
         let outcome = block_on(&ctx.slot, || {
@@ -410,6 +423,7 @@ pub fn test_ctx() -> crate::registry::BoxedCtx {
         body_timeout: Arc::new(std::sync::atomic::AtomicBool::new(false)),
         leftover: None,
         slot: None,
+        pin_slab: Arc::new(crate::pin::PinSlab::new()),
         responder: Arc::new(Responder::new(head_tx)),
     })
 }

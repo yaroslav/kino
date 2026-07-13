@@ -112,6 +112,7 @@ pub fn server_start(ruby: &Ruby, config: magnus::RHash) -> Result<(u64, u16), Er
         access_log: log_requests.then(|| crate::logsink::Sink::new(std::io::stdout())),
         lanes,
         lane_cursor: std::sync::atomic::AtomicUsize::new(0),
+        pin_slab: Arc::new(crate::pin::PinSlab::new()),
     });
 
     let tokio_listener = {
@@ -350,6 +351,7 @@ async fn handle_request(
         body_timeout,
         leftover: None,
         slot: None,
+        pin_slab: server.pin_slab.clone(),
         responder,
     });
 
@@ -587,6 +589,16 @@ pub fn shutdown_runtime(_ruby: &Ruby, server_id: u64, timeout_ms: u64) -> Result
         }
     }
     Ok(())
+}
+
+/// The GC anchor for this server's zero-copy pins: the Ruby Server holds
+/// it for its lifetime, so pinned buffers survive worker-ractor crashes.
+pub fn pin_keeper(
+    ruby: &Ruby,
+    server_id: u64,
+) -> Result<magnus::typed_data::Obj<crate::pin::PinKeeper>, Error> {
+    let server = registry::get(ruby, server_id)?;
+    Ok(ruby.obj_wrap(crate::pin::PinKeeper(server.pin_slab.clone())))
 }
 
 /// Errors print in red on color terminals. Covers worker errors,

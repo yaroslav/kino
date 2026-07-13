@@ -7,6 +7,7 @@ static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
 mod env_strings;
 mod gvl;
 mod logsink;
+mod pin;
 mod queue;
 mod registry;
 mod request;
@@ -58,6 +59,9 @@ fn init(ruby: &Ruby) -> Result<(), Error> {
         "register_defaults",
         function!(env_strings::register_defaults, 2),
     )?;
+
+    native.define_class("PinKeeper", ruby.class_object())?;
+    native.define_singleton_method("pin_keeper", function!(server::pin_keeper, 1))?;
 
     let request = native.define_class("Request", ruby.class_object())?;
     request.define_method("respond_and_take", method!(queue::respond_and_take, 6))?;

@@ -8,6 +8,9 @@
   overwriting) while the pidfile's owner is alive, a leftover file from a
   dead process is replaced, symlinks are never followed, and shutdown
   removes the file only while it still holds our pid.
+- Zero-copy response bodies: bodies of 4 KB and up ride to the network
+  layer by reference instead of being copied at the FFI boundary, in both
+  dispatch modes. A 10 KB-body endpoint now serves at plaintext speed.
 
 ## [0.1.3] - 2026-07-04
 

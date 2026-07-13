@@ -52,6 +52,9 @@ pub struct ServerInner {
     pub lanes: bool,
     /// Round-robin cursor for lane dispatch.
     pub lane_cursor: AtomicUsize,
+    /// GC roots for zero-copy response buffers (pin.rs). The Ruby Server
+    /// object holds the marking PinKeeper for this slab.
+    pub pin_slab: Arc<crate::pin::PinSlab>,
 }
 
 /// One per worker *thread* (slot count = workers × threads). The interrupt
@@ -189,6 +192,7 @@ pub fn test_server(lanes: bool, queue_depth: usize) -> Arc<ServerInner> {
         access_log: None,
         lanes,
         lane_cursor: AtomicUsize::new(0),
+        pin_slab: Arc::new(crate::pin::PinSlab::new()),
     })
 }
 

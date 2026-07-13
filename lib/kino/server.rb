@@ -92,6 +92,9 @@ module Kino
       ensure
         remove_pidfile if @pidfile && !booted
       end
+      # GC anchor for zero-copy response buffers: held for the server's
+      # lifetime so in-flight buffers survive even a worker ractor crash.
+      @pin_keeper = Native.pin_keeper(@id)
       if @mode == :ractor
         @supervisor = RactorSupervisor.new(@id, @app, workers: @workers, threads: @threads,
           batch: @batch, on_error: @on_error).start
@@ -141,6 +144,9 @@ module Kino
       end
 
       Native.shutdown_runtime(@id, 1_000)
+      # The runtime is gone, so hyper has dropped every pinned buffer;
+      # the keeper (and the strings it marked) may now be collected.
+      @pin_keeper = nil
       @worker_threads.clear
       @started = false
       remove_pidfile if @pidfile
