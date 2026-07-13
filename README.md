@@ -21,6 +21,8 @@ and a threaded fallback mode runs everything else, Rails included.
   small process.
 * **Production plumbing included.** Graceful drain, crash supervision
   and respawn, bounded queues with 503 backpressure, request timeouts,
+  hardened intake (slowloris and TLS-handshake deadlines, connection
+  and body-size caps), an `on_error` hook for your error tracker,
   TLS (rustls), live stats, async access and app logging.
 * **Tells you why.** `kino --check` lists exactly what blocks your app
   from ractor mode, finding by finding, so you do not have to decode
@@ -224,6 +226,9 @@ server = Kino::Server.new(app,
   queue_depth: 1024,          # bounded queue; overflow → 503
   queue_timeout: 5.0,         # seconds before 503 on a full queue
   request_timeout: nil,       # seconds before a slow response becomes a 504 (nil = off)
+  max_connections: 8192,      # cap concurrent connections; default: most of ulimit -n
+  max_body_size: 50 * 1024 * 1024,  # bytes before a 413; nil = let a proxy handle it
+  on_error: ->(e, env) { ErrorTracker.capture(e) },  # after the client got its 500
   shutdown_timeout: 30,       # drain deadline
   tls: { cert: "cert.pem", key: "key.pem" },  # file paths or inline PEM
 )
@@ -302,6 +307,18 @@ deliberately *not* killed, because interrupting arbitrary Ruby mid-flight
 is unsafe. A stuck handler still occupies its worker slot until it
 returns, so set the deadline above your slowest legitimate endpoint and
 watch `stats[:timeouts]`.
+
+Timeouts guard your app; the network intake guards itself. New
+connections past `max_connections` (default: most of `ulimit -n`) wait
+in the kernel backlog; request bodies past `max_body_size` (default
+50 MB, `nil` delegates to a fronting proxy) get a **413**; and fixed
+deadlines drop slow-header clients (15 s), stalled TLS handshakes
+(10 s), and uploads stalled mid-body (30 s). When a worker catches an
+app or delivery error,
+`on_error ->(error, env) { ErrorTracker.capture(error) }` is called
+after the client got its 500—the only place a tracker sees errors
+raised while the response was being written (in `:ractor` mode, build
+the handler with `Ractor.shareable_proc`).
 
 ## Stats
 
