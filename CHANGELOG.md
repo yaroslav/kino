@@ -1,6 +1,9 @@
 ## [0.1.4] - Unreleased
 
 - Strip debug info from release builds.
+- A panic in the native layer now raises a RuntimeError on the affected
+  worker (visible to `on_error` and the error log) instead of killing the
+  server process.
 
 ## [0.1.3] - 2026-07-04
 

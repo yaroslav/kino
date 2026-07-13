@@ -50,7 +50,7 @@ pub fn sleep_chunk(ruby: &Ruby, seconds: f64) -> Result<f64, Error> {
             func: gvl::ubf_interrupt,
             data: &interrupted as *const _ as *mut c_void,
         }),
-    );
+    )?;
 
     let remaining = requested.saturating_sub(chunk);
     Ok(remaining.as_secs_f64())

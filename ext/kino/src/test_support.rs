@@ -71,8 +71,20 @@ pub fn take(ruby: &magnus::Ruby, id: u64) -> Result<Option<String>, magnus::Erro
             Err(flume::RecvTimeoutError::Timeout) => None,
             Err(flume::RecvTimeoutError::Disconnected) => Some(None),
         }
-    });
+    })?;
     Ok(taken.flatten())
+}
+
+/// Panic inside a GVL-released block: proves it surfaces as a Ruby
+/// exception instead of unwinding into the VM and killing the process.
+/// The default panic hook is silenced around the intentional panic so
+/// spec output stays clean.
+pub fn panic_in_release() -> Result<(), magnus::Error> {
+    let hook = std::panic::take_hook();
+    std::panic::set_hook(Box::new(|_| {}));
+    let result = gvl::without_gvl(|| panic!("intentional test panic"), None);
+    std::panic::set_hook(hook);
+    result
 }
 
 pub fn close(ruby: &magnus::Ruby, id: u64) -> Result<(), magnus::Error> {

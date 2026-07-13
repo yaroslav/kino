@@ -30,7 +30,7 @@ type Taken = Option<BoxedCtx>;
 /// cost is real (~20% of cycles at saturation, per perf), but a measured
 /// 20µs spin made things WORSE on oversubscribed cores: spinners steal
 /// exactly the CPU the tokio threads need.
-fn block_take(server: &ServerInner, slot: &Arc<WorkerSlot>) -> Taken {
+fn block_take(server: &ServerInner, slot: &Arc<WorkerSlot>) -> Result<Taken, Error> {
     if slot.lane_rx.is_some() {
         return lane_take(server, slot);
     }
@@ -40,15 +40,16 @@ fn block_take(server: &ServerInner, slot: &Arc<WorkerSlot>) -> Taken {
     // try_recv never blocks, so the whole GVL release/reacquire (two
     // scheduler round-trips per request) is skipped entirely.
     match req_rx.try_recv() {
-        Ok(ctx) => Some(ctx),
-        Err(flume::TryRecvError::Disconnected) => None,
+        Ok(ctx) => Ok(Some(ctx)),
+        Err(flume::TryRecvError::Disconnected) => Ok(None),
         Err(flume::TryRecvError::Empty) => {
-            gvl::interruptible(&slot.interrupted, || match req_rx.recv_timeout(TICK) {
-                Ok(ctx) => Some(Some(ctx)),
-                Err(flume::RecvTimeoutError::Timeout) => None,
-                Err(flume::RecvTimeoutError::Disconnected) => Some(None),
-            })
-            .flatten()
+            let taken =
+                gvl::interruptible(&slot.interrupted, || match req_rx.recv_timeout(TICK) {
+                    Ok(ctx) => Some(Some(ctx)),
+                    Err(flume::RecvTimeoutError::Timeout) => None,
+                    Err(flume::RecvTimeoutError::Disconnected) => Some(None),
+                })?;
+            Ok(taken.flatten())
         }
     }
 }
@@ -56,7 +57,7 @@ fn block_take(server: &ServerInner, slot: &Arc<WorkerSlot>) -> Taken {
 /// Lane-mode take: own lane first (no wake needed while the dispatcher
 /// keeps feeding an awake lane), then steal from siblings, then park on
 /// the own lane with the parked flag raised so the dispatcher avoids it.
-fn lane_take(server: &ServerInner, slot: &Arc<WorkerSlot>) -> Taken {
+fn lane_take(server: &ServerInner, slot: &Arc<WorkerSlot>) -> Result<Taken, Error> {
     let lane_rx = slot.lane_rx.as_ref().expect("lane_take without lane");
 
     let steal = || -> Option<BoxedCtx> {
@@ -76,12 +77,12 @@ fn lane_take(server: &ServerInner, slot: &Arc<WorkerSlot>) -> Taken {
 
     // Hot path, GVL still held: own lane, then a steal sweep.
     match lane_rx.try_recv() {
-        Ok(ctx) => return Some(ctx),
-        Err(flume::TryRecvError::Disconnected) => return None,
+        Ok(ctx) => return Ok(Some(ctx)),
+        Err(flume::TryRecvError::Disconnected) => return Ok(None),
         Err(flume::TryRecvError::Empty) => {}
     }
     if let Some(ctx) = steal() {
-        return Some(ctx);
+        return Ok(Some(ctx));
     }
 
     // Park. The flag-then-recheck order closes the race with a dispatcher
@@ -96,10 +97,11 @@ fn lane_take(server: &ServerInner, slot: &Arc<WorkerSlot>) -> Taken {
             Err(flume::RecvTimeoutError::Timeout) => steal().map(Some),
             Err(flume::RecvTimeoutError::Disconnected) => Some(None),
         }
-    })
-    .flatten();
+    });
+    // Unpark before propagating any panic, or the dispatcher shuns this
+    // lane for good.
     slot.parked.store(false, Ordering::SeqCst);
-    taken
+    Ok(taken?.flatten())
 }
 
 /// Wrap a ctx into its env Hash, with the Ruby request handle embedded
@@ -137,7 +139,7 @@ fn checkout(ruby: &Ruby, server_id: u64, worker_id: usize) -> Result<Option<Chec
     slot.current.lock().clear();
     slot.interrupted.store(false, Ordering::SeqCst);
 
-    Ok(block_take(&server, &slot).map(|ctx| (server, slot, ctx)))
+    Ok(block_take(&server, &slot)?.map(|ctx| (server, slot, ctx)))
 }
 
 /// Take one request; returns its env Hash (request handle inside under

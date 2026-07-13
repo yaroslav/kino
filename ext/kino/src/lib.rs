@@ -85,6 +85,7 @@ fn init(ruby: &Ruby) -> Result<(), Error> {
     native.define_singleton_method("_test_push", function!(test_support::push, 2))?;
     native.define_singleton_method("_test_take", function!(test_support::take, 1))?;
     native.define_singleton_method("_test_close", function!(test_support::close, 1))?;
+    native.define_singleton_method("_test_panic", function!(test_support::panic_in_release, 0))?;
 
     Ok(())
 }

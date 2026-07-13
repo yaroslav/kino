@@ -52,12 +52,12 @@ impl Drop for RequestCtx {
 
 /// Block on a channel operation with the GVL released, waking on the
 /// slot's interrupt flag. `attempt` performs one bounded tick and returns
-/// Some when done; None on timeout. Outer None = interrupted. Every Ruby
+/// Some when done; None on timeout. Ok(None) = interrupted. Every Ruby
 /// handle is created by `admit` (queue.rs), which always sets the slot.
 fn block_on<T>(
     slot: &Option<Arc<crate::registry::WorkerSlot>>,
     attempt: impl FnMut() -> Option<T>,
-) -> Option<T> {
+) -> Result<Option<T>, Error> {
     let slot = slot.as_ref().expect("slot set by admit");
     gvl::interruptible(&slot.interrupted, attempt)
 }
@@ -256,7 +256,7 @@ impl Request {
                         Err(flume::RecvTimeoutError::Timeout) => None,
                         Err(flume::RecvTimeoutError::Disconnected) => Some(None),
                     }
-                });
+                })?;
                 match outcome {
                     Some(Some(bytes)) => bytes,
                     Some(None) => {
@@ -319,7 +319,7 @@ impl Request {
                 }
                 Err(flume::SendTimeoutError::Disconnected(_)) => Some(false),
             }
-        });
+        })?;
         match outcome {
             // Receiver dropped = client went away; the app keeps writing
             // into the void harmlessly (Rack has no error contract here).

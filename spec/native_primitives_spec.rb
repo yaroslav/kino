@@ -67,6 +67,14 @@ RSpec.describe "native primitives" do
     end
   end
 
+  describe "panic containment" do
+    it "surfaces a native panic as a RuntimeError instead of killing the process" do
+      expect { Kino::Native._test_panic }.to raise_error(
+        RuntimeError, /panic in native blocking call: intentional test panic/
+      )
+    end
+  end
+
   describe "ractor safety" do
     it "can call every native from a non-main Ractor" do
       result = Ractor.new do
