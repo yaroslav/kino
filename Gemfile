@@ -8,5 +8,5 @@ gemspec
 gem "irb"
 
 # Benchmark baselines (bench/run.sh).
-gem "puma", "~> 7.0"
+gem "puma", "~> 8.0"
 gem "falcon", "~> 0.52"
