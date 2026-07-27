@@ -14,11 +14,11 @@ crate-type = ["cdylib", "rlib"]
 [dependencies]
 magnus = { version = "0.8.2", features = ["rb-sys"] }
 rb-sys = { version = "0.9", features = ["stable-api-compiled-fallback"] }
-flume = "0.11"
+flume = "0.12"
 parking_lot = "0.12"
 ahash = "0.8"
 smallvec = "1"
-lru = "0.12"
+lru = "0.18"
 mimalloc = { version = "0.1", default-features = false }
 tokio = { version = "1.45", features = ["rt-multi-thread", "net", "time", "sync", "io-util", "macros"] }
 hyper = { version = "1.6", features = ["http1", "server"] }

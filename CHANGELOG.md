@@ -1,3 +1,9 @@
+## [0.2.1] - Unreleased
+
+- Update Rust dependencies: flume 0.12, lru 0.18, and a lockfile refresh
+  (tokio 1.53, hyper 1.11, rustls 0.23.42, among others). flume 0.12 drops
+  four transitive crates, so source installs compile a little faster.
+
 ## [0.2.0] - 2026-07-13
 
 - Strip debug info from release builds.
