@@ -432,6 +432,14 @@ bundle exec rake                       # compile, Rust tests, specs, RBS, lint
 RB_SYS_CARGO_PROFILE=dev bundle exec rake compile   # fast dev rebuilds
 ```
 
+## Acknowledgements
+
+Thanks to [Mat Sadler](https://github.com/matsadler) for [magnus](https://github.com/matsadler/magnus).
+
+For ractors, thanks to [Koichi Sasada](https://github.com/ko1), [John Hawthorn](https://github.com/jhawthorn), [Jean Boussier](https://github.com/byroot), [Luke Gruber](https://github.com/luke-gruber), and other Ruby core contributors.
+
+For the Rust network stack, thanks to [Sean McArthur](https://github.com/seanmonstar) for [hyper](https://github.com/hyperium/hyper), and to [Carl Lerche](https://github.com/carllerche), [Alice Ryhl](https://github.com/Darksonn), and the other [Tokio](https://github.com/tokio-rs/tokio) maintainers for the runtime underneath it. Thanks to [Joshua Barretto](https://github.com/zesterer) for [flume](https://github.com/zesterer/flume)—its channels carry every request between the network side and the workers.
+
 ## Assisted by
 
 Claude Code (Mythos, Opus).
