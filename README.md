@@ -442,7 +442,7 @@ For the Rust network stack, thanks to [Sean McArthur](https://github.com/seanmon
 
 ## Assisted by
 
-Claude Code (Mythos, Opus).
+Claude Code (Fable 5, Opus 4.8).
 
 ## Contributing
 
