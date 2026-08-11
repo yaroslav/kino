@@ -102,6 +102,19 @@
 # heavily CPU-bound apps, try 1 to leave more cores for Ruby.
 # tokio_threads 4
 
+## Control plane
+
+# Serve read-only monitoring on a separate address: live stats as JSON
+# at /stats, Prometheus text at /metrics, and /ready and /live probes
+# for an orchestrator. Answered by the native layer on its own thread,
+# so it stays live even when every Ruby worker is busy or stuck.
+# Accepts "host:port" or "unix://path". Off unless set.
+# control_bind "127.0.0.1:9293"
+
+# When set, /stats and /metrics require "Authorization: Bearer <token>".
+# The probes stay open; they carry no data.
+# control_token ENV["KINO_CONTROL_TOKEN"]
+
 ## App
 
 # Rackup file to load (a command-line argument wins).

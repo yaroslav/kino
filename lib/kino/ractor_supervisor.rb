@@ -7,8 +7,6 @@ module Kino
   # ractor, Exception from app code included) wakes it to 500 the in-flight
   # requests and respawn. Clean exits (queue drained) end supervision.
   class RactorSupervisor
-    attr_reader :respawns
-
     def initialize(server_id, app, workers:, threads:, batch: 1, on_error: nil)
       @server_id = server_id
       @app = app
@@ -16,7 +14,6 @@ module Kino
       @threads = threads
       @batch = batch
       @on_error = on_error
-      @respawns = 0
       @draining = false
       @lock = Mutex.new
       @supervisor_threads = []
@@ -66,7 +63,7 @@ module Kino
             break if draining?
 
             crashes += 1
-            @lock.synchronize { @respawns += 1 }
+            Native.record_respawn(@server_id)
             cause = (e.respond_to?(:cause) && e.cause) ? e.cause : e
             Native.log_error("worker ractor #{index} crashed (#{cause.class}: #{cause.message}); respawning")
             # Policy (crash recovery): unlimited respawn

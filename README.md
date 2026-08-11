@@ -230,6 +230,8 @@ server = Kino::Server.new(app,
   max_body_size: 50 * 1024 * 1024,  # bytes before a 413; nil = let a proxy handle it
   on_error: ->(e, env) { ErrorTracker.capture(e) },  # after the client got its 500
   shutdown_timeout: 30,       # drain deadline
+  control_bind: "127.0.0.1:9293",   # monitoring: /stats /metrics /ready /live; port 0 reads back via server.control_port
+  control_token: ENV["KINO_CONTROL_TOKEN"],  # optional Bearer auth for /stats + /metrics
   tls: { cert: "cert.pem", key: "key.pem" },  # file paths or inline PEM
 )
 server.start
@@ -340,6 +342,22 @@ From the outside, `kill -USR1 <pid>` prints the same snapshot as one line
 ```
 Kino stats: mode=:ractor lanes=false workers=8 threads=1 batch=1 respawns=0 queued=0 in_flight=2 served=1041 rejected=0 timeouts=0
 ```
+
+For pull-based monitoring, `control_bind "127.0.0.1:9293"` (or a
+`unix://` path) serves a read-only **control plane** from the native
+layer on its own thread—it keeps answering even while every Ruby worker
+is busy or stuck, and reports `draining` through a graceful shutdown:
+
+- `GET /stats`—the same snapshot as `server.stats`, as JSON (plus
+  `state` and `version`).
+- `GET /metrics`—Prometheus text format (`kino_requests_served_total`,
+  `kino_queue_depth`, `kino_ready`, …).
+- `GET /ready`—`200` when serving, `503` while booting or draining:
+  wire it to your load balancer or Kubernetes readiness probe.
+- `GET /live`—`200` whenever the process is alive: the liveness probe.
+
+`control_token "..."` puts `/stats` and `/metrics` behind
+`Authorization: Bearer`; the probes stay open.
 
 ## Logging
 

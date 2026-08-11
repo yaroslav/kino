@@ -58,4 +58,12 @@ RSpec.describe "server stats" do
     expect(line).to include("mode=:ractor")
     expect(line).to include("served=42")
   end
+
+  it "reads respawns from the native layer" do
+    with_server(ok_app) do |_host, _port, server|
+      id = server.instance_variable_get(:@id)
+      Kino::Native.record_respawn(id)
+      expect(server.stats[:respawns]).to eq(1)
+    end
+  end
 end

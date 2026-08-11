@@ -169,6 +169,17 @@ RSpec.describe Kino::Configuration do
     end
   end
 
+  it "accepts control plane directives" do
+    config = Kino::Configuration.new
+    Kino::Configuration::DSL.new(config).instance_eval do
+      control_bind "127.0.0.1:9293"
+      control_token "s3cret"
+    end
+
+    expect(config[:control_bind]).to eq("127.0.0.1:9293")
+    expect(config[:control_token]).to eq("s3cret")
+  end
+
   it "raises on an unknown setting" do
     expect { described_class.new.set(:nope, 1) }.to raise_error(ArgumentError, /unknown setting/)
   end

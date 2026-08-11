@@ -12,6 +12,10 @@ module Kino
     #   port when configured with port 0)
     attr_reader :port
 
+    # @return [Integer, nil] the control plane's TCP port (nil until #start,
+    #   when the control plane is off, or for a unix-socket bind)
+    attr_reader :control_port
+
     # @return [Symbol] the resolved dispatch mode, :ractor or :threaded
     attr_reader :mode
 
@@ -60,6 +64,12 @@ module Kino
       @tokio_threads = settings[:tokio_threads]
       @tls = validate_tls(settings[:tls])
       @pidfile = settings[:pidfile]
+      @control_bind = settings[:control_bind]&.to_s
+      @control_token = settings[:control_token]&.to_s
+      # An empty token (e.g. control_token ENV["KINO_CONTROL_TOKEN"] with the
+      # var unset) must not half-disable auth: treat it as auth off, not as
+      # "require a zero-length Bearer token".
+      @control_token = nil if @control_token && @control_token.empty?
       @worker_threads = []
       @supervisor = nil
       @started = false
@@ -78,7 +88,7 @@ module Kino
       write_pidfile if @pidfile
       booted = false
       begin
-        @id, @port = Native.server_start(
+        @id, @port, @control_port = Native.server_start(
           bind: @bind, port: @requested_port,
           queue_depth: @queue_depth, queue_timeout_ms: @queue_timeout_ms,
           request_timeout_ms: @request_timeout_ms,
@@ -86,7 +96,9 @@ module Kino
           max_body_size: @max_body_size,
           tokio_threads: @tokio_threads,
           tls_cert: @tls&.fetch(:cert), tls_key: @tls&.fetch(:key),
-          lanes: @lanes, log_requests: @log_requests
+          lanes: @lanes, log_requests: @log_requests,
+          mode: @mode.to_s, workers: @workers, threads: @threads, batch: @batch,
+          control_bind: @control_bind, control_token: @control_token
         )
         booted = true
       ensure
@@ -104,6 +116,7 @@ module Kino
           Thread.new { Worker.run(@id, worker_id, @app, @batch, @on_error) }
         end
       end
+      Native.control_ready(@id)
       @started = true
       self
     end
@@ -144,6 +157,9 @@ module Kino
       end
 
       Native.shutdown_runtime(@id, 1_000)
+      # The control thread reports "draining" for the whole drain and stops
+      # only now, once there is nothing left to report.
+      Native.control_stop(@id)
       # The runtime is gone, so hyper has dropped every pinned buffer;
       # the keeper (and the strings it marked) may now be collected.
       @pin_keeper = nil
@@ -209,12 +225,12 @@ module Kino
     def stats
       base = {
         mode: @mode, lanes: @lanes, workers: @workers, threads: @threads,
-        batch: @batch, respawns: @supervisor ? @supervisor.respawns : 0
+        batch: @batch, respawns: 0
       }
       return base unless @started
 
-      queued, in_flight, served, rejected, timeouts, lane_depths = Native.server_stats(@id)
-      base.merge!(queued:, in_flight:, served:, rejected:, timeouts:)
+      queued, in_flight, served, rejected, timeouts, respawns, lane_depths = Native.server_stats(@id)
+      base.merge!(queued:, in_flight:, served:, rejected:, timeouts:, respawns:)
       base[:lane_depths] = lane_depths if lane_depths
       base
     end

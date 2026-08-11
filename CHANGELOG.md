@@ -1,3 +1,11 @@
+## [Unreleased]
+
+- Control plane: a read-only monitoring listener (`control_bind`,
+  optional `control_token`) serving live stats as JSON at `/stats`,
+  Prometheus metrics at `/metrics`, and `/ready`/`/live` probes, answered
+  from the native layer on a dedicated thread so it stays responsive
+  while workers are busy, stuck, or draining.
+
 ## [0.2.1] - 2026-07-27
 
 - Update Rust dependencies for Kino.

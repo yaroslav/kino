@@ -28,6 +28,8 @@ module Kino
       tls: nil,
       environment: nil,
       pidfile: nil,
+      control_bind: nil,
+      control_token: nil,
       rackup: nil
     }.freeze
 
@@ -199,6 +201,15 @@ module Kino
 
       # Write the master PID here on start.
       def pidfile(path) = @config.set(:pidfile, path.to_s)
+
+      # Serve the read-only control plane (live stats as JSON at /stats,
+      # Prometheus text at /metrics, /ready and /live probes) on this
+      # address: "host:port" or "unix://path". Off unless set.
+      def control_bind(addr) = @config.set(:control_bind, addr.to_s)
+
+      # When set, /stats and /metrics require "Authorization: Bearer <token>".
+      # The probes stay open; they carry no data.
+      def control_token(token) = @config.set(:control_token, token.to_s)
 
       # Rackup file the `kino` CLI loads (positional argument wins).
       def rackup(path) = @config.set(:rackup, path.to_s)

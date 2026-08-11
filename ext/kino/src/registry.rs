@@ -11,6 +11,20 @@ use parking_lot::{Mutex, RwLock};
 use crate::request::RequestCtx;
 use crate::response::Responder;
 
+/// Lifecycle as seen by the control plane's /ready.
+pub const STATE_BOOTING: u8 = 0;
+pub const STATE_READY: u8 = 1;
+pub const STATE_DRAINING: u8 = 2;
+
+/// Boot-time configuration echoed by /stats. Stored resolved: mode is
+/// "ractor" or "threaded", never "auto".
+pub struct Topology {
+    pub mode: String,
+    pub workers: usize,
+    pub threads: usize,
+    pub batch: usize,
+}
+
 /// Requests travel through channels boxed: one heap allocation at accept
 /// time instead of moving ~300 bytes by value through every channel hop.
 pub type BoxedCtx = Box<RequestCtx>;
@@ -45,6 +59,13 @@ pub struct ServerInner {
     /// 413 (truthful Content-Length) or a mid-stream abort (chunked/lying).
     pub max_body_size: usize,
     pub timeouts: AtomicU64,
+    /// Lifecycle for /ready: booting until Ruby reports the workers up,
+    /// draining once stop_accepting runs. Relaxed everywhere (advisory).
+    pub state: std::sync::atomic::AtomicU8,
+    /// Worker respawns, recorded from the Ruby supervisor. Lives here so
+    /// the control plane reads it without touching Ruby.
+    pub respawns: AtomicU64,
+    pub topology: Topology,
     pub https: bool,
     /// Native access log sink (None unless log_requests is on).
     pub access_log: Option<crate::logsink::Sink>,
@@ -188,6 +209,9 @@ pub fn test_server(lanes: bool, queue_depth: usize) -> Arc<ServerInner> {
         request_timeout_ms: 0,
         max_body_size: 0,
         timeouts: AtomicU64::new(0),
+        state: std::sync::atomic::AtomicU8::new(STATE_BOOTING),
+        respawns: AtomicU64::new(0),
+        topology: Topology { mode: "threaded".to_string(), workers: 0, threads: 0, batch: 1 },
         https: false,
         access_log: None,
         lanes,
@@ -272,5 +296,13 @@ mod tests {
         let a = next_server_id();
         let b = next_server_id();
         assert_ne!(a, b);
+    }
+
+    #[test]
+    fn servers_boot_in_the_booting_state_with_zero_respawns() {
+        let server = test_server(false, 4);
+        assert_eq!(server.state.load(Ordering::Relaxed), STATE_BOOTING);
+        assert_eq!(server.respawns.load(Ordering::Relaxed), 0);
+        assert_eq!(server.topology.batch, 1);
     }
 }
