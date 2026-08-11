@@ -602,6 +602,12 @@ fn abort_slot(slot: &WorkerSlot) {
             responder.respond_500_if_unsent();
         }
     }
+    // A dead worker holds nothing: every request it had is answered above
+    // (or already was), so the slot is quiescent from here on. Without
+    // this, a crashed worker's slot reports in_flight>=1 forever (the
+    // supervisor never reuses a slot after a crash), wedging /stats,
+    // /metrics and server.stats with a phantom busy worker.
+    slot.in_flight.store(0, Ordering::Relaxed);
     // Lane mode: this worker is dead. Close its lane so the dispatcher
     // skips it, and drain anything queued; dropping each ctx fires the
     // Drop-500 backstop so those clients aren't left hanging.
@@ -684,6 +690,21 @@ pub fn server_stats(
         server.respawns.load(Ordering::Relaxed),
         lane_depths,
     ))
+}
+
+/// Per-slot rows for Server#stats parity: [index, served, in_flight,
+/// busy_ms] each. Empty when the server is gone.
+pub fn worker_stats(
+    _ruby: &Ruby,
+    server_id: u64,
+) -> Result<Vec<(usize, u64, usize, u64)>, Error> {
+    let Some(server) = registry::try_get(server_id) else {
+        return Ok(Vec::new());
+    };
+    Ok(crate::control::collect_worker_status(&server)
+        .into_iter()
+        .map(|w| (w.index, w.served, w.in_flight, w.busy_ms))
+        .collect())
 }
 
 #[cfg(test)]

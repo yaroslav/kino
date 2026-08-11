@@ -21,6 +21,8 @@ RSpec.describe "server stats" do
       expect(stats[:rejected]).to eq(0)
       expect(stats[:queued]).to eq(0)
       expect(stats[:in_flight]).to eq(0)
+      expect(stats).to have_key(:worker_status)
+      expect(stats[:worker_status]).to be_an(Array)
     end
   end
 
@@ -52,11 +54,13 @@ RSpec.describe "server stats" do
   end
 
   it "formats a stats line for the USR1 handler" do
-    line = Kino::CLI.stats_line({mode: :ractor, served: 42})
+    line = Kino::CLI.stats_line({mode: :ractor, served: 42,
+      worker_status: [{index: 0, served: 1, in_flight: 0, busy_ms: 0}]})
 
     expect(line).to include("Kino stats:")
     expect(line).to include("mode=:ractor")
     expect(line).to include("served=42")
+    expect(line).not_to include("worker_status")
   end
 
   it "reads respawns from the native layer" do

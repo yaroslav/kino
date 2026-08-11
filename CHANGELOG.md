@@ -5,6 +5,10 @@
   Prometheus metrics at `/metrics`, and `/ready`/`/live` probes, answered
   from the native layer on a dedicated thread so it stays responsive
   while workers are busy, stuck, or draining.
+- Per-worker stats: `/stats`, `/metrics`, and `server.stats` now break the
+  counters down per dispatch slot (served, in-flight, and `busy_ms`, the
+  age of the slot's current request), so a stuck slot is visible
+  individually.
 
 ## [0.2.1] - 2026-07-27
 

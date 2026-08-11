@@ -221,7 +221,7 @@ module Kino
     #
     # @return [Hash{Symbol => Object}] mode, lanes, workers, threads,
     #   batch, respawns; plus queued, in_flight, served, rejected,
-    #   timeouts (and lane_depths in lanes mode) once started
+    #   timeouts, worker_status (and lane_depths in lanes mode) once started
     def stats
       base = {
         mode: @mode, lanes: @lanes, workers: @workers, threads: @threads,
@@ -232,6 +232,9 @@ module Kino
       queued, in_flight, served, rejected, timeouts, respawns, lane_depths = Native.server_stats(@id)
       base.merge!(queued:, in_flight:, served:, rejected:, timeouts:, respawns:)
       base[:lane_depths] = lane_depths if lane_depths
+      base[:worker_status] = Native.worker_stats(@id).map do |index, served, in_flight, busy_ms|
+        {index:, served:, in_flight:, busy_ms:}
+      end
       base
     end
 

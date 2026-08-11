@@ -8,6 +8,7 @@ mod control;
 mod env_strings;
 mod gvl;
 mod logsink;
+mod mono;
 mod pin;
 mod queue;
 mod registry;
@@ -41,6 +42,7 @@ fn init(ruby: &Ruby) -> Result<(), Error> {
     native.define_singleton_method("close_queue", function!(server::close_queue, 1))?;
     native.define_singleton_method("queue_stats", function!(server::queue_stats, 1))?;
     native.define_singleton_method("server_stats", function!(server::server_stats, 1))?;
+    native.define_singleton_method("worker_stats", function!(server::worker_stats, 1))?;
     native.define_singleton_method("control_ready", function!(server::control_ready, 1))?;
     native.define_singleton_method("record_respawn", function!(server::record_respawn, 1))?;
     native.define_singleton_method("control_stop", function!(control::control_stop, 1))?;

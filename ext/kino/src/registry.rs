@@ -93,6 +93,12 @@ pub struct WorkerSlot {
     pub lane_tx: Mutex<Option<flume::Sender<BoxedCtx>>>,
     pub lane_rx: Option<flume::Receiver<BoxedCtx>>,
     pub parked: std::sync::atomic::AtomicBool,
+    /// Per-slot sensors (Relaxed, advisory). served/in_flight mirror the
+    /// global counters at slot granularity; last_started_ms (stamped on
+    /// admit) drives busy-age (wedge) reporting.
+    pub served: AtomicU64,
+    pub in_flight: AtomicUsize,
+    pub last_started_ms: AtomicU64,
 }
 
 /// Per-lane depth cap: small, so a slow handler can only ever delay this
@@ -113,6 +119,9 @@ impl WorkerSlot {
             lane_tx: Mutex::new(lane_tx),
             lane_rx,
             parked: std::sync::atomic::AtomicBool::new(false),
+            served: AtomicU64::new(0),
+            in_flight: AtomicUsize::new(0),
+            last_started_ms: AtomicU64::new(0),
         }
     }
 }
@@ -304,5 +313,16 @@ mod tests {
         assert_eq!(server.state.load(Ordering::Relaxed), STATE_BOOTING);
         assert_eq!(server.respawns.load(Ordering::Relaxed), 0);
         assert_eq!(server.topology.batch, 1);
+    }
+
+    #[test]
+    fn fresh_slot_has_zeroed_per_worker_sensors() {
+        let server = test_server(false, 4);
+        server.register_worker();
+        let slots = server.slots.read();
+        let slot = &slots[0];
+        assert_eq!(slot.served.load(Ordering::Relaxed), 0);
+        assert_eq!(slot.in_flight.load(Ordering::Relaxed), 0);
+        assert_eq!(slot.last_started_ms.load(Ordering::Relaxed), 0);
     }
 }

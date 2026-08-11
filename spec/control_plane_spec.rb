@@ -214,6 +214,72 @@ RSpec.describe "control plane" do
       server&.shutdown
     end
 
+    it "reports per-worker rows that sum to the global served count" do
+      with_server(ok_app, workers: 1, threads: 2, control_bind: "127.0.0.1:0") do |host, port, server|
+        5.times { Net::HTTP.get_response(host, "/", port) }
+
+        stats = server.stats
+        expect(stats[:worker_status].sum { |w| w[:served] }).to eq(stats[:served])
+
+        json = JSON.parse(control_get(server.control_port, "/stats").body)
+        expect(json["worker_status"].sum { |w| w["served"] }).to eq(5)
+      end
+    end
+
+    it "shows a wedged slot as in_flight with a growing busy_ms, then clears" do
+      gate = Queue.new
+      released = false
+      wedged = lambda do |_env|
+        gate.pop
+        [200, {"content-type" => "text/plain"}, ["late"]]
+      end
+
+      with_server(wedged, workers: 1, threads: 2, control_bind: "127.0.0.1:0",
+        shutdown_timeout: 0.1) do |host, port, server|
+        req = Thread.new { Net::HTTP.get_response(host, "/", port) }
+        sleep 0.15 # one slot is now inside the app, blocked on the gate
+
+        first = JSON.parse(control_get(server.control_port, "/stats").body)["worker_status"]
+        busy = first.find { |w| w["in_flight"] == 1 }
+        expect(busy).not_to be_nil
+        sleep 0.1
+        second = JSON.parse(control_get(server.control_port, "/stats").body)["worker_status"]
+        grown = second.find { |w| w["index"] == busy["index"] }
+        expect(grown["busy_ms"]).to be >= busy["busy_ms"]
+
+        gate << :go
+        released = true
+        req.join
+        sleep 0.1
+        cleared = JSON.parse(control_get(server.control_port, "/stats").body)["worker_status"]
+        expect(cleared.sum { |w| w["in_flight"] }).to eq(0)
+      ensure
+        # A failed assertion above must never leave the wedged thread
+        # blocked on the gate: release it here so shutdown converges
+        # through the normal drain path instead of the kill escalation.
+        gate << :go unless released
+      end
+    end
+
+    it "emits per-worker metric series" do
+      with_server(ok_app, workers: 1, threads: 2, control_bind: "127.0.0.1:0") do |host, port, server|
+        Net::HTTP.get_response(host, "/", port)
+        body = control_get(server.control_port, "/metrics").body
+        expect(body).to include("# TYPE kino_worker_busy_ms gauge")
+        expect(body).to match(/kino_worker_requests_served_total\{worker="0"\} \d+/)
+      end
+    end
+
+    it "reports per-worker rows in :ractor mode" do
+      shareable = Ractor.shareable_proc { |_env| [200, {"content-type" => "text/plain"}, ["ok"]] }
+      with_server(shareable, mode: :ractor, workers: 2, threads: 1, control_bind: "127.0.0.1:0") do |host, port, server|
+        3.times { Net::HTTP.get_response(host, "/", port) }
+        stats = server.stats
+        expect(stats[:worker_status].length).to eq(2)
+        expect(stats[:worker_status].sum { |w| w[:served] }).to eq(stats[:served])
+      end
+    end
+
     it "keeps answering stats while every worker is wedged" do
       wedged = ->(_env) {
         sleep 30

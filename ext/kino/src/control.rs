@@ -10,6 +10,38 @@ use parking_lot::Mutex;
 
 use crate::registry::{ServerInner, STATE_DRAINING, STATE_READY};
 
+/// One dispatch slot's sensors, captured for a response. busy_ms is the
+/// age of the current in-flight work (0 when idle), the wedge signal.
+pub struct WorkerStat {
+    pub index: usize,
+    pub served: u64,
+    pub in_flight: usize,
+    pub busy_ms: u64,
+}
+
+/// Read every slot's per-worker sensors in one pass under the slots read
+/// lock (the same lock lane_depths uses), computing busy_ms against one
+/// "now". No Ruby, so it is safe on the control thread and below the GVL.
+pub fn collect_worker_status(server: &ServerInner) -> Vec<WorkerStat> {
+    let now = crate::mono::mono_ms();
+    server
+        .slots
+        .read()
+        .iter()
+        .enumerate()
+        .map(|(index, slot)| {
+            let in_flight = slot.in_flight.load(Ordering::Relaxed);
+            let started = slot.last_started_ms.load(Ordering::Relaxed);
+            WorkerStat {
+                index,
+                served: slot.served.load(Ordering::Relaxed),
+                in_flight,
+                busy_ms: if in_flight > 0 { now.saturating_sub(started) } else { 0 },
+            }
+        })
+        .collect()
+}
+
 /// Everything the endpoints report, captured in one pass so a response
 /// is internally consistent.
 pub struct StatsSnapshot {
@@ -26,6 +58,7 @@ pub struct StatsSnapshot {
     pub timeouts: u64,
     pub lane_depths: Option<Vec<usize>>,
     pub state: u8,
+    pub worker_status: Vec<WorkerStat>,
 }
 
 impl StatsSnapshot {
@@ -44,6 +77,7 @@ impl StatsSnapshot {
             timeouts: server.timeouts.load(Ordering::Relaxed),
             lane_depths: server.lane_depths(),
             state: server.state.load(Ordering::Relaxed),
+            worker_status: collect_worker_status(server),
         }
     }
 
@@ -72,6 +106,19 @@ pub fn stats_json(s: &StatsSnapshot) -> String {
         let list = depths.iter().map(|d| d.to_string()).collect::<Vec<_>>().join(",");
         write!(out, r#","lane_depths":[{list}]"#).expect("writing to a String cannot fail");
     }
+    out.push_str(r#","worker_status":["#);
+    for (i, w) in s.worker_status.iter().enumerate() {
+        if i > 0 {
+            out.push(',');
+        }
+        write!(
+            out,
+            r#"{{"index":{},"served":{},"in_flight":{},"busy_ms":{}}}"#,
+            w.index, w.served, w.in_flight, w.busy_ms
+        )
+        .expect("writing to a String cannot fail");
+    }
+    out.push(']');
     write!(
         out,
         r#","state":"{}","version":"{}"}}"#,
@@ -105,6 +152,21 @@ pub fn metrics_text(s: &StatsSnapshot) -> String {
             write!(out, "kino_lane_depth{{lane=\"{lane}\"}} {depth}\n")
                 .expect("writing to a String cannot fail");
         }
+    }
+    out.push_str("# HELP kino_worker_requests_served_total Requests handed to each dispatch slot.\n# TYPE kino_worker_requests_served_total counter\n");
+    for w in &s.worker_status {
+        write!(out, "kino_worker_requests_served_total{{worker=\"{}\"}} {}\n", w.index, w.served)
+            .expect("writing to a String cannot fail");
+    }
+    out.push_str("# HELP kino_worker_in_flight Requests executing in each dispatch slot.\n# TYPE kino_worker_in_flight gauge\n");
+    for w in &s.worker_status {
+        write!(out, "kino_worker_in_flight{{worker=\"{}\"}} {}\n", w.index, w.in_flight)
+            .expect("writing to a String cannot fail");
+    }
+    out.push_str("# HELP kino_worker_busy_ms Age in ms of the current in-flight request per slot (0 when idle).\n# TYPE kino_worker_busy_ms gauge\n");
+    for w in &s.worker_status {
+        write!(out, "kino_worker_busy_ms{{worker=\"{}\"}} {}\n", w.index, w.busy_ms)
+            .expect("writing to a String cannot fail");
     }
     out
 }
@@ -409,7 +471,7 @@ mod tests {
         StatsSnapshot {
             mode: "ractor".to_string(), lanes: false, workers: 8, threads: 1,
             batch: 1, respawns: 2, queued: 3, in_flight: 4, served: 100,
-            rejected: 5, timeouts: 6, lane_depths: None, state,
+            rejected: 5, timeouts: 6, lane_depths: None, state, worker_status: vec![],
         }
     }
 
@@ -497,5 +559,37 @@ mod tests {
         assert_eq!(route("GET", "/metrics", Some("Bearer t"), Some("t"), &ready).0, 200);
         assert_eq!(route("GET", "/ready", None, Some("t"), &ready).0, 200);
         assert_eq!(route("GET", "/live", None, Some("t"), &ready).0, 200);
+    }
+
+    #[test]
+    fn stats_json_emits_worker_status_array() {
+        let mut s = snapshot(crate::registry::STATE_READY);
+        s.worker_status = vec![
+            WorkerStat { index: 0, served: 10, in_flight: 1, busy_ms: 4 },
+            WorkerStat { index: 1, served: 7, in_flight: 0, busy_ms: 0 },
+        ];
+        let json = stats_json(&s);
+        assert!(json.contains(r#""worker_status":[{"index":0,"served":10,"in_flight":1,"busy_ms":4},{"index":1,"served":7,"in_flight":0,"busy_ms":0}]"#), "got {json}");
+    }
+
+    #[test]
+    fn stats_json_worker_status_is_empty_array_with_no_slots() {
+        let s = snapshot(crate::registry::STATE_READY);
+        assert!(stats_json(&s).contains(r#""worker_status":[]"#));
+    }
+
+    #[test]
+    fn metrics_text_emits_per_worker_series() {
+        let mut s = snapshot(crate::registry::STATE_READY);
+        s.worker_status = vec![
+            WorkerStat { index: 0, served: 10, in_flight: 1, busy_ms: 4 },
+            WorkerStat { index: 1, served: 7, in_flight: 0, busy_ms: 0 },
+        ];
+        let text = metrics_text(&s);
+        assert!(text.contains("# TYPE kino_worker_requests_served_total counter"));
+        assert!(text.contains(r#"kino_worker_requests_served_total{worker="0"} 10"#));
+        assert!(text.contains(r#"kino_worker_in_flight{worker="1"} 0"#));
+        assert!(text.contains("# TYPE kino_worker_busy_ms gauge"));
+        assert!(text.contains(r#"kino_worker_busy_ms{worker="0"} 4"#));
     }
 }

@@ -100,11 +100,14 @@ module Kino
       end.join
     end
 
-    # One-line stats dump (the SIGUSR1 handler's output).
+    # One-line stats dump (the SIGUSR1 handler's output). Excludes
+    # worker_status: it's an array with one entry per execution slot, and
+    # printing it inline would break the one-line contract (see /stats for
+    # per-worker detail).
     # @param stats [Hash{Symbol => Object}] see {Kino::Server#stats}
     # @return [String]
     def stats_line(stats)
-      dim("Kino stats: #{stats.map { |k, v| "#{k}=#{v.inspect}" }.join(" ")}")
+      dim("Kino stats: #{stats.except(:worker_status).map { |k, v| "#{k}=#{v.inspect}" }.join(" ")}")
     end
 
     # The two banner halves around Server#start: credits before, the ready

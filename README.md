@@ -332,7 +332,7 @@ cost):
 server.stats
 # => {mode: :ractor, lanes: false, workers: 8, threads: 1, batch: 1,
 #     respawns: 0, queued: 0, in_flight: 2, served: 1041, rejected: 0,
-#     timeouts: 0}
+#     timeouts: 0, worker_status: [...]}
 # plus lane_depths: [...] when lane dispatch is on
 ```
 
@@ -352,6 +352,17 @@ is busy or stuck, and reports `draining` through a graceful shutdown:
   `state` and `version`).
 - `GET /metrics`—Prometheus text format (`kino_requests_served_total`,
   `kino_queue_depth`, `kino_ready`, …).
+
+Both `/stats` and `/metrics` also break the counters down per dispatch
+slot: `/stats` carries a `worker_status` array (`index`, `served`,
+`in_flight`, `busy_ms`) and `/metrics` emits `kino_worker_*{worker="N"}`
+series, one entry per execution slot (`workers × threads`)—a crashed
+worker's slot is never reused, so it stays in the list with its counters
+frozen where they stopped, meaning the array (and its `worker="N"` metric
+series) grows by one across every respawn. `busy_ms` is how long the
+slot's current request has been running (0 when idle), so a single slot
+climbing while the rest sit at 0 is your stuck worker.
+
 - `GET /ready`—`200` when serving, `503` while booting or draining:
   wire it to your load balancer or Kubernetes readiness probe.
 - `GET /live`—`200` whenever the process is alive: the liveness probe.
