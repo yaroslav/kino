@@ -17,6 +17,12 @@ module Kino
       @draining = false
       @lock = Mutex.new
       @supervisor_threads = []
+      @worker_slots = {}
+      @slot_to_worker = {}
+      @replaced = {}
+      # The first replacement's index; `replace` increments before using it,
+      # so this starts one below the first free index (@workers).
+      @next_worker_index = @workers - 1
     end
 
     def start
@@ -29,20 +35,55 @@ module Kino
     def shutdown(timeout)
       @lock.synchronize { @draining = true }
       deadline = Process.clock_gettime(Process::CLOCK_MONOTONIC) + timeout
-      @supervisor_threads.each do |thread|
+      @lock.synchronize { @supervisor_threads.dup }.each do |thread|
         remaining = deadline - Process.clock_gettime(Process::CLOCK_MONOTONIC)
         thread.join([remaining, 0.01].max)
       end
     end
 
     def done?
-      @supervisor_threads.none?(&:alive?)
+      @lock.synchronize { @supervisor_threads.dup }.none?(&:alive?)
     end
 
     # Block until the workers exit on their own (drain elsewhere): join
     # without flipping the draining flag.
     def join
-      @supervisor_threads.each(&:join)
+      @lock.synchronize { @supervisor_threads.dup }.each(&:join)
+    end
+
+    # Replace the ractor owning slot `worker_id`: spawn a fresh supervised
+    # ractor, then quarantine the old ractor's slots. The old supervisor
+    # thread stays blocked in ractor.value on the wedged ractor (it and the
+    # ractor leak until process exit; a wedged ractor cannot be
+    # force-killed). Returns true if a replacement was spawned.
+    def replace(worker_id)
+      worker_index = @lock.synchronize { @slot_to_worker[worker_id] }
+      return false unless worker_index
+
+      # Idempotent per ractor: a stale monitor snapshot can list two sibling
+      # slots of the same ractor, only the first replaces it.
+      claimed = @lock.synchronize do
+        if @replaced.key?(worker_index)
+          false
+        else
+          @replaced[worker_index] = true
+          true
+        end
+      end
+      return false unless claimed
+
+      new_index = @lock.synchronize { @next_worker_index += 1 }
+      thread =
+        begin
+          supervise(new_index) # spawn FIRST, nothing quarantined yet
+        rescue
+          @lock.synchronize { @replaced.delete(worker_index) } # allow retry next tick
+          raise
+        end
+      slot_ids = @lock.synchronize { @worker_slots[worker_index] } || []
+      slot_ids.each { |id| Native.quarantine_slot(@server_id, id) } # quarantine only after success
+      @lock.synchronize { @supervisor_threads << thread }
+      true
     end
 
     private
@@ -51,7 +92,7 @@ module Kino
       Thread.new do
         crashes = 0
         loop do
-          ractor, worker_ids = spawn_worker
+          ractor, worker_ids = spawn_worker(index)
           begin
             ractor.value # blocks until the ractor terminates
             break        # clean exit: queue closed, workers drained
@@ -79,8 +120,12 @@ module Kino
     # Fresh ractor + fresh native slots. Slots are never reused across
     # respawns: stale interrupt kicks and dead weak refs go down with the
     # old slot.
-    def spawn_worker
+    def spawn_worker(worker_index)
       worker_ids = Array.new(@threads) { Native.register_worker(@server_id) }
+      @lock.synchronize do
+        @worker_slots[worker_index] = worker_ids
+        worker_ids.each { |id| @slot_to_worker[id] = worker_index }
+      end
       ractor = Ractor.new(@server_id, worker_ids, @app, @batch, @on_error) do |server_id, ids, app, batch, on_error|
         ids.map do |id|
           Thread.new do

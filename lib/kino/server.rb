@@ -70,8 +70,19 @@ module Kino
       # var unset) must not half-disable auth: treat it as auth off, not as
       # "require a zero-length Bearer token".
       @control_token = nil if @control_token && @control_token.empty?
+      @quarantine_timeout_ms = settings[:quarantine_timeout] ? (Float(settings[:quarantine_timeout]) * 1000).round : nil
+      @quarantine_max =
+        if settings[:quarantine_max]
+          Integer(settings[:quarantine_max])
+        elsif @mode == :ractor
+          @workers
+        else
+          @workers * @threads
+        end
       @worker_threads = []
+      @worker_threads_lock = Mutex.new
       @supervisor = nil
+      @quarantine_monitor = nil
       @started = false
     end
 
@@ -111,11 +122,9 @@ module Kino
         @supervisor = RactorSupervisor.new(@id, @app, workers: @workers, threads: @threads,
           batch: @batch, on_error: @on_error).start
       else
-        @worker_threads = (@workers * @threads).times.map do
-          worker_id = Native.register_worker(@id)
-          Thread.new { Worker.run(@id, worker_id, @app, @batch, @on_error) }
-        end
+        @worker_threads = (@workers * @threads).times.map { spawn_worker_thread }
       end
+      start_quarantine_monitor if @quarantine_timeout_ms
       Native.control_ready(@id)
       @started = true
       self
@@ -132,6 +141,7 @@ module Kino
     def shutdown(timeout: nil)
       return unless @started
 
+      @quarantine_monitor&.stop
       deadline = monotonic_now + (timeout || @shutdown_timeout)
       Native.stop_accepting(@id)
 
@@ -221,7 +231,8 @@ module Kino
     #
     # @return [Hash{Symbol => Object}] mode, lanes, workers, threads,
     #   batch, respawns; plus queued, in_flight, served, rejected,
-    #   timeouts, worker_status (and lane_depths in lanes mode) once started
+    #   timeouts, worker_status, quarantined (and lane_depths in lanes mode)
+    #   once started
     def stats
       base = {
         mode: @mode, lanes: @lanes, workers: @workers, threads: @threads,
@@ -232,13 +243,53 @@ module Kino
       queued, in_flight, served, rejected, timeouts, respawns, lane_depths = Native.server_stats(@id)
       base.merge!(queued:, in_flight:, served:, rejected:, timeouts:, respawns:)
       base[:lane_depths] = lane_depths if lane_depths
-      base[:worker_status] = Native.worker_stats(@id).map do |index, served, in_flight, busy_ms|
-        {index:, served:, in_flight:, busy_ms:}
+      rows = Native.worker_stats(@id)
+      base[:worker_status] = rows.map do |index, served, in_flight, busy_ms, quarantined|
+        {index:, served:, in_flight:, busy_ms:, quarantined:}
       end
+      base[:quarantined] = rows.count { |row| row[4] }
       base
     end
 
     private
+
+    # Register a fresh dispatch slot and run a worker thread on it; returns
+    # the thread. Used at boot and by the quarantine replacer.
+    def spawn_worker_thread
+      worker_id = Native.register_worker(@id)
+      Thread.new { Worker.run(@id, worker_id, @app, @batch, @on_error) }
+    end
+
+    # Track a replacement thread spawned outside the initial pool assignment
+    # (the quarantine replacer) so shutdown's join/done?/kill sweeps see it.
+    def track_replacement_thread(thread)
+      @worker_threads_lock.synchronize { @worker_threads << thread }
+    end
+
+    # A replacer.replace(worker_id) spawns a replacement worker, then
+    # quarantines the wedged slot, mode-appropriately. In :ractor the
+    # supervisor is the replacer; in :threaded a small object over
+    # spawn_worker_thread.
+    def start_quarantine_monitor
+      replacer =
+        if @supervisor
+          @supervisor
+        else
+          server = self
+          Class.new do
+            define_method(:replace) do |worker_id|
+              thread = server.send(:spawn_worker_thread) # spawn FIRST (may raise ThreadError)
+              Native.quarantine_slot(server.instance_variable_get(:@id), worker_id) # quarantine after success
+              server.send(:track_replacement_thread, thread)
+              true
+            end
+          end.new
+        end
+      @quarantine_monitor = QuarantineMonitor.new(
+        server_id: @id, timeout_ms: @quarantine_timeout_ms,
+        max: @quarantine_max, replacer: replacer
+      ).start
+    end
 
     def validate_tls(tls)
       return nil if tls.nil?
@@ -339,7 +390,8 @@ module Kino
       if @supervisor
         @supervisor.shutdown([deadline - monotonic_now, 0].max)
       else
-        @worker_threads.each do |thread|
+        threads = @worker_threads_lock.synchronize { @worker_threads.dup }
+        threads.each do |thread|
           thread.join([deadline - monotonic_now, 0.01].max)
         end
       end
@@ -349,7 +401,8 @@ module Kino
       if @supervisor
         @supervisor.done?
       else
-        @worker_threads.none?(&:alive?)
+        threads = @worker_threads_lock.synchronize { @worker_threads.dup }
+        threads.none?(&:alive?)
       end
     end
 
@@ -359,7 +412,8 @@ module Kino
         # by abort_all_inflight. The stuck ractor leaks until process exit.
         Native.log_error("shutdown deadline passed with stuck ractor workers") unless @supervisor.done?
       else
-        @worker_threads.each { |thread| thread.kill if thread.alive? }
+        threads = @worker_threads_lock.synchronize { @worker_threads.dup }
+        threads.each { |thread| thread.kill if thread.alive? }
       end
     end
 

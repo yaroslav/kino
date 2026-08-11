@@ -106,6 +106,8 @@ module Kino
       def pidfile: (String path) -> untyped
       def control_bind: (String addr) -> String
       def control_token: (String token) -> String
+      def quarantine_timeout: (Numeric? seconds) -> untyped
+      def quarantine_max: (int count) -> untyped
       def rackup: (String path) -> untyped
     end
   end

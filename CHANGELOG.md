@@ -1,5 +1,9 @@
 ## [Unreleased]
 
+- Stuck-worker quarantine: past `quarantine_timeout`, a wedged dispatch
+  slot is quarantined and a replacement worker is spawned to restore
+  capacity (capped by `quarantine_max`), surfaced via `/stats`, `/metrics`,
+  and `server.stats`. The wedged worker is never force-killed.
 - Control plane: a read-only monitoring listener (`control_bind`,
   optional `control_token`) serving live stats as JSON at `/stats`,
   Prometheus metrics at `/metrics`, and `/ready`/`/live` probes, answered

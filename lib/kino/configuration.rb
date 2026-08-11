@@ -30,6 +30,8 @@ module Kino
       pidfile: nil,
       control_bind: nil,
       control_token: nil,
+      quarantine_timeout: nil,
+      quarantine_max: nil,
       rackup: nil
     }.freeze
 
@@ -210,6 +212,28 @@ module Kino
       # When set, /stats and /metrics require "Authorization: Bearer <token>".
       # The probes stay open; they carry no data.
       def control_token(token) = @config.set(:control_token, token.to_s)
+
+      # Quarantine a dispatch slot whose current request has run longer
+      # than this many seconds, spawning a replacement to restore capacity.
+      # Off unless set. Set it above your slowest legitimate endpoint (and
+      # typically above request_timeout).
+      def quarantine_timeout(seconds)
+        seconds &&= Float(seconds)
+        if seconds && seconds <= 0
+          raise ArgumentError, "quarantine_timeout must be greater than 0 (got #{seconds})"
+        end
+        @config.set(:quarantine_timeout, seconds)
+      end
+
+      # Cap on the total number of replacement events over the process
+      # lifetime. Past the cap the monitor stops replacing and the server
+      # runs at reduced capacity. Default: the worker count in :ractor
+      # mode, workers x threads in :threaded.
+      def quarantine_max(count)
+        count = Integer(count)
+        raise ArgumentError, "quarantine_max must be >= 1 (got #{count})" if count < 1
+        @config.set(:quarantine_max, count)
+      end
 
       # Rackup file the `kino` CLI loads (positional argument wins).
       def rackup(path) = @config.set(:rackup, path.to_s)

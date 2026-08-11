@@ -65,6 +65,8 @@ pub struct ServerInner {
     /// Worker respawns, recorded from the Ruby supervisor. Lives here so
     /// the control plane reads it without touching Ruby.
     pub respawns: AtomicU64,
+    /// Replacements spawned by the quarantine monitor (Relaxed, advisory).
+    pub quarantine_replacements: AtomicU64,
     pub topology: Topology,
     pub https: bool,
     /// Native access log sink (None unless log_requests is on).
@@ -99,6 +101,9 @@ pub struct WorkerSlot {
     pub served: AtomicU64,
     pub in_flight: AtomicUsize,
     pub last_started_ms: AtomicU64,
+    /// Set by the quarantine monitor when this slot is abandoned as wedged:
+    /// excluded from wedge detection, and its busy_ms is reported as 0.
+    pub quarantined: std::sync::atomic::AtomicBool,
 }
 
 /// Per-lane depth cap: small, so a slow handler can only ever delay this
@@ -122,6 +127,7 @@ impl WorkerSlot {
             served: AtomicU64::new(0),
             in_flight: AtomicUsize::new(0),
             last_started_ms: AtomicU64::new(0),
+            quarantined: std::sync::atomic::AtomicBool::new(false),
         }
     }
 }
@@ -220,6 +226,7 @@ pub fn test_server(lanes: bool, queue_depth: usize) -> Arc<ServerInner> {
         timeouts: AtomicU64::new(0),
         state: std::sync::atomic::AtomicU8::new(STATE_BOOTING),
         respawns: AtomicU64::new(0),
+        quarantine_replacements: AtomicU64::new(0),
         topology: Topology { mode: "threaded".to_string(), workers: 0, threads: 0, batch: 1 },
         https: false,
         access_log: None,
@@ -324,5 +331,13 @@ mod tests {
         assert_eq!(slot.served.load(Ordering::Relaxed), 0);
         assert_eq!(slot.in_flight.load(Ordering::Relaxed), 0);
         assert_eq!(slot.last_started_ms.load(Ordering::Relaxed), 0);
+    }
+
+    #[test]
+    fn fresh_slot_is_not_quarantined() {
+        let server = test_server(false, 4);
+        server.register_worker();
+        assert!(!server.slots.read()[0].quarantined.load(Ordering::Relaxed));
+        assert_eq!(server.quarantine_replacements.load(Ordering::Relaxed), 0);
     }
 }

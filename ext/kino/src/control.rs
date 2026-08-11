@@ -17,6 +17,7 @@ pub struct WorkerStat {
     pub served: u64,
     pub in_flight: usize,
     pub busy_ms: u64,
+    pub quarantined: bool,
 }
 
 /// Read every slot's per-worker sensors in one pass under the slots read
@@ -30,13 +31,21 @@ pub fn collect_worker_status(server: &ServerInner) -> Vec<WorkerStat> {
         .iter()
         .enumerate()
         .map(|(index, slot)| {
+            let quarantined = slot.quarantined.load(Ordering::Relaxed);
             let in_flight = slot.in_flight.load(Ordering::Relaxed);
             let started = slot.last_started_ms.load(Ordering::Relaxed);
             WorkerStat {
                 index,
                 served: slot.served.load(Ordering::Relaxed),
                 in_flight,
-                busy_ms: if in_flight > 0 { now.saturating_sub(started) } else { 0 },
+                // A quarantined slot is a known, handled wedge: report 0 so
+                // it never re-trips detection or reads as a live wedge.
+                busy_ms: if quarantined || in_flight == 0 {
+                    0
+                } else {
+                    now.saturating_sub(started)
+                },
+                quarantined,
             }
         })
         .collect()
@@ -59,10 +68,14 @@ pub struct StatsSnapshot {
     pub lane_depths: Option<Vec<usize>>,
     pub state: u8,
     pub worker_status: Vec<WorkerStat>,
+    pub quarantined_count: usize,
+    pub quarantine_replacements: u64,
 }
 
 impl StatsSnapshot {
     pub fn take(server: &ServerInner) -> Self {
+        let worker_status = collect_worker_status(server);
+        let quarantined_count = worker_status.iter().filter(|w| w.quarantined).count();
         StatsSnapshot {
             mode: server.topology.mode.clone(),
             lanes: server.lanes,
@@ -77,7 +90,9 @@ impl StatsSnapshot {
             timeouts: server.timeouts.load(Ordering::Relaxed),
             lane_depths: server.lane_depths(),
             state: server.state.load(Ordering::Relaxed),
-            worker_status: collect_worker_status(server),
+            worker_status,
+            quarantined_count,
+            quarantine_replacements: server.quarantine_replacements.load(Ordering::Relaxed),
         }
     }
 
@@ -113,16 +128,16 @@ pub fn stats_json(s: &StatsSnapshot) -> String {
         }
         write!(
             out,
-            r#"{{"index":{},"served":{},"in_flight":{},"busy_ms":{}}}"#,
-            w.index, w.served, w.in_flight, w.busy_ms
+            r#"{{"index":{},"served":{},"in_flight":{},"busy_ms":{},"quarantined":{}}}"#,
+            w.index, w.served, w.in_flight, w.busy_ms, w.quarantined
         )
         .expect("writing to a String cannot fail");
     }
     out.push(']');
     write!(
         out,
-        r#","state":"{}","version":"{}"}}"#,
-        s.state_name(),
+        r#","quarantined":{},"state":"{}","version":"{}"}}"#,
+        s.quarantined_count, s.state_name(),
         env!("CARGO_PKG_VERSION")
     )
     .expect("writing to a String cannot fail");
@@ -168,6 +183,10 @@ pub fn metrics_text(s: &StatsSnapshot) -> String {
         write!(out, "kino_worker_busy_ms{{worker=\"{}\"}} {}\n", w.index, w.busy_ms)
             .expect("writing to a String cannot fail");
     }
+    out.push_str("# HELP kino_quarantined_workers Dispatch slots abandoned as wedged.\n# TYPE kino_quarantined_workers gauge\n");
+    write!(out, "kino_quarantined_workers {}\n", s.quarantined_count).expect("writing to a String cannot fail");
+    out.push_str("# HELP kino_quarantine_replacements_total Replacement workers spawned after a wedge.\n# TYPE kino_quarantine_replacements_total counter\n");
+    write!(out, "kino_quarantine_replacements_total {}\n", s.quarantine_replacements).expect("writing to a String cannot fail");
     out
 }
 
@@ -472,6 +491,7 @@ mod tests {
             mode: "ractor".to_string(), lanes: false, workers: 8, threads: 1,
             batch: 1, respawns: 2, queued: 3, in_flight: 4, served: 100,
             rejected: 5, timeouts: 6, lane_depths: None, state, worker_status: vec![],
+            quarantined_count: 0, quarantine_replacements: 0,
         }
     }
 
@@ -565,11 +585,11 @@ mod tests {
     fn stats_json_emits_worker_status_array() {
         let mut s = snapshot(crate::registry::STATE_READY);
         s.worker_status = vec![
-            WorkerStat { index: 0, served: 10, in_flight: 1, busy_ms: 4 },
-            WorkerStat { index: 1, served: 7, in_flight: 0, busy_ms: 0 },
+            WorkerStat { index: 0, served: 10, in_flight: 1, busy_ms: 4, quarantined: false },
+            WorkerStat { index: 1, served: 7, in_flight: 0, busy_ms: 0, quarantined: false },
         ];
         let json = stats_json(&s);
-        assert!(json.contains(r#""worker_status":[{"index":0,"served":10,"in_flight":1,"busy_ms":4},{"index":1,"served":7,"in_flight":0,"busy_ms":0}]"#), "got {json}");
+        assert!(json.contains(r#""worker_status":[{"index":0,"served":10,"in_flight":1,"busy_ms":4,"quarantined":false},{"index":1,"served":7,"in_flight":0,"busy_ms":0,"quarantined":false}]"#), "got {json}");
     }
 
     #[test]
@@ -582,8 +602,8 @@ mod tests {
     fn metrics_text_emits_per_worker_series() {
         let mut s = snapshot(crate::registry::STATE_READY);
         s.worker_status = vec![
-            WorkerStat { index: 0, served: 10, in_flight: 1, busy_ms: 4 },
-            WorkerStat { index: 1, served: 7, in_flight: 0, busy_ms: 0 },
+            WorkerStat { index: 0, served: 10, in_flight: 1, busy_ms: 4, quarantined: false },
+            WorkerStat { index: 1, served: 7, in_flight: 0, busy_ms: 0, quarantined: false },
         ];
         let text = metrics_text(&s);
         assert!(text.contains("# TYPE kino_worker_requests_served_total counter"));
@@ -591,5 +611,46 @@ mod tests {
         assert!(text.contains(r#"kino_worker_in_flight{worker="1"} 0"#));
         assert!(text.contains("# TYPE kino_worker_busy_ms gauge"));
         assert!(text.contains(r#"kino_worker_busy_ms{worker="0"} 4"#));
+    }
+
+    #[test]
+    fn quarantined_slot_reports_zero_busy_ms() {
+        let server = crate::registry::test_server(false, 4);
+        server.register_worker();
+        {
+            let slots = server.slots.read();
+            slots[0].in_flight.store(1, std::sync::atomic::Ordering::Relaxed);
+            slots[0].last_started_ms.store(0, std::sync::atomic::Ordering::Relaxed);
+            slots[0].quarantined.store(true, std::sync::atomic::Ordering::Relaxed);
+        }
+        let rows = collect_worker_status(&server);
+        assert!(rows[0].quarantined);
+        assert_eq!(rows[0].busy_ms, 0);
+    }
+
+    #[test]
+    fn stats_json_reports_quarantine() {
+        let mut s = snapshot(crate::registry::STATE_READY);
+        s.quarantined_count = 1;
+        s.worker_status = vec![
+            WorkerStat { index: 0, served: 3, in_flight: 1, busy_ms: 0, quarantined: true },
+            WorkerStat { index: 1, served: 9, in_flight: 1, busy_ms: 5, quarantined: false },
+        ];
+        let json = stats_json(&s);
+        assert!(json.contains(r#""quarantined":1"#), "top-level count: {json}");
+        assert!(json.contains(r#"{"index":0,"served":3,"in_flight":1,"busy_ms":0,"quarantined":true}"#), "{json}");
+        assert!(json.contains(r#""quarantined":false"#));
+    }
+
+    #[test]
+    fn metrics_text_reports_quarantine() {
+        let mut s = snapshot(crate::registry::STATE_READY);
+        s.quarantined_count = 2;
+        s.quarantine_replacements = 7;
+        let text = metrics_text(&s);
+        assert!(text.contains("# TYPE kino_quarantined_workers gauge"));
+        assert!(text.contains("kino_quarantined_workers 2"));
+        assert!(text.contains("# TYPE kino_quarantine_replacements_total counter"));
+        assert!(text.contains("kino_quarantine_replacements_total 7"));
     }
 }

@@ -322,6 +322,28 @@ after the client got its 500—the only place a tracker sees errors
 raised while the response was being written (in `:ractor` mode, build
 the handler with `Ractor.shareable_proc`).
 
+## Stuck-worker quarantine
+
+`quarantine_timeout: seconds` (or `quarantine_timeout 60` in `kino.rb`)
+quarantines a dispatch slot whose request has run longer than the deadline
+and spawns a replacement worker to restore capacity—distinct from
+`request_timeout`, which gives the client a 504 but leaves the slot
+occupied. `quarantine_max` (default: the worker count in `:ractor` mode,
+workers × threads in `:threaded`) caps the total number of replacement
+events over the process lifetime—past it the monitor stops replacing and
+the server runs at reduced capacity.
+
+The wedged worker is never interrupted or force-killed, and its slot stays
+quarantined for good. In `:threaded` mode, if the blocked thread
+eventually returns, it keeps serving requests on that same slot—but the
+slot itself stays flagged quarantined (busy_ms reported as 0) for the rest
+of the process; in `:ractor` mode the wedged ractor (and its supervisor
+thread) leaks until the process exits, since a wedged ractor cannot be
+safely interrupted. Monitor quarantine activity via `server.stats`
+(top-level `quarantined` count and per-slot `worker_status[].quarantined`
+flag), `GET /stats` (same), and `GET /metrics` (`kino_quarantined_workers`
+gauge and `kino_quarantine_replacements_total` counter).
+
 ## Stats
 
 `server.stats` returns a live snapshot: the configuration plus counters

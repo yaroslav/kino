@@ -45,6 +45,7 @@ require_relative "kino/stream"
 require_relative "kino/configuration"
 require_relative "kino/worker"
 require_relative "kino/ractor_supervisor"
+require_relative "kino/quarantine_monitor"
 require_relative "kino/server"
 
 # Hand the frozen shareable singletons to the native layer: it sets them

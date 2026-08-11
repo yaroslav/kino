@@ -115,6 +115,23 @@
 # The probes stay open; they carry no data.
 # control_token ENV["KINO_CONTROL_TOKEN"]
 
+## Quarantine
+
+# Quarantine a dispatch slot whose current request has run longer than
+# this many seconds and spawn a replacement to restore capacity. The
+# wedged worker is never interrupted or force-killed; its slot stays
+# quarantined for good (in :ractor mode the ractor itself leaks until
+# process exit, since a wedged ractor cannot be safely interrupted). Off
+# unless set; set it above your slowest legitimate endpoint, and above
+# request_timeout.
+# quarantine_timeout 60
+
+# Cap on the total number of replacement events over the process
+# lifetime. Past the cap the monitor stops replacing and the server runs
+# at reduced capacity. Default: the worker count in :ractor mode, workers
+# x threads in :threaded.
+# quarantine_max 8
+
 ## App
 
 # Rackup file to load (a command-line argument wins).

@@ -126,6 +126,7 @@ pub fn server_start(ruby: &Ruby, config: magnus::RHash) -> Result<(u64, u16, Opt
         timeouts: std::sync::atomic::AtomicU64::new(0),
         state: std::sync::atomic::AtomicU8::new(registry::STATE_BOOTING),
         respawns: std::sync::atomic::AtomicU64::new(0),
+        quarantine_replacements: std::sync::atomic::AtomicU64::new(0),
         topology: registry::Topology { mode, workers, threads, batch },
         https: acceptor.is_some(),
         access_log: log_requests.then(|| crate::logsink::Sink::new(std::io::stdout())),
@@ -693,18 +694,35 @@ pub fn server_stats(
 }
 
 /// Per-slot rows for Server#stats parity: [index, served, in_flight,
-/// busy_ms] each. Empty when the server is gone.
+/// busy_ms, quarantined] each. Empty when the server is gone.
 pub fn worker_stats(
     _ruby: &Ruby,
     server_id: u64,
-) -> Result<Vec<(usize, u64, usize, u64)>, Error> {
+) -> Result<Vec<(usize, u64, usize, u64, bool)>, Error> {
     let Some(server) = registry::try_get(server_id) else {
         return Ok(Vec::new());
     };
     Ok(crate::control::collect_worker_status(&server)
         .into_iter()
-        .map(|w| (w.index, w.served, w.in_flight, w.busy_ms))
+        .map(|w| (w.index, w.served, w.in_flight, w.busy_ms, w.quarantined))
         .collect())
+}
+
+/// Mark a slot quarantined (the monitor has abandoned it as wedged).
+pub fn quarantine_slot(ruby: &Ruby, server_id: u64, worker_id: usize) -> Result<(), Error> {
+    if let Some(server) = registry::try_get(server_id) {
+        let slot = server.slot(ruby, worker_id)?;
+        slot.quarantined.store(true, Ordering::Relaxed);
+    }
+    Ok(())
+}
+
+/// One replacement spawned by the quarantine monitor.
+pub fn record_quarantine_replacement(_ruby: &Ruby, server_id: u64) -> Result<(), Error> {
+    if let Some(server) = registry::try_get(server_id) {
+        server.quarantine_replacements.fetch_add(1, Ordering::Relaxed);
+    }
+    Ok(())
 }
 
 #[cfg(test)]

@@ -180,6 +180,30 @@ RSpec.describe Kino::Configuration do
     expect(config[:control_token]).to eq("s3cret")
   end
 
+  it "accepts quarantine directives" do
+    config = Kino::Configuration.new
+    Kino::Configuration::DSL.new(config).instance_eval do
+      quarantine_timeout 60
+      quarantine_max 4
+    end
+    expect(config[:quarantine_timeout]).to eq(60)
+    expect(config[:quarantine_max]).to eq(4)
+  end
+
+  it "rejects non-positive quarantine settings" do
+    config = Kino::Configuration.new
+    dsl = Kino::Configuration::DSL.new(config)
+
+    expect { dsl.instance_eval { quarantine_timeout(0) } }
+      .to raise_error(ArgumentError, /quarantine_timeout/)
+    expect { dsl.instance_eval { quarantine_timeout(-1) } }
+      .to raise_error(ArgumentError, /quarantine_timeout/)
+    expect { dsl.instance_eval { quarantine_max(0) } }
+      .to raise_error(ArgumentError, /quarantine_max/)
+    expect { dsl.instance_eval { quarantine_max(-1) } }
+      .to raise_error(ArgumentError, /quarantine_max/)
+  end
+
   it "raises on an unknown setting" do
     expect { described_class.new.set(:nope, 1) }.to raise_error(ArgumentError, /unknown setting/)
   end
