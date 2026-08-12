@@ -7,13 +7,14 @@ module Kino
   # ractor, Exception from app code included) wakes it to 500 the in-flight
   # requests and respawn. Clean exits (queue drained) end supervision.
   class RactorSupervisor
-    def initialize(server_id, app, workers:, threads:, batch: 1, on_error: nil)
+    def initialize(server_id, app, workers:, threads:, batch: 1, hooks: nil, on_worker_exit: nil)
       @server_id = server_id
       @app = app
       @workers = workers
       @threads = threads
       @batch = batch
-      @on_error = on_error
+      @hooks = hooks
+      @on_worker_exit = on_worker_exit
       @draining = false
       @lock = Mutex.new
       @supervisor_threads = []
@@ -95,17 +96,19 @@ module Kino
           ractor, worker_ids = spawn_worker(index)
           begin
             ractor.value # blocks until the ractor terminates
+            fire_worker_exit(index, nil) # clean exit: queue drained
             break        # clean exit: queue closed, workers drained
           rescue Ractor::Error => e
             # The ractor died mid-flight. Anything it was serving will never
             # be answered by Ruby: 500 those clients NOW (not when GC gets
             # around to dropping the dead heap), then decide on respawn.
             worker_ids.each { |id| Native.abort_inflight(@server_id, id) }
+            cause = (e.respond_to?(:cause) && e.cause) ? e.cause : e
+            fire_worker_exit(index, cause)
             break if draining?
 
             crashes += 1
             Native.record_respawn(@server_id)
-            cause = (e.respond_to?(:cause) && e.cause) ? e.cause : e
             Native.log_error("worker ractor #{index} crashed (#{cause.class}: #{cause.message}); respawning")
             # Policy (crash recovery): unlimited respawn
             # keeps the server up under rare crashes but turns a
@@ -114,6 +117,16 @@ module Kino
             # availability for fail-fast. Current policy: respawn forever.
           end
         end
+      end
+    end
+
+    def fire_worker_exit(index, error)
+      return unless @on_worker_exit
+
+      begin
+        @on_worker_exit.call(index, error)
+      rescue => e
+        Native.log_error("on_worker_exit hook raised #{e.class}: #{e.message}")
       end
     end
 
@@ -126,13 +139,13 @@ module Kino
         @worker_slots[worker_index] = worker_ids
         worker_ids.each { |id| @slot_to_worker[id] = worker_index }
       end
-      ractor = Ractor.new(@server_id, worker_ids, @app, @batch, @on_error) do |server_id, ids, app, batch, on_error|
+      ractor = Ractor.new(@server_id, worker_ids, @app, @batch, @hooks) do |server_id, ids, app, batch, hooks|
         ids.map do |id|
           Thread.new do
             # Crashes surface via Ractor#value in the supervisor; don't also
             # spray the backtrace to stderr from inside the dying ractor.
             Thread.current.report_on_exception = false
-            Kino::Worker.run(server_id, id, app, batch, on_error)
+            Kino::Worker.run(server_id, id, app, batch, hooks)
           end
         end.each(&:join)
       end

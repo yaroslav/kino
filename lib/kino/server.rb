@@ -45,8 +45,17 @@ module Kino
       @bind = settings[:bind]
       @requested_port = settings[:port]
       @workers = Integer(settings[:workers])
-      @on_error = validate_on_error(settings[:on_error])
+      @on_error = validate_hook(settings[:on_error], :on_error)
+      @after_worker_boot = validate_hook(settings[:after_worker_boot], :after_worker_boot)
+      @after_request_complete = validate_hook(settings[:after_request_complete], :after_request_complete)
+      @after_boot = validate_hook(settings[:after_boot], :after_boot)
+      @on_worker_exit = validate_hook(settings[:on_worker_exit], :on_worker_exit)
       @mode = resolve_mode(settings[:mode])
+      @worker_hooks = WorkerHooks.new(
+        on_error: @on_error,
+        after_worker_boot: @after_worker_boot,
+        after_request_complete: @after_request_complete
+      )
       # Default threads per mode: 1 in :ractor (threads inside a ractor
       # share its lock; a measured +17% on fast handlers; raise `workers`
       # for I/O concurrency instead), 3 in :threaded (threads ARE the
@@ -120,12 +129,13 @@ module Kino
       @pin_keeper = Native.pin_keeper(@id)
       if @mode == :ractor
         @supervisor = RactorSupervisor.new(@id, @app, workers: @workers, threads: @threads,
-          batch: @batch, on_error: @on_error).start
+          batch: @batch, hooks: @worker_hooks, on_worker_exit: @on_worker_exit).start
       else
         @worker_threads = (@workers * @threads).times.map { spawn_worker_thread }
       end
       start_quarantine_monitor if @quarantine_timeout_ms
       Native.control_ready(@id)
+      fire_hook(@after_boot, "after_boot")
       @started = true
       self
     end
@@ -257,7 +267,17 @@ module Kino
     # the thread. Used at boot and by the quarantine replacer.
     def spawn_worker_thread
       worker_id = Native.register_worker(@id)
-      Thread.new { Worker.run(@id, worker_id, @app, @batch, @on_error) }
+      Thread.new do
+        error = nil
+        begin
+          Worker.run(@id, worker_id, @app, @batch, @worker_hooks)
+        rescue Exception => e # rubocop:disable Lint/RescueException -- a hard crash in a threaded worker thread
+          error = e
+          raise
+        ensure
+          fire_hook(@on_worker_exit, "on_worker_exit", worker_id, error)
+        end
+      end
     end
 
     # Track a replacement thread spawned outside the initial pool assignment
@@ -300,13 +320,23 @@ module Kino
       {cert: String(tls[:cert]), key: String(tls[:key])}
     end
 
-    def validate_on_error(handler)
+    def validate_hook(handler, name)
       return nil if handler.nil?
       unless handler.respond_to?(:call)
-        raise ArgumentError, "on_error must respond to #call (got #{handler.class})"
+        raise ArgumentError, "#{name} must respond to #call (got #{handler.class})"
       end
 
       handler
+    end
+
+    def fire_hook(hook, name, *args)
+      return unless hook
+
+      begin
+        hook.call(*args)
+      rescue => e
+        Native.log_error("#{name} hook raised #{e.class}: #{e.message}")
+      end
     end
 
     def monotonic_now
@@ -434,9 +464,11 @@ module Kino
             "Ractor.shareable_proc endpoints); try Ractor.make_shareable(app) " \
             "or mode: :threaded"
         end
-        unless @on_error.nil? || Ractor.shareable?(@on_error)
+        unshareable = worker_context_hooks.reject { |_name, hook| hook.nil? || Ractor.shareable?(hook) }
+        unless unshareable.empty?
+          name = unshareable.first.first
           raise Error,
-            "mode: :ractor requires a Ractor-shareable on_error handler " \
+            "mode: :ractor requires a Ractor-shareable #{name} hook " \
             "(build it with Ractor.shareable_proc, or use mode: :threaded)"
         end
         :ractor
@@ -444,8 +476,8 @@ module Kino
         if !Ractor.shareable?(@app)
           warn "Kino: app is not Ractor-shareable; falling back to mode: :threaded"
           :threaded
-        elsif !(@on_error.nil? || Ractor.shareable?(@on_error))
-          warn "Kino: on_error handler is not Ractor-shareable; falling back to mode: :threaded"
+        elsif (bad = worker_context_hooks.find { |_name, hook| !(hook.nil? || Ractor.shareable?(hook)) })
+          warn "Kino: #{bad.first} hook is not Ractor-shareable; falling back to mode: :threaded"
           :threaded
         else
           :ractor
@@ -453,6 +485,14 @@ module Kino
       else
         raise ArgumentError, "mode must be :auto, :ractor, or :threaded (got #{requested.inspect})"
       end
+    end
+
+    # The hooks that ride into worker context (a ractor in :ractor mode)
+    # and so must be Ractor-shareable there. after_boot and on_worker_exit
+    # run on the main thread and are exempt.
+    def worker_context_hooks
+      [[:on_error, @on_error], [:after_worker_boot, @after_worker_boot],
+        [:after_request_complete, @after_request_complete]]
     end
   end
 end

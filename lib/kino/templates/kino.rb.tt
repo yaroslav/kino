@@ -87,6 +87,27 @@
 # must be Ractor-shareable (build it with Ractor.shareable_proc).
 # on_error ->(error, env) { ExceptionService.capture(error) }
 
+# Called once on the main thread after the worker pool is up. Wire
+# readiness here (sd_notify, a "server ready" metric).
+# after_boot { }
+
+# Called once inside each worker before it serves, with the worker's slot
+# id. In :ractor mode it runs inside the worker ractor, so it must be
+# Ractor-shareable (build it with Ractor.shareable_proc).
+# after_worker_boot { |worker_id| }
+
+# Called inside the worker after each successful response, with (env,
+# status). This is the hot path: leave it unset for zero cost. In :ractor
+# mode it must be Ractor-shareable.
+# after_request_complete { |env, status| }
+
+# Called on the main thread when a worker exits, with (worker_index,
+# error). error is the crash cause, or nil on a clean exit. In :ractor
+# mode worker_index identifies the exited ractor (0..workers - 1), a
+# different number space than after_worker_boot's slot id: do not
+# correlate boot and exit by that number in :ractor mode.
+# on_worker_exit { |worker_index, error| }
+
 ## Lifecycle
 
 # On shutdown, give in-flight requests this many seconds to finish.

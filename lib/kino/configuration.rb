@@ -23,6 +23,10 @@ module Kino
       lanes: false,
       log_requests: false,
       on_error: nil,
+      after_boot: nil,
+      after_worker_boot: nil,
+      after_request_complete: nil,
+      on_worker_exit: nil,
       shutdown_timeout: 30,
       tokio_threads: nil,
       tls: nil,
@@ -188,6 +192,24 @@ module Kino
       # delivery error; wire your error tracker here. Takes a callable
       # or a block. Must be Ractor-shareable in :ractor mode.
       def on_error(handler = nil, &block) = @config.set(:on_error, handler || block)
+
+      # Called once on the main thread after the worker pool is up. The
+      # readiness seam (wire sd_notify or a "server ready" metric here).
+      def after_boot(handler = nil, &block) = @config.set(:after_boot, handler || block)
+
+      # Called once inside each worker (a ractor in :ractor mode) before it
+      # serves, with the worker's slot id. Must be Ractor-shareable in
+      # :ractor mode (build it with Ractor.shareable_proc).
+      def after_worker_boot(handler = nil, &block) = @config.set(:after_worker_boot, handler || block)
+
+      # Called inside the worker after each successful response with
+      # (env, status). Hot path: leave unset for zero cost. Must be
+      # Ractor-shareable in :ractor mode.
+      def after_request_complete(handler = nil, &block) = @config.set(:after_request_complete, handler || block)
+
+      # Called on the main thread when a worker exits, with (worker_index,
+      # error_or_nil). error is the crash cause, or nil on a clean exit.
+      def on_worker_exit(handler = nil, &block) = @config.set(:on_worker_exit, handler || block)
 
       # Graceful-shutdown drain deadline in seconds.
       def shutdown_timeout(seconds) = @config.set(:shutdown_timeout, seconds)

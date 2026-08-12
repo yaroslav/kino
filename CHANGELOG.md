@@ -1,5 +1,10 @@
 ## [Unreleased]
 
+- Lifecycle hooks: `after_boot`, `after_worker_boot`,
+  `after_request_complete`, and `on_worker_exit` join `on_error`, so apps
+  can wire their own metrics, readiness, and error tracking. The
+  worker-context hooks must be Ractor-shareable in `:ractor` mode; a raising
+  hook is logged and never kills a worker.
 - Stuck-worker quarantine: past `quarantine_timeout`, a wedged dispatch
   slot is quarantined and a replacement worker is spawned to restore
   capacity (capped by `quarantine_max`), surfaced via `/stats`, `/metrics`,

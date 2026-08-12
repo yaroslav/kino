@@ -322,6 +322,22 @@ after the client got its 500—the only place a tracker sees errors
 raised while the response was being written (in `:ractor` mode, build
 the handler with `Ractor.shareable_proc`).
 
+## Lifecycle hooks
+
+Kino fires four lifecycle hooks alongside `on_error`, split by firing context.
+
+**Worker-context hooks** run inside the worker and are available to all workers:
+- `after_worker_boot { |worker_id| }`: runs once before the worker begins serving, with its slot id. In `:ractor` mode it runs inside the worker ractor and must be `Ractor.shareable_proc`.
+- `after_request_complete { |env, status| }`: fires inside the worker after each successful response. This is the hot path—leave it unset for zero cost. In `:ractor` mode it must be `Ractor.shareable_proc`.
+
+**Main-context hooks** run on the main thread, outside workers, and are plain procs:
+- `after_boot { }`: fires once after the worker pool is up. Wire readiness here—sd_notify, a "server ready" metric, and so on.
+- `on_worker_exit { |worker_index, error| }`: fires when a worker exits, with its index and the crash cause (or nil on a clean exit).
+
+`after_worker_boot`'s argument is the worker's slot id, while in `:ractor` mode `on_worker_exit`'s argument identifies the exited ractor (`0`..`workers - 1`)—a different number space—so don't correlate boot and exit by that number in `:ractor` mode.
+
+A raising hook is logged and never kills a worker.
+
 ## Stuck-worker quarantine
 
 `quarantine_timeout: seconds` (or `quarantine_timeout 60` in `kino.rb`)

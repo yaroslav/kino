@@ -204,6 +204,21 @@ RSpec.describe Kino::Configuration do
       .to raise_error(ArgumentError, /quarantine_max/)
   end
 
+  it "accepts the lifecycle hook directives" do
+    boot = -> {}
+    config = Kino::Configuration.new
+    Kino::Configuration::DSL.new(config).instance_eval do
+      after_boot(&boot)
+      after_worker_boot { |i| i }
+      after_request_complete { |env, status| status }
+      on_worker_exit { |i, err| err }
+    end
+    expect(config[:after_boot]).to eq(boot)
+    expect(config[:after_worker_boot]).to respond_to(:call)
+    expect(config[:after_request_complete]).to respond_to(:call)
+    expect(config[:on_worker_exit]).to respond_to(:call)
+  end
+
   it "raises on an unknown setting" do
     expect { described_class.new.set(:nope, 1) }.to raise_error(ArgumentError, /unknown setting/)
   end
