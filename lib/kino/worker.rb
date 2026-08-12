@@ -101,14 +101,7 @@ module Kino
       # because nothing may escape this block and kill the worker.
       Native.log_error(error_log_line(e))
       request.abort
-      cb = hooks&.on_error
-      if cb
-        begin
-          cb.call(e, env)
-        rescue => hook_error
-          Native.log_error("on_error hook raised #{hook_error.class}: #{hook_error.message}")
-        end
-      end
+      HookFire.fire(hooks&.on_error, "on_error", e, env)
       NOT_FUSED
     end
 
@@ -158,25 +151,11 @@ module Kino
     end
 
     def fire_after_worker_boot(hooks, worker_id)
-      cb = hooks&.after_worker_boot
-      return unless cb
-
-      begin
-        cb.call(worker_id)
-      rescue => e
-        Native.log_error("after_worker_boot hook raised #{e.class}: #{e.message}")
-      end
+      HookFire.fire(hooks&.after_worker_boot, "after_worker_boot", worker_id)
     end
 
     def fire_after_request_complete(hooks, env, status)
-      cb = hooks&.after_request_complete
-      return unless cb
-
-      begin
-        cb.call(env, status)
-      rescue => e
-        Native.log_error("after_request_complete hook raised #{e.class}: #{e.message}")
-      end
+      HookFire.fire(hooks&.after_request_complete, "after_request_complete", env, status)
     end
 
     private_class_method :handle_one, :process, :serve, :deliver_streaming,

@@ -169,6 +169,19 @@ impl QueueHistogram {
     }
 }
 
+impl Default for QueueHistogram {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl QueueHistogramSnapshot {
+    /// Summed queue wait, converted from the stored microseconds to seconds.
+    pub fn sum_seconds(&self) -> f64 {
+        self.sum_us as f64 / 1_000_000.0
+    }
+}
+
 impl WorkerSlot {
     fn new(lanes: bool) -> Self {
         let (lane_tx, lane_rx) = if lanes {

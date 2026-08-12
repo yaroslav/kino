@@ -140,7 +140,7 @@ pub fn stats_json(s: &StatsSnapshot) -> String {
         out,
         r#","queue_time":{{"count":{},"sum_seconds":{}}}"#,
         s.queue_histogram.count,
-        s.queue_histogram.sum_us as f64 / 1_000_000.0
+        s.queue_histogram.sum_seconds()
     )
     .expect("writing to a String cannot fail");
     write!(
@@ -153,63 +153,71 @@ pub fn stats_json(s: &StatsSnapshot) -> String {
     out
 }
 
+/// One HELP/TYPE/sample triple for a single-value metric.
+fn metric(out: &mut String, name: &str, kind: &str, help: &str, value: impl std::fmt::Display) {
+    use std::fmt::Write;
+    writeln!(out, "# HELP {name} {help}\n# TYPE {name} {kind}\n{name} {value}")
+        .expect("writing to a String cannot fail");
+}
+
+/// One HELP/TYPE header followed by one `name{label="key"} value` line per
+/// row, for the labeled per-lane and per-worker series.
+fn series<K: std::fmt::Display, V: std::fmt::Display>(
+    out: &mut String,
+    name: &str,
+    kind: &str,
+    help: &str,
+    label: &str,
+    rows: impl Iterator<Item = (K, V)>,
+) {
+    use std::fmt::Write;
+    writeln!(out, "# HELP {name} {help}\n# TYPE {name} {kind}").expect("writing to a String cannot fail");
+    for (key, value) in rows {
+        writeln!(out, "{name}{{{label}=\"{key}\"}} {value}").expect("writing to a String cannot fail");
+    }
+}
+
+/// Prometheus text exposition (version 0.0.4) for every stat in `s`.
 pub fn metrics_text(s: &StatsSnapshot) -> String {
     use std::fmt::Write;
     let mut out = String::with_capacity(1024);
-    let mut metric = |name: &str, kind: &str, help: &str, value: String| {
-        write!(out, "# HELP {name} {help}\n# TYPE {name} {kind}\n{name} {value}\n")
-            .expect("writing to a String cannot fail");
-    };
-    metric("kino_requests_served_total", "counter", "Requests handed to Ruby workers.", s.served.to_string());
-    metric("kino_requests_rejected_total", "counter", "Requests rejected with a 503.", s.rejected.to_string());
-    metric("kino_request_timeouts_total", "counter", "Responses past the request timeout (client got a 504).", s.timeouts.to_string());
-    metric("kino_worker_respawns_total", "counter", "Crashed workers respawned by the supervisor.", s.respawns.to_string());
-    metric("kino_queue_depth", "gauge", "Requests waiting for a worker.", s.queued.to_string());
-    metric("kino_requests_in_flight", "gauge", "Requests currently inside Ruby workers.", s.in_flight.to_string());
-    metric("kino_workers", "gauge", "Configured worker count.", s.workers.to_string());
-    metric("kino_threads_per_worker", "gauge", "Configured threads per worker.", s.threads.to_string());
-    metric("kino_ready", "gauge", "1 when serving, 0 while booting or draining.",
-        if s.state == STATE_READY { "1" } else { "0" }.to_string());
+    metric(&mut out, "kino_requests_served_total", "counter", "Requests handed to Ruby workers.", s.served);
+    metric(&mut out, "kino_requests_rejected_total", "counter", "Requests rejected with a 503.", s.rejected);
+    metric(&mut out, "kino_request_timeouts_total", "counter", "Responses past the request timeout (client got a 504).", s.timeouts);
+    metric(&mut out, "kino_worker_respawns_total", "counter", "Crashed workers respawned by the supervisor.", s.respawns);
+    metric(&mut out, "kino_queue_depth", "gauge", "Requests waiting for a worker.", s.queued);
+    metric(&mut out, "kino_requests_in_flight", "gauge", "Requests currently inside Ruby workers.", s.in_flight);
+    metric(&mut out, "kino_workers", "gauge", "Configured worker count.", s.workers);
+    metric(&mut out, "kino_threads_per_worker", "gauge", "Configured threads per worker.", s.threads);
+    metric(&mut out, "kino_ready", "gauge", "1 when serving, 0 while booting or draining.",
+        if s.state == STATE_READY { "1" } else { "0" });
     if let Some(depths) = &s.lane_depths {
-        out.push_str("# HELP kino_lane_depth Queued requests in each worker lane.\n# TYPE kino_lane_depth gauge\n");
-        for (lane, depth) in depths.iter().enumerate() {
-            write!(out, "kino_lane_depth{{lane=\"{lane}\"}} {depth}\n")
-                .expect("writing to a String cannot fail");
-        }
+        series(&mut out, "kino_lane_depth", "gauge", "Queued requests in each worker lane.", "lane",
+            depths.iter().enumerate().map(|(lane, depth)| (lane, *depth)));
     }
-    out.push_str("# HELP kino_worker_requests_served_total Requests handed to each dispatch slot.\n# TYPE kino_worker_requests_served_total counter\n");
-    for w in &s.worker_status {
-        write!(out, "kino_worker_requests_served_total{{worker=\"{}\"}} {}\n", w.index, w.served)
-            .expect("writing to a String cannot fail");
-    }
-    out.push_str("# HELP kino_worker_in_flight Requests executing in each dispatch slot.\n# TYPE kino_worker_in_flight gauge\n");
-    for w in &s.worker_status {
-        write!(out, "kino_worker_in_flight{{worker=\"{}\"}} {}\n", w.index, w.in_flight)
-            .expect("writing to a String cannot fail");
-    }
-    out.push_str("# HELP kino_worker_busy_ms Age in ms of the current in-flight request per slot (0 when idle).\n# TYPE kino_worker_busy_ms gauge\n");
-    for w in &s.worker_status {
-        write!(out, "kino_worker_busy_ms{{worker=\"{}\"}} {}\n", w.index, w.busy_ms)
-            .expect("writing to a String cannot fail");
-    }
-    out.push_str("# HELP kino_quarantined_workers Dispatch slots abandoned as wedged.\n# TYPE kino_quarantined_workers gauge\n");
-    write!(out, "kino_quarantined_workers {}\n", s.quarantined_count).expect("writing to a String cannot fail");
-    out.push_str("# HELP kino_quarantine_replacements_total Replacement workers spawned after a wedge.\n# TYPE kino_quarantine_replacements_total counter\n");
-    write!(out, "kino_quarantine_replacements_total {}\n", s.quarantine_replacements).expect("writing to a String cannot fail");
+    series(&mut out, "kino_worker_requests_served_total", "counter", "Requests handed to each dispatch slot.", "worker",
+        s.worker_status.iter().map(|w| (w.index, w.served)));
+    series(&mut out, "kino_worker_in_flight", "gauge", "Requests executing in each dispatch slot.", "worker",
+        s.worker_status.iter().map(|w| (w.index, w.in_flight)));
+    series(&mut out, "kino_worker_busy_ms", "gauge", "Age in ms of the current in-flight request per slot (0 when idle).", "worker",
+        s.worker_status.iter().map(|w| (w.index, w.busy_ms)));
+    metric(&mut out, "kino_quarantined_workers", "gauge", "Dispatch slots abandoned as wedged.", s.quarantined_count);
+    metric(&mut out, "kino_quarantine_replacements_total", "counter", "Replacement workers spawned after a wedge.", s.quarantine_replacements);
     let h = &s.queue_histogram;
     out.push_str("# HELP kino_request_queue_seconds Seconds requests waited in the queue before a worker admitted them.\n# TYPE kino_request_queue_seconds histogram\n");
     let mut cumulative = 0u64;
     for (i, bound_us) in crate::registry::QUEUE_BOUNDS_US.iter().enumerate() {
         cumulative += h.buckets[i];
         let le = *bound_us as f64 / 1_000_000.0;
-        write!(out, "kino_request_queue_seconds_bucket{{le=\"{le}\"}} {cumulative}\n")
+        writeln!(out, "kino_request_queue_seconds_bucket{{le=\"{le}\"}} {cumulative}")
             .expect("writing to a String cannot fail");
     }
-    write!(out, "kino_request_queue_seconds_bucket{{le=\"+Inf\"}} {}\n", cumulative + h.overflow)
+    let total = cumulative + h.overflow;
+    writeln!(out, "kino_request_queue_seconds_bucket{{le=\"+Inf\"}} {total}")
         .expect("writing to a String cannot fail");
-    write!(out, "kino_request_queue_seconds_sum {}\n", h.sum_us as f64 / 1_000_000.0)
+    writeln!(out, "kino_request_queue_seconds_sum {}", h.sum_seconds())
         .expect("writing to a String cannot fail");
-    write!(out, "kino_request_queue_seconds_count {}\n", cumulative + h.overflow)
+    writeln!(out, "kino_request_queue_seconds_count {total}")
         .expect("writing to a String cannot fail");
     out
 }
@@ -282,6 +290,8 @@ const CONTROL_DEADLINE: Duration = Duration::from_secs(5);
 /// handful, connections past the cap are dropped at accept.
 const CONTROL_MAX_CONNECTIONS: usize = 16;
 
+/// A bound control listener: TCP with its resolved port, or a unix socket
+/// with its path.
 pub enum ControlBind {
     Tcp(std::net::TcpListener, u16),
     Unix(std::os::unix::net::UnixListener, std::path::PathBuf),
@@ -326,7 +336,7 @@ pub fn bind_control(addr: &str) -> std::io::Result<ControlBind> {
 
 struct ControlHandle {
     stop_tx: tokio::sync::watch::Sender<bool>,
-    join: Option<std::thread::JoinHandle<()>>,
+    join: std::thread::JoinHandle<()>,
     unix_path: Option<std::path::PathBuf>,
 }
 
@@ -367,7 +377,7 @@ pub fn start(
     };
     control_registry().lock().insert(
         id,
-        ControlHandle { stop_tx, join: Some(join), unix_path },
+        ControlHandle { stop_tx, join, unix_path },
     );
     Ok(port)
 }
@@ -377,11 +387,9 @@ pub fn start(
 /// is gone (the control thread must be the last thing reporting).
 pub fn control_stop(_ruby: &magnus::Ruby, server_id: u64) -> Result<(), magnus::Error> {
     let handle = control_registry().lock().remove(&server_id);
-    if let Some(mut handle) = handle {
+    if let Some(handle) = handle {
         let _ = handle.stop_tx.send(true);
-        if let Some(join) = handle.join.take() {
-            let _ = join.join();
-        }
+        let _ = handle.join.join();
         if let Some(path) = handle.unix_path {
             let _ = std::fs::remove_file(path);
         }
@@ -425,21 +433,21 @@ async fn serve(
     mut stop_rx: tokio::sync::watch::Receiver<bool>,
 ) {
     let permits = Arc::new(tokio::sync::Semaphore::new(CONTROL_MAX_CONNECTIONS));
-    loop {
-        // Accept errors (EMFILE and friends) back off instead of
-        // exiting: a dead control loop reads as a dead process to
-        // liveness probes, which must never happen while we serve.
-        macro_rules! conn {
-            ($accepted:expr) => {
-                match $accepted {
-                    Ok((stream, _)) => {
-                        let Ok(permit) = permits.clone().try_acquire_owned() else { continue };
-                        spawn_connection(stream, permit, server.clone(), token.clone());
-                    }
-                    Err(_) => tokio::time::sleep(Duration::from_millis(100)).await,
+    // Accept errors (EMFILE and friends) back off instead of exiting: a dead
+    // control loop reads as a dead process to liveness probes, which must
+    // never happen while we serve.
+    macro_rules! conn {
+        ($accepted:expr) => {
+            match $accepted {
+                Ok((stream, _)) => {
+                    let Ok(permit) = permits.clone().try_acquire_owned() else { continue };
+                    spawn_connection(stream, permit, server.clone(), token.clone());
                 }
-            };
-        }
+                Err(_) => tokio::time::sleep(Duration::from_millis(100)).await,
+            }
+        };
+    }
+    loop {
         match &listener {
             TcpOrUnix::Tcp(l) => tokio::select! {
                 _ = stop_rx.changed() => return,
@@ -516,7 +524,7 @@ mod tests {
             batch: 1, respawns: 2, queued: 3, in_flight: 4, served: 100,
             rejected: 5, timeouts: 6, lane_depths: None, state, worker_status: vec![],
             quarantined_count: 0, quarantine_replacements: 0,
-            queue_histogram: crate::registry::QueueHistogramSnapshot { buckets: [0; 14], overflow: 0, sum_us: 0, count: 0 },
+            queue_histogram: crate::registry::QueueHistogramSnapshot { buckets: [0; crate::registry::QUEUE_BOUNDS_US.len()], overflow: 0, sum_us: 0, count: 0 },
         }
     }
 
@@ -682,7 +690,7 @@ mod tests {
     #[test]
     fn metrics_text_emits_a_cumulative_queue_histogram() {
         let mut s = snapshot(crate::registry::STATE_READY);
-        let mut buckets = [0u64; 14];
+        let mut buckets = [0u64; crate::registry::QUEUE_BOUNDS_US.len()];
         buckets[0] = 3; // <= 0.0005s
         buckets[2] = 1; // <= 0.0025s
         s.queue_histogram = crate::registry::QueueHistogramSnapshot {
@@ -702,7 +710,7 @@ mod tests {
     fn stats_json_reports_queue_time() {
         let mut s = snapshot(crate::registry::STATE_READY);
         s.queue_histogram = crate::registry::QueueHistogramSnapshot {
-            buckets: [0; 14], overflow: 0, sum_us: 1_500_000, count: 2,
+            buckets: [0; crate::registry::QUEUE_BOUNDS_US.len()], overflow: 0, sum_us: 1_500_000, count: 2,
         };
         let json = stats_json(&s);
         assert!(json.contains(r#""queue_time":{"count":2,"sum_seconds":1.5}"#), "{json}");

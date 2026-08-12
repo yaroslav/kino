@@ -90,13 +90,12 @@ pub fn server_start(ruby: &Ruby, config: magnus::RHash) -> Result<(u64, u16, Opt
 
     let control_bind_addr: Option<String> = cfg_opt(ruby, config, "control_bind")?;
     let control_token: Option<String> = cfg_opt(ruby, config, "control_token")?;
-    let control_bind = match &control_bind_addr {
-        Some(addr) => Some(
-            crate::control::bind_control(addr)
-                .map_err(|e| io_error(ruby, "control bind failed", e))?,
-        ),
-        None => None,
-    };
+    let control_bind = control_bind_addr
+        .as_deref()
+        .map(|addr| {
+            crate::control::bind_control(addr).map_err(|e| io_error(ruby, "control bind failed", e))
+        })
+        .transpose()?;
 
     let mut builder = tokio::runtime::Builder::new_multi_thread();
     builder.enable_all().thread_name("kino-tokio");
@@ -702,15 +701,18 @@ pub fn queue_time(_ruby: &Ruby, server_id: u64) -> Result<(u64, f64), Error> {
         return Ok((0, 0.0));
     };
     let h = server.queue_histogram.snapshot();
-    Ok((h.count, h.sum_us as f64 / 1_000_000.0))
+    Ok((h.count, h.sum_seconds()))
 }
+
+/// One worker slot's [index, served, in_flight, busy_ms, quarantined] row.
+pub type WorkerStatRow = (usize, u64, usize, u64, bool);
 
 /// Per-slot rows for Server#stats parity: [index, served, in_flight,
 /// busy_ms, quarantined] each. Empty when the server is gone.
 pub fn worker_stats(
     _ruby: &Ruby,
     server_id: u64,
-) -> Result<Vec<(usize, u64, usize, u64, bool)>, Error> {
+) -> Result<Vec<WorkerStatRow>, Error> {
     let Some(server) = registry::try_get(server_id) else {
         return Ok(Vec::new());
     };

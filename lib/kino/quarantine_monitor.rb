@@ -39,6 +39,15 @@ module Kino
     end
 
     def tick
+      scan_slots
+    rescue => e
+      # A bad tick must never kill the monitor.
+      Native.log_error("quarantine tick error: #{e.class}: #{e.message}")
+    ensure
+      sleep @tick
+    end
+
+    def scan_slots
       Native.worker_stats(@server_id).each do |index, _served, _in_flight, busy_ms, quarantined|
         next if quarantined || busy_ms <= @timeout_ms
 
@@ -56,11 +65,6 @@ module Kino
           @at_cap_logged = false
         end
       end
-      sleep @tick
-    rescue => e
-      # A bad tick must never kill the monitor.
-      Native.log_error("quarantine tick error: #{e.class}: #{e.message}")
-      sleep @tick
     end
   end
 end

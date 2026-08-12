@@ -96,7 +96,7 @@ module Kino
           ractor, worker_ids = spawn_worker(index)
           begin
             ractor.value # blocks until the ractor terminates
-            fire_worker_exit(index, nil) # clean exit: queue drained
+            HookFire.fire(@on_worker_exit, "on_worker_exit", index, nil) # clean exit: queue drained
             break        # clean exit: queue closed, workers drained
           rescue Ractor::Error => e
             # The ractor died mid-flight. Anything it was serving will never
@@ -104,7 +104,7 @@ module Kino
             # around to dropping the dead heap), then decide on respawn.
             worker_ids.each { |id| Native.abort_inflight(@server_id, id) }
             cause = (e.respond_to?(:cause) && e.cause) ? e.cause : e
-            fire_worker_exit(index, cause)
+            HookFire.fire(@on_worker_exit, "on_worker_exit", index, cause)
             break if draining?
 
             crashes += 1
@@ -117,16 +117,6 @@ module Kino
             # availability for fail-fast. Current policy: respawn forever.
           end
         end
-      end
-    end
-
-    def fire_worker_exit(index, error)
-      return unless @on_worker_exit
-
-      begin
-        @on_worker_exit.call(index, error)
-      rescue => e
-        Native.log_error("on_worker_exit hook raised #{e.class}: #{e.message}")
       end
     end
 

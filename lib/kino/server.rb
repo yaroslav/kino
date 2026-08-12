@@ -135,7 +135,7 @@ module Kino
       end
       start_quarantine_monitor if @quarantine_timeout_ms
       Native.control_ready(@id)
-      fire_hook(@after_boot, "after_boot")
+      HookFire.fire(@after_boot, "after_boot")
       @started = true
       self
     end
@@ -257,7 +257,7 @@ module Kino
       base[:worker_status] = rows.map do |index, served, in_flight, busy_ms, quarantined|
         {index:, served:, in_flight:, busy_ms:, quarantined:}
       end
-      base[:quarantined] = rows.count { |row| row[4] }
+      base[:quarantined] = rows.count { |_index, _served, _in_flight, _busy_ms, quarantined| quarantined }
       count, sum_seconds = Native.queue_time(@id)
       base[:queue_time] = {count:, sum_seconds:}
       base
@@ -277,7 +277,7 @@ module Kino
           error = e
           raise
         ensure
-          fire_hook(@on_worker_exit, "on_worker_exit", worker_id, error)
+          HookFire.fire(@on_worker_exit, "on_worker_exit", worker_id, error)
         end
       end
     end
@@ -288,25 +288,35 @@ module Kino
       @worker_threads_lock.synchronize { @worker_threads << thread }
     end
 
+    # @private
+    # The :threaded-mode quarantine replacer: spawns a replacement worker
+    # thread, quarantines the wedged slot, then tracks the new thread so
+    # shutdown's join/done?/kill sweeps see it. Built from bound Method
+    # objects instead of a server reference, so it drives the server
+    # through those methods without send or instance_variable_get.
+    class ThreadedReplacer
+      def initialize(server_id:, spawner:, tracker:)
+        @server_id = server_id
+        @spawner = spawner
+        @tracker = tracker
+      end
+
+      def replace(worker_id)
+        thread = @spawner.call # spawn FIRST (may raise ThreadError)
+        Native.quarantine_slot(@server_id, worker_id) # quarantine after success
+        @tracker.call(thread)
+        true
+      end
+    end
+    private_constant :ThreadedReplacer
+
     # A replacer.replace(worker_id) spawns a replacement worker, then
     # quarantines the wedged slot, mode-appropriately. In :ractor the
     # supervisor is the replacer; in :threaded a small object over
     # spawn_worker_thread.
     def start_quarantine_monitor
-      replacer =
-        if @supervisor
-          @supervisor
-        else
-          server = self
-          Class.new do
-            define_method(:replace) do |worker_id|
-              thread = server.send(:spawn_worker_thread) # spawn FIRST (may raise ThreadError)
-              Native.quarantine_slot(server.instance_variable_get(:@id), worker_id) # quarantine after success
-              server.send(:track_replacement_thread, thread)
-              true
-            end
-          end.new
-        end
+      replacer = @supervisor || ThreadedReplacer.new(server_id: @id, spawner: method(:spawn_worker_thread),
+        tracker: method(:track_replacement_thread))
       @quarantine_monitor = QuarantineMonitor.new(
         server_id: @id, timeout_ms: @quarantine_timeout_ms,
         max: @quarantine_max, replacer: replacer
@@ -329,16 +339,6 @@ module Kino
       end
 
       handler
-    end
-
-    def fire_hook(hook, name, *args)
-      return unless hook
-
-      begin
-        hook.call(*args)
-      rescue => e
-        Native.log_error("#{name} hook raised #{e.class}: #{e.message}")
-      end
     end
 
     def monotonic_now
@@ -466,9 +466,7 @@ module Kino
             "Ractor.shareable_proc endpoints); try Ractor.make_shareable(app) " \
             "or mode: :threaded"
         end
-        unshareable = worker_context_hooks.reject { |_name, hook| hook.nil? || Ractor.shareable?(hook) }
-        unless unshareable.empty?
-          name = unshareable.first.first
+        if (name = unshareable_worker_hook_name)
           raise Error,
             "mode: :ractor requires a Ractor-shareable #{name} hook " \
             "(build it with Ractor.shareable_proc, or use mode: :threaded)"
@@ -478,8 +476,8 @@ module Kino
         if !Ractor.shareable?(@app)
           warn "Kino: app is not Ractor-shareable; falling back to mode: :threaded"
           :threaded
-        elsif (bad = worker_context_hooks.find { |_name, hook| !(hook.nil? || Ractor.shareable?(hook)) })
-          warn "Kino: #{bad.first} hook is not Ractor-shareable; falling back to mode: :threaded"
+        elsif (name = unshareable_worker_hook_name)
+          warn "Kino: #{name} hook is not Ractor-shareable; falling back to mode: :threaded"
           :threaded
         else
           :ractor
@@ -495,6 +493,15 @@ module Kino
     def worker_context_hooks
       [[:on_error, @on_error], [:after_worker_boot, @after_worker_boot],
         [:after_request_complete, @after_request_complete]]
+    end
+
+    # The name of the first worker-context hook that is set but not
+    # Ractor-shareable, or nil if all set ones are. Used by both the
+    # :ractor raise and the :auto warn/fallback branches, so "first
+    # offender" is defined once.
+    def unshareable_worker_hook_name
+      bad = worker_context_hooks.find { |_name, hook| !(hook.nil? || Ractor.shareable?(hook)) }
+      bad&.first
     end
   end
 end
