@@ -70,6 +70,7 @@ pub struct StatsSnapshot {
     pub worker_status: Vec<WorkerStat>,
     pub quarantined_count: usize,
     pub quarantine_replacements: u64,
+    pub queue_histogram: crate::registry::QueueHistogramSnapshot,
 }
 
 impl StatsSnapshot {
@@ -93,6 +94,7 @@ impl StatsSnapshot {
             worker_status,
             quarantined_count,
             quarantine_replacements: server.quarantine_replacements.load(Ordering::Relaxed),
+            queue_histogram: server.queue_histogram.snapshot(),
         }
     }
 
@@ -134,6 +136,13 @@ pub fn stats_json(s: &StatsSnapshot) -> String {
         .expect("writing to a String cannot fail");
     }
     out.push(']');
+    write!(
+        out,
+        r#","queue_time":{{"count":{},"sum_seconds":{}}}"#,
+        s.queue_histogram.count,
+        s.queue_histogram.sum_us as f64 / 1_000_000.0
+    )
+    .expect("writing to a String cannot fail");
     write!(
         out,
         r#","quarantined":{},"state":"{}","version":"{}"}}"#,
@@ -187,6 +196,21 @@ pub fn metrics_text(s: &StatsSnapshot) -> String {
     write!(out, "kino_quarantined_workers {}\n", s.quarantined_count).expect("writing to a String cannot fail");
     out.push_str("# HELP kino_quarantine_replacements_total Replacement workers spawned after a wedge.\n# TYPE kino_quarantine_replacements_total counter\n");
     write!(out, "kino_quarantine_replacements_total {}\n", s.quarantine_replacements).expect("writing to a String cannot fail");
+    let h = &s.queue_histogram;
+    out.push_str("# HELP kino_request_queue_seconds Seconds requests waited in the queue before a worker admitted them.\n# TYPE kino_request_queue_seconds histogram\n");
+    let mut cumulative = 0u64;
+    for (i, bound_us) in crate::registry::QUEUE_BOUNDS_US.iter().enumerate() {
+        cumulative += h.buckets[i];
+        let le = *bound_us as f64 / 1_000_000.0;
+        write!(out, "kino_request_queue_seconds_bucket{{le=\"{le}\"}} {cumulative}\n")
+            .expect("writing to a String cannot fail");
+    }
+    write!(out, "kino_request_queue_seconds_bucket{{le=\"+Inf\"}} {}\n", cumulative + h.overflow)
+        .expect("writing to a String cannot fail");
+    write!(out, "kino_request_queue_seconds_sum {}\n", h.sum_us as f64 / 1_000_000.0)
+        .expect("writing to a String cannot fail");
+    write!(out, "kino_request_queue_seconds_count {}\n", cumulative + h.overflow)
+        .expect("writing to a String cannot fail");
     out
 }
 
@@ -492,6 +516,7 @@ mod tests {
             batch: 1, respawns: 2, queued: 3, in_flight: 4, served: 100,
             rejected: 5, timeouts: 6, lane_depths: None, state, worker_status: vec![],
             quarantined_count: 0, quarantine_replacements: 0,
+            queue_histogram: crate::registry::QueueHistogramSnapshot { buckets: [0; 14], overflow: 0, sum_us: 0, count: 0 },
         }
     }
 
@@ -652,5 +677,34 @@ mod tests {
         assert!(text.contains("kino_quarantined_workers 2"));
         assert!(text.contains("# TYPE kino_quarantine_replacements_total counter"));
         assert!(text.contains("kino_quarantine_replacements_total 7"));
+    }
+
+    #[test]
+    fn metrics_text_emits_a_cumulative_queue_histogram() {
+        let mut s = snapshot(crate::registry::STATE_READY);
+        let mut buckets = [0u64; 14];
+        buckets[0] = 3; // <= 0.0005s
+        buckets[2] = 1; // <= 0.0025s
+        s.queue_histogram = crate::registry::QueueHistogramSnapshot {
+            buckets, overflow: 1, sum_us: 3 * 100 + 2_000 + 20_000_000, count: 5,
+        };
+        let text = metrics_text(&s);
+        assert!(text.contains("# TYPE kino_request_queue_seconds histogram"));
+        assert!(text.contains(r#"kino_request_queue_seconds_bucket{le="0.0005"} 3"#));
+        // cumulative: le=0.0025 includes buckets 0..=2 = 3 + 0 + 1 = 4
+        assert!(text.contains(r#"kino_request_queue_seconds_bucket{le="0.0025"} 4"#));
+        assert!(text.contains(r#"kino_request_queue_seconds_bucket{le="+Inf"} 5"#));
+        assert!(text.contains("kino_request_queue_seconds_count 5"));
+        assert!(text.contains("kino_request_queue_seconds_sum "));
+    }
+
+    #[test]
+    fn stats_json_reports_queue_time() {
+        let mut s = snapshot(crate::registry::STATE_READY);
+        s.queue_histogram = crate::registry::QueueHistogramSnapshot {
+            buckets: [0; 14], overflow: 0, sum_us: 1_500_000, count: 2,
+        };
+        let json = stats_json(&s);
+        assert!(json.contains(r#""queue_time":{"count":2,"sum_seconds":1.5}"#), "{json}");
     }
 }

@@ -401,6 +401,12 @@ series) grows by one across every respawn. `busy_ms` is how long the
 slot's current request has been running (0 when idle), so a single slot
 climbing while the rest sit at 0 is your stuck worker.
 
+The `/stats` response and `server.stats` carry `queue_time` (count and
+summed seconds), and `/metrics` exposes `kino_request_queue_seconds`—a
+Prometheus histogram of queue-wait time, the worker-saturation signal.
+Counts admitted requests only; a 503 after queue wait goes to `rejected`,
+not `queue_time`.
+
 - `GET /ready`—`200` when serving, `503` while booting or draining:
   wire it to your load balancer or Kubernetes readiness probe.
 - `GET /live`—`200` whenever the process is alive: the liveness probe.

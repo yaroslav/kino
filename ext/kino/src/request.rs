@@ -41,6 +41,9 @@ pub struct RequestCtx {
     /// here and ride to hyper without a copy (pin.rs).
     pub pin_slab: Arc<crate::pin::PinSlab>,
     pub responder: Arc<Responder>,
+    /// When this request entered the queue, for the queue-wait histogram.
+    /// Stamped at ctx creation; read once at admit (queue.rs).
+    pub enqueued_at: std::time::Instant,
 }
 
 impl Drop for RequestCtx {
@@ -425,6 +428,7 @@ pub fn test_ctx() -> crate::registry::BoxedCtx {
         slot: None,
         pin_slab: Arc::new(crate::pin::PinSlab::new()),
         responder: Arc::new(Responder::new(head_tx)),
+        enqueued_at: std::time::Instant::now(),
     })
 }
 

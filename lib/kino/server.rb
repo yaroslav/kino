@@ -241,8 +241,8 @@ module Kino
     #
     # @return [Hash{Symbol => Object}] mode, lanes, workers, threads,
     #   batch, respawns; plus queued, in_flight, served, rejected,
-    #   timeouts, worker_status, quarantined (and lane_depths in lanes mode)
-    #   once started
+    #   timeouts, worker_status, quarantined, queue_time (and lane_depths in
+    #   lanes mode) once started
     def stats
       base = {
         mode: @mode, lanes: @lanes, workers: @workers, threads: @threads,
@@ -258,6 +258,8 @@ module Kino
         {index:, served:, in_flight:, busy_ms:, quarantined:}
       end
       base[:quarantined] = rows.count { |row| row[4] }
+      count, sum_seconds = Native.queue_time(@id)
+      base[:queue_time] = {count:, sum_seconds:}
       base
     end
 

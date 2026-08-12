@@ -133,6 +133,7 @@ pub fn server_start(ruby: &Ruby, config: magnus::RHash) -> Result<(u64, u16, Opt
         lanes,
         lane_cursor: std::sync::atomic::AtomicUsize::new(0),
         pin_slab: Arc::new(crate::pin::PinSlab::new()),
+        queue_histogram: registry::QueueHistogram::new(),
     });
 
     let tokio_listener = {
@@ -393,6 +394,7 @@ async fn handle_request(
         slot: None,
         pin_slab: server.pin_slab.clone(),
         responder,
+        enqueued_at: std::time::Instant::now(),
     });
 
     // Drop guard, not manual decrement: when a client aborts mid-request,
@@ -691,6 +693,16 @@ pub fn server_stats(
         server.respawns.load(Ordering::Relaxed),
         lane_depths,
     ))
+}
+
+/// Queue-wait count and summed seconds for Server#stats parity. Zeros when
+/// the server is gone.
+pub fn queue_time(_ruby: &Ruby, server_id: u64) -> Result<(u64, f64), Error> {
+    let Some(server) = registry::try_get(server_id) else {
+        return Ok((0, 0.0));
+    };
+    let h = server.queue_histogram.snapshot();
+    Ok((h.count, h.sum_us as f64 / 1_000_000.0))
 }
 
 /// Per-slot rows for Server#stats parity: [index, served, in_flight,

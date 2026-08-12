@@ -119,6 +119,9 @@ fn admit(
     slot.served.fetch_add(1, Ordering::Relaxed);
     slot.last_started_ms.store(crate::mono::mono_ms(), Ordering::Relaxed);
     slot.in_flight.fetch_add(1, Ordering::Relaxed);
+    server
+        .queue_histogram
+        .record(ctx.enqueued_at.elapsed().as_micros() as u64);
     slot.current.lock().push(Arc::downgrade(&ctx.responder));
     // Wire the slot into the request so blocked body reads/writes are
     // interruptible the same way the queue pop is.

@@ -23,6 +23,7 @@ RSpec.describe "server stats" do
       expect(stats[:in_flight]).to eq(0)
       expect(stats).to have_key(:worker_status)
       expect(stats[:worker_status]).to be_an(Array)
+      expect(stats[:queue_time]).to include(:count, :sum_seconds)
     end
   end
 

@@ -43,6 +43,7 @@ fn init(ruby: &Ruby) -> Result<(), Error> {
     native.define_singleton_method("queue_stats", function!(server::queue_stats, 1))?;
     native.define_singleton_method("server_stats", function!(server::server_stats, 1))?;
     native.define_singleton_method("worker_stats", function!(server::worker_stats, 1))?;
+    native.define_singleton_method("queue_time", function!(server::queue_time, 1))?;
     native.define_singleton_method("quarantine_slot", function!(server::quarantine_slot, 2))?;
     native.define_singleton_method(
         "record_quarantine_replacement",

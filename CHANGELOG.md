@@ -1,5 +1,10 @@
 ## [Unreleased]
 
+- Queue-time histogram: `/metrics` exposes `kino_request_queue_seconds`, a
+  histogram of how long each request waited for a free worker (the
+  saturation signal), and `server.stats`/`/stats` gain `queue_time`
+  (count and summed seconds). Measured internally with a monotonic clock,
+  so it needs no proxy header and is immune to clock skew.
 - Lifecycle hooks: `after_boot`, `after_worker_boot`,
   `after_request_complete`, and `on_worker_exit` join `on_error`, so apps
   can wire their own metrics, readiness, and error tracking. The
