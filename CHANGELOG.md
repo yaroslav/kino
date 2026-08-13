@@ -1,4 +1,4 @@
-## [Unreleased]
+## [0.3.0] - 2026-08-13
 
 - Queue-time histogram: `/metrics` exposes `kino_request_queue_seconds`, a
   histogram of how long each request waited for a free worker (the
@@ -23,6 +23,7 @@
   counters down per dispatch slot (served, in-flight, and `busy_ms`, the
   age of the slot's current request), so a stuck slot is visible
   individually.
+- Update Rust and Ruby dependencies.
 
 ## [0.2.1] - 2026-07-27
 
