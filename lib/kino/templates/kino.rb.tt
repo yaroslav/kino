@@ -87,6 +87,27 @@
 # must be Ractor-shareable (build it with Ractor.shareable_proc).
 # on_error ->(error, env) { ExceptionService.capture(error) }
 
+# Called once on the main thread after the worker pool is up. Wire
+# readiness here (sd_notify, a "server ready" metric).
+# after_boot { }
+
+# Called once inside each worker before it serves, with the worker's slot
+# id. In :ractor mode it runs inside the worker ractor, so it must be
+# Ractor-shareable (build it with Ractor.shareable_proc).
+# after_worker_boot { |worker_id| }
+
+# Called inside the worker after each successful response, with (env,
+# status). This is the hot path: leave it unset for zero cost. In :ractor
+# mode it must be Ractor-shareable.
+# after_request_complete { |env, status| }
+
+# Called on the main thread when a worker exits, with (worker_index,
+# error). error is the crash cause, or nil on a clean exit. In :ractor
+# mode worker_index identifies the exited ractor (0..workers - 1), a
+# different number space than after_worker_boot's slot id: do not
+# correlate boot and exit by that number in :ractor mode.
+# on_worker_exit { |worker_index, error| }
+
 ## Lifecycle
 
 # On shutdown, give in-flight requests this many seconds to finish.
@@ -101,6 +122,36 @@
 # Threads for the Rust I/O engine. The default suits most apps; for
 # heavily CPU-bound apps, try 1 to leave more cores for Ruby.
 # tokio_threads 4
+
+## Control plane
+
+# Serve read-only monitoring on a separate address: live stats as JSON
+# at /stats, Prometheus text at /metrics, and /ready and /live probes
+# for an orchestrator. Answered by the native layer on its own thread,
+# so it stays live even when every Ruby worker is busy or stuck.
+# Accepts "host:port" or "unix://path". Off unless set.
+# control_bind "127.0.0.1:9293"
+
+# When set, /stats and /metrics require "Authorization: Bearer <token>".
+# The probes stay open; they carry no data.
+# control_token ENV["KINO_CONTROL_TOKEN"]
+
+## Quarantine
+
+# Quarantine a dispatch slot whose current request has run longer than
+# this many seconds and spawn a replacement to restore capacity. The
+# wedged worker is never interrupted or force-killed; its slot stays
+# quarantined for good (in :ractor mode the ractor itself leaks until
+# process exit, since a wedged ractor cannot be safely interrupted). Off
+# unless set; set it above your slowest legitimate endpoint, and above
+# request_timeout.
+# quarantine_timeout 60
+
+# Cap on the total number of replacement events over the process
+# lifetime. Past the cap the monitor stops replacing and the server runs
+# at reduced capacity. Default: the worker count in :ractor mode, workers
+# x threads in :threaded.
+# quarantine_max 8
 
 ## App
 

@@ -12,6 +12,10 @@ module Kino
     #   port when configured with port 0)
     attr_reader :port
 
+    # @return [Integer, nil] the control plane's TCP port (nil until #start,
+    #   when the control plane is off, or for a unix-socket bind)
+    attr_reader :control_port
+
     # @return [Symbol] the resolved dispatch mode, :ractor or :threaded
     attr_reader :mode
 
@@ -41,8 +45,17 @@ module Kino
       @bind = settings[:bind]
       @requested_port = settings[:port]
       @workers = Integer(settings[:workers])
-      @on_error = validate_on_error(settings[:on_error])
+      @on_error = validate_hook(settings[:on_error], :on_error)
+      @after_worker_boot = validate_hook(settings[:after_worker_boot], :after_worker_boot)
+      @after_request_complete = validate_hook(settings[:after_request_complete], :after_request_complete)
+      @after_boot = validate_hook(settings[:after_boot], :after_boot)
+      @on_worker_exit = validate_hook(settings[:on_worker_exit], :on_worker_exit)
       @mode = resolve_mode(settings[:mode])
+      @worker_hooks = WorkerHooks.new(
+        on_error: @on_error,
+        after_worker_boot: @after_worker_boot,
+        after_request_complete: @after_request_complete
+      )
       # Default threads per mode: 1 in :ractor (threads inside a ractor
       # share its lock; a measured +17% on fast handlers; raise `workers`
       # for I/O concurrency instead), 3 in :threaded (threads ARE the
@@ -60,8 +73,25 @@ module Kino
       @tokio_threads = settings[:tokio_threads]
       @tls = validate_tls(settings[:tls])
       @pidfile = settings[:pidfile]
+      @control_bind = settings[:control_bind]&.to_s
+      @control_token = settings[:control_token]&.to_s
+      # An empty token (e.g. control_token ENV["KINO_CONTROL_TOKEN"] with the
+      # var unset) must not half-disable auth: treat it as auth off, not as
+      # "require a zero-length Bearer token".
+      @control_token = nil if @control_token && @control_token.empty?
+      @quarantine_timeout_ms = settings[:quarantine_timeout] ? (Float(settings[:quarantine_timeout]) * 1000).round : nil
+      @quarantine_max =
+        if settings[:quarantine_max]
+          Integer(settings[:quarantine_max])
+        elsif @mode == :ractor
+          @workers
+        else
+          @workers * @threads
+        end
       @worker_threads = []
+      @worker_threads_lock = Mutex.new
       @supervisor = nil
+      @quarantine_monitor = nil
       @started = false
     end
 
@@ -78,7 +108,7 @@ module Kino
       write_pidfile if @pidfile
       booted = false
       begin
-        @id, @port = Native.server_start(
+        @id, @port, @control_port = Native.server_start(
           bind: @bind, port: @requested_port,
           queue_depth: @queue_depth, queue_timeout_ms: @queue_timeout_ms,
           request_timeout_ms: @request_timeout_ms,
@@ -86,7 +116,9 @@ module Kino
           max_body_size: @max_body_size,
           tokio_threads: @tokio_threads,
           tls_cert: @tls&.fetch(:cert), tls_key: @tls&.fetch(:key),
-          lanes: @lanes, log_requests: @log_requests
+          lanes: @lanes, log_requests: @log_requests,
+          mode: @mode.to_s, workers: @workers, threads: @threads, batch: @batch,
+          control_bind: @control_bind, control_token: @control_token
         )
         booted = true
       ensure
@@ -97,13 +129,13 @@ module Kino
       @pin_keeper = Native.pin_keeper(@id)
       if @mode == :ractor
         @supervisor = RactorSupervisor.new(@id, @app, workers: @workers, threads: @threads,
-          batch: @batch, on_error: @on_error).start
+          batch: @batch, hooks: @worker_hooks, on_worker_exit: @on_worker_exit).start
       else
-        @worker_threads = (@workers * @threads).times.map do
-          worker_id = Native.register_worker(@id)
-          Thread.new { Worker.run(@id, worker_id, @app, @batch, @on_error) }
-        end
+        @worker_threads = (@workers * @threads).times.map { spawn_worker_thread }
       end
+      start_quarantine_monitor if @quarantine_timeout_ms
+      Native.control_ready(@id)
+      HookFire.fire(@after_boot, "after_boot")
       @started = true
       self
     end
@@ -119,6 +151,7 @@ module Kino
     def shutdown(timeout: nil)
       return unless @started
 
+      @quarantine_monitor&.stop
       deadline = monotonic_now + (timeout || @shutdown_timeout)
       Native.stop_accepting(@id)
 
@@ -144,6 +177,9 @@ module Kino
       end
 
       Native.shutdown_runtime(@id, 1_000)
+      # The control thread reports "draining" for the whole drain and stops
+      # only now, once there is nothing left to report.
+      Native.control_stop(@id)
       # The runtime is gone, so hyper has dropped every pinned buffer;
       # the keeper (and the strings it marked) may now be collected.
       @pin_keeper = nil
@@ -205,21 +241,87 @@ module Kino
     #
     # @return [Hash{Symbol => Object}] mode, lanes, workers, threads,
     #   batch, respawns; plus queued, in_flight, served, rejected,
-    #   timeouts (and lane_depths in lanes mode) once started
+    #   timeouts, worker_status, quarantined, queue_time (and lane_depths in
+    #   lanes mode) once started
     def stats
       base = {
         mode: @mode, lanes: @lanes, workers: @workers, threads: @threads,
-        batch: @batch, respawns: @supervisor ? @supervisor.respawns : 0
+        batch: @batch, respawns: 0
       }
       return base unless @started
 
-      queued, in_flight, served, rejected, timeouts, lane_depths = Native.server_stats(@id)
-      base.merge!(queued:, in_flight:, served:, rejected:, timeouts:)
+      queued, in_flight, served, rejected, timeouts, respawns, lane_depths = Native.server_stats(@id)
+      base.merge!(queued:, in_flight:, served:, rejected:, timeouts:, respawns:)
       base[:lane_depths] = lane_depths if lane_depths
+      rows = Native.worker_stats(@id)
+      base[:worker_status] = rows.map do |index, served, in_flight, busy_ms, quarantined|
+        {index:, served:, in_flight:, busy_ms:, quarantined:}
+      end
+      base[:quarantined] = rows.count { |_index, _served, _in_flight, _busy_ms, quarantined| quarantined }
+      count, sum_seconds = Native.queue_time(@id)
+      base[:queue_time] = {count:, sum_seconds:}
       base
     end
 
     private
+
+    # Register a fresh dispatch slot and run a worker thread on it; returns
+    # the thread. Used at boot and by the quarantine replacer.
+    def spawn_worker_thread
+      worker_id = Native.register_worker(@id)
+      Thread.new do
+        error = nil
+        begin
+          Worker.run(@id, worker_id, @app, @batch, @worker_hooks)
+        rescue Exception => e # rubocop:disable Lint/RescueException -- a hard crash in a threaded worker thread
+          error = e
+          raise
+        ensure
+          HookFire.fire(@on_worker_exit, "on_worker_exit", worker_id, error)
+        end
+      end
+    end
+
+    # Track a replacement thread spawned outside the initial pool assignment
+    # (the quarantine replacer) so shutdown's join/done?/kill sweeps see it.
+    def track_replacement_thread(thread)
+      @worker_threads_lock.synchronize { @worker_threads << thread }
+    end
+
+    # @private
+    # The :threaded-mode quarantine replacer: spawns a replacement worker
+    # thread, quarantines the wedged slot, then tracks the new thread so
+    # shutdown's join/done?/kill sweeps see it. Built from bound Method
+    # objects instead of a server reference, so it drives the server
+    # through those methods without send or instance_variable_get.
+    class ThreadedReplacer
+      def initialize(server_id:, spawner:, tracker:)
+        @server_id = server_id
+        @spawner = spawner
+        @tracker = tracker
+      end
+
+      def replace(worker_id)
+        thread = @spawner.call # spawn FIRST (may raise ThreadError)
+        Native.quarantine_slot(@server_id, worker_id) # quarantine after success
+        @tracker.call(thread)
+        true
+      end
+    end
+    private_constant :ThreadedReplacer
+
+    # A replacer.replace(worker_id) spawns a replacement worker, then
+    # quarantines the wedged slot, mode-appropriately. In :ractor the
+    # supervisor is the replacer; in :threaded a small object over
+    # spawn_worker_thread.
+    def start_quarantine_monitor
+      replacer = @supervisor || ThreadedReplacer.new(server_id: @id, spawner: method(:spawn_worker_thread),
+        tracker: method(:track_replacement_thread))
+      @quarantine_monitor = QuarantineMonitor.new(
+        server_id: @id, timeout_ms: @quarantine_timeout_ms,
+        max: @quarantine_max, replacer: replacer
+      ).start
+    end
 
     def validate_tls(tls)
       return nil if tls.nil?
@@ -230,10 +332,10 @@ module Kino
       {cert: String(tls[:cert]), key: String(tls[:key])}
     end
 
-    def validate_on_error(handler)
+    def validate_hook(handler, name)
       return nil if handler.nil?
       unless handler.respond_to?(:call)
-        raise ArgumentError, "on_error must respond to #call (got #{handler.class})"
+        raise ArgumentError, "#{name} must respond to #call (got #{handler.class})"
       end
 
       handler
@@ -320,7 +422,8 @@ module Kino
       if @supervisor
         @supervisor.shutdown([deadline - monotonic_now, 0].max)
       else
-        @worker_threads.each do |thread|
+        threads = @worker_threads_lock.synchronize { @worker_threads.dup }
+        threads.each do |thread|
           thread.join([deadline - monotonic_now, 0.01].max)
         end
       end
@@ -330,7 +433,8 @@ module Kino
       if @supervisor
         @supervisor.done?
       else
-        @worker_threads.none?(&:alive?)
+        threads = @worker_threads_lock.synchronize { @worker_threads.dup }
+        threads.none?(&:alive?)
       end
     end
 
@@ -340,7 +444,8 @@ module Kino
         # by abort_all_inflight. The stuck ractor leaks until process exit.
         Native.log_error("shutdown deadline passed with stuck ractor workers") unless @supervisor.done?
       else
-        @worker_threads.each { |thread| thread.kill if thread.alive? }
+        threads = @worker_threads_lock.synchronize { @worker_threads.dup }
+        threads.each { |thread| thread.kill if thread.alive? }
       end
     end
 
@@ -361,9 +466,9 @@ module Kino
             "Ractor.shareable_proc endpoints); try Ractor.make_shareable(app) " \
             "or mode: :threaded"
         end
-        unless @on_error.nil? || Ractor.shareable?(@on_error)
+        if (name = unshareable_worker_hook_name)
           raise Error,
-            "mode: :ractor requires a Ractor-shareable on_error handler " \
+            "mode: :ractor requires a Ractor-shareable #{name} hook " \
             "(build it with Ractor.shareable_proc, or use mode: :threaded)"
         end
         :ractor
@@ -371,8 +476,8 @@ module Kino
         if !Ractor.shareable?(@app)
           warn "Kino: app is not Ractor-shareable; falling back to mode: :threaded"
           :threaded
-        elsif !(@on_error.nil? || Ractor.shareable?(@on_error))
-          warn "Kino: on_error handler is not Ractor-shareable; falling back to mode: :threaded"
+        elsif (name = unshareable_worker_hook_name)
+          warn "Kino: #{name} hook is not Ractor-shareable; falling back to mode: :threaded"
           :threaded
         else
           :ractor
@@ -380,6 +485,23 @@ module Kino
       else
         raise ArgumentError, "mode must be :auto, :ractor, or :threaded (got #{requested.inspect})"
       end
+    end
+
+    # The hooks that ride into worker context (a ractor in :ractor mode)
+    # and so must be Ractor-shareable there. after_boot and on_worker_exit
+    # run on the main thread and are exempt.
+    def worker_context_hooks
+      [[:on_error, @on_error], [:after_worker_boot, @after_worker_boot],
+        [:after_request_complete, @after_request_complete]]
+    end
+
+    # The name of the first worker-context hook that is set but not
+    # Ractor-shareable, or nil if all set ones are. Used by both the
+    # :ractor raise and the :auto warn/fallback branches, so "first
+    # offender" is defined once.
+    def unshareable_worker_hook_name
+      bad = worker_context_hooks.find { |_name, hook| !(hook.nil? || Ractor.shareable?(hook)) }
+      bad&.first
     end
   end
 end

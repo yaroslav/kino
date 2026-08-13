@@ -23,11 +23,19 @@ module Kino
       lanes: false,
       log_requests: false,
       on_error: nil,
+      after_boot: nil,
+      after_worker_boot: nil,
+      after_request_complete: nil,
+      on_worker_exit: nil,
       shutdown_timeout: 30,
       tokio_threads: nil,
       tls: nil,
       environment: nil,
       pidfile: nil,
+      control_bind: nil,
+      control_token: nil,
+      quarantine_timeout: nil,
+      quarantine_max: nil,
       rackup: nil
     }.freeze
 
@@ -185,6 +193,24 @@ module Kino
       # or a block. Must be Ractor-shareable in :ractor mode.
       def on_error(handler = nil, &block) = @config.set(:on_error, handler || block)
 
+      # Called once on the main thread after the worker pool is up. The
+      # readiness seam (wire sd_notify or a "server ready" metric here).
+      def after_boot(handler = nil, &block) = @config.set(:after_boot, handler || block)
+
+      # Called once inside each worker (a ractor in :ractor mode) before it
+      # serves, with the worker's slot id. Must be Ractor-shareable in
+      # :ractor mode (build it with Ractor.shareable_proc).
+      def after_worker_boot(handler = nil, &block) = @config.set(:after_worker_boot, handler || block)
+
+      # Called inside the worker after each successful response with
+      # (env, status). Hot path: leave unset for zero cost. Must be
+      # Ractor-shareable in :ractor mode.
+      def after_request_complete(handler = nil, &block) = @config.set(:after_request_complete, handler || block)
+
+      # Called on the main thread when a worker exits, with (worker_index,
+      # error_or_nil). error is the crash cause, or nil on a clean exit.
+      def on_worker_exit(handler = nil, &block) = @config.set(:on_worker_exit, handler || block)
+
       # Graceful-shutdown drain deadline in seconds.
       def shutdown_timeout(seconds) = @config.set(:shutdown_timeout, seconds)
 
@@ -199,6 +225,37 @@ module Kino
 
       # Write the master PID here on start.
       def pidfile(path) = @config.set(:pidfile, path.to_s)
+
+      # Serve the read-only control plane (live stats as JSON at /stats,
+      # Prometheus text at /metrics, /ready and /live probes) on this
+      # address: "host:port" or "unix://path". Off unless set.
+      def control_bind(addr) = @config.set(:control_bind, addr.to_s)
+
+      # When set, /stats and /metrics require "Authorization: Bearer <token>".
+      # The probes stay open; they carry no data.
+      def control_token(token) = @config.set(:control_token, token.to_s)
+
+      # Quarantine a dispatch slot whose current request has run longer
+      # than this many seconds, spawning a replacement to restore capacity.
+      # Off unless set. Set it above your slowest legitimate endpoint (and
+      # typically above request_timeout).
+      def quarantine_timeout(seconds)
+        seconds &&= Float(seconds)
+        if seconds && seconds <= 0
+          raise ArgumentError, "quarantine_timeout must be greater than 0 (got #{seconds})"
+        end
+        @config.set(:quarantine_timeout, seconds)
+      end
+
+      # Cap on the total number of replacement events over the process
+      # lifetime. Past the cap the monitor stops replacing and the server
+      # runs at reduced capacity. Default: the worker count in :ractor
+      # mode, workers x threads in :threaded.
+      def quarantine_max(count)
+        count = Integer(count)
+        raise ArgumentError, "quarantine_max must be >= 1 (got #{count})" if count < 1
+        @config.set(:quarantine_max, count)
+      end
 
       # Rackup file the `kino` CLI loads (positional argument wins).
       def rackup(path) = @config.set(:rackup, path.to_s)

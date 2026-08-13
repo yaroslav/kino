@@ -18,13 +18,14 @@ module Kino
 
     module_function
 
-    def run(server_id, worker_id, app, batch_size = 1, on_error = nil)
+    def run(server_id, worker_id, app, batch_size = 1, hooks = nil)
+      fire_after_worker_boot(hooks, worker_id)
       if batch_size <= 1
         env = Native.take_one(server_id, worker_id)
-        env = handle_one(env, server_id, worker_id, app, on_error) while env
+        env = handle_one(env, server_id, worker_id, app, hooks) while env
       else
         batch = Native.take_batch(server_id, worker_id, batch_size)
-        batch = process(batch, server_id, worker_id, app, batch_size, on_error) while batch
+        batch = process(batch, server_id, worker_id, app, batch_size, hooks) while batch
       end
     end
 
@@ -34,8 +35,8 @@ module Kino
     NOT_FUSED = Object.new.freeze
 
     # Handle one request; returns the next env (fused take) or nil.
-    def handle_one(env, server_id, worker_id, app, on_error)
-      result = serve(env, app, on_error) do |request, status, headers, chunks|
+    def handle_one(env, server_id, worker_id, app, hooks)
+      result = serve(env, app, hooks) do |request, status, headers, chunks|
         request.respond_and_take_one(server_id, worker_id, status, headers, chunks)
       end
       result.equal?(NOT_FUSED) ? Native.take_one(server_id, worker_id) : result
@@ -43,10 +44,10 @@ module Kino
 
     # Handle every env in the batch; returns the next batch (the last
     # simple response rides the fused respond_and_take) or nil on shutdown.
-    def process(batch, server_id, worker_id, app, batch_size, on_error)
+    def process(batch, server_id, worker_id, app, batch_size, hooks)
       last = batch.size - 1
       batch.each_with_index do |env, index|
-        result = serve(env, app, on_error) do |request, status, headers, chunks|
+        result = serve(env, app, hooks) do |request, status, headers, chunks|
           if index == last
             request.respond_and_take(server_id, worker_id, batch_size,
               status, headers, chunks)
@@ -66,17 +67,30 @@ module Kino
     # here and return NOT_FUSED. App errors must never kill the worker;
     # hard crashes (Exception) are the supervisor's job; and `abort` does
     # the right thing whether or not the response head already went out.
-    def serve(env, app, on_error)
+    def serve(env, app, hooks)
       request = env[KINO_REQUEST]
       env[RACK_INPUT] ||= Input.new(request)
       status, headers, body = app.call(env)
 
       if body.respond_to?(:to_ary)
-        result = yield(request, status.to_i, headers, join_chunks(body.to_ary))
-        body.close if body.respond_to?(:close)
-        result
+        chunks = join_chunks(body.to_ary)
+        if hooks&.after_request_complete
+          # Hook set: do not fuse. Send the complete response, fire the hook
+          # after it is out, then signal the caller to take the next request
+          # separately (so the hook never waits on the next request).
+          request.send_simple(status.to_i, headers, chunks)
+          body.close if body.respond_to?(:close)
+          fire_after_request_complete(hooks, env, status.to_i)
+          NOT_FUSED
+        else
+          # No hook: fused fast path, unchanged, zero cost.
+          result = yield(request, status.to_i, headers, chunks)
+          body.close if body.respond_to?(:close)
+          result
+        end
       else
         deliver_streaming(request, status.to_i, headers, body, env[RACK_INPUT])
+        fire_after_request_complete(hooks, env, status.to_i)
         NOT_FUSED
       end
     rescue => e
@@ -87,13 +101,7 @@ module Kino
       # because nothing may escape this block and kill the worker.
       Native.log_error(error_log_line(e))
       request.abort
-      if on_error
-        begin
-          on_error.call(e, env)
-        rescue => hook_error
-          Native.log_error("on_error hook raised #{hook_error.class}: #{hook_error.message}")
-        end
-      end
+      HookFire.fire(hooks&.on_error, "on_error", e, env)
       NOT_FUSED
     end
 
@@ -142,7 +150,16 @@ module Kino
       joined
     end
 
+    def fire_after_worker_boot(hooks, worker_id)
+      HookFire.fire(hooks&.after_worker_boot, "after_worker_boot", worker_id)
+    end
+
+    def fire_after_request_complete(hooks, env, status)
+      HookFire.fire(hooks&.after_request_complete, "after_request_complete", env, status)
+    end
+
     private_class_method :handle_one, :process, :serve, :deliver_streaming,
-      :join_chunks, :error_log_line
+      :join_chunks, :error_log_line, :fire_after_worker_boot,
+      :fire_after_request_complete
   end
 end

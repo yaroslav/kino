@@ -1,3 +1,29 @@
+## [Unreleased]
+
+- Queue-time histogram: `/metrics` exposes `kino_request_queue_seconds`, a
+  histogram of how long each request waited for a free worker (the
+  saturation signal), and `server.stats`/`/stats` gain `queue_time`
+  (count and summed seconds). Measured internally with a monotonic clock,
+  so it needs no proxy header and is immune to clock skew.
+- Lifecycle hooks: `after_boot`, `after_worker_boot`,
+  `after_request_complete`, and `on_worker_exit` join `on_error`, so apps
+  can wire their own metrics, readiness, and error tracking. The
+  worker-context hooks must be Ractor-shareable in `:ractor` mode; a raising
+  hook is logged and never kills a worker.
+- Stuck-worker quarantine: past `quarantine_timeout`, a wedged dispatch
+  slot is quarantined and a replacement worker is spawned to restore
+  capacity (capped by `quarantine_max`), surfaced via `/stats`, `/metrics`,
+  and `server.stats`. The wedged worker is never force-killed.
+- Control plane: a read-only monitoring listener (`control_bind`,
+  optional `control_token`) serving live stats as JSON at `/stats`,
+  Prometheus metrics at `/metrics`, and `/ready`/`/live` probes, answered
+  from the native layer on a dedicated thread so it stays responsive
+  while workers are busy, stuck, or draining.
+- Per-worker stats: `/stats`, `/metrics`, and `server.stats` now break the
+  counters down per dispatch slot (served, in-flight, and `busy_ms`, the
+  age of the slot's current request), so a stuck slot is visible
+  individually.
+
 ## [0.2.1] - 2026-07-27
 
 - Update Rust dependencies for Kino.

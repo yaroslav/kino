@@ -141,6 +141,27 @@ RSpec.describe "ractor mode" do
         expect(server.stats[:respawns]).to eq(1)
       end
     end
+
+    it "leaves no phantom in_flight on the crashed worker's slot" do
+      with_server(shareable_app, mode: :ractor, workers: 1, threads: 1) do |host, port, server|
+        crashed = Net::HTTP.get_response(host, "/boom", port)
+        expect(crashed.code).to eq("500")
+
+        # The respawned worker needs a moment to come up and finish serving;
+        # poll for the whole server going idle rather than a bare sleep.
+        stats = nil
+        20.times do
+          Net::HTTP.get_response(host, "/ok", port)
+          stats = server.stats
+          break if stats[:worker_status].sum { |w| w[:in_flight] }.zero?
+
+          sleep 0.1
+        end
+
+        expect(stats[:worker_status].sum { |w| w[:in_flight] }).to eq(0)
+        expect(stats[:worker_status].sum { |w| w[:served] }).to eq(stats[:served])
+      end
+    end
   end
 
   describe "parallelism" do

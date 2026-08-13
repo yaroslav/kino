@@ -116,6 +116,12 @@ fn admit(
     mut ctx: BoxedCtx,
 ) -> Result<RHash, Error> {
     server.served.fetch_add(1, Ordering::Relaxed);
+    slot.served.fetch_add(1, Ordering::Relaxed);
+    slot.last_started_ms.store(crate::mono::mono_ms(), Ordering::Relaxed);
+    slot.in_flight.fetch_add(1, Ordering::Relaxed);
+    server
+        .queue_histogram
+        .record(ctx.enqueued_at.elapsed().as_micros() as u64);
     slot.current.lock().push(Arc::downgrade(&ctx.responder));
     // Wire the slot into the request so blocked body reads/writes are
     // interruptible the same way the queue pop is.
@@ -137,6 +143,7 @@ fn checkout(ruby: &Ruby, server_id: u64, worker_id: usize) -> Result<Option<Chec
 
     // The previous batch is fully answered once the worker comes back.
     slot.current.lock().clear();
+    slot.in_flight.store(0, Ordering::Relaxed);
     slot.interrupted.store(false, Ordering::SeqCst);
 
     Ok(block_take(&server, &slot)?.map(|ctx| (server, slot, ctx)))

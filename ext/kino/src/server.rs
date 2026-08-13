@@ -44,8 +44,10 @@ fn cfg_opt<T: magnus::TryConvert>(
 /// at boot, so Hash-lookup cost is irrelevant and the interface stays
 /// extensible. Binding is synchronous so address errors raise in Ruby at
 /// `start` time; returns the actual port for `port: 0`. TLS config errors
-/// (bad cert/key) also raise here, before any traffic.
-pub fn server_start(ruby: &Ruby, config: magnus::RHash) -> Result<(u64, u16), Error> {
+/// (bad cert/key) also raise here, before any traffic. The third element
+/// of the return tuple is the control-plane port (nil unless control_bind
+/// is configured).
+pub fn server_start(ruby: &Ruby, config: magnus::RHash) -> Result<(u64, u16, Option<u16>), Error> {
     let bind: String = cfg(ruby, config, "bind")?;
     let port: u16 = cfg(ruby, config, "port")?;
     let queue_depth: usize = cfg(ruby, config, "queue_depth")?;
@@ -58,6 +60,10 @@ pub fn server_start(ruby: &Ruby, config: magnus::RHash) -> Result<(u64, u16), Er
     let tls_key: Option<String> = cfg_opt(ruby, config, "tls_key")?;
     let lanes: bool = cfg_opt(ruby, config, "lanes")?.unwrap_or(false);
     let log_requests: bool = cfg_opt(ruby, config, "log_requests")?.unwrap_or(false);
+    let mode: String = cfg_opt(ruby, config, "mode")?.unwrap_or_else(|| "threaded".to_string());
+    let workers: usize = cfg_opt(ruby, config, "workers")?.unwrap_or(0);
+    let threads: usize = cfg_opt(ruby, config, "threads")?.unwrap_or(0);
+    let batch: usize = cfg_opt(ruby, config, "batch")?.unwrap_or(1);
     let acceptor = match (&tls_cert, &tls_key) {
         (Some(cert), Some(key)) => Some(
             crate::tls::build_acceptor(cert, key)
@@ -81,6 +87,15 @@ pub fn server_start(ruby: &Ruby, config: magnus::RHash) -> Result<(u64, u16), Er
         .local_addr()
         .map_err(|e| io_error(ruby, "listener setup failed", e))?
         .port();
+
+    let control_bind_addr: Option<String> = cfg_opt(ruby, config, "control_bind")?;
+    let control_token: Option<String> = cfg_opt(ruby, config, "control_token")?;
+    let control_bind = control_bind_addr
+        .as_deref()
+        .map(|addr| {
+            crate::control::bind_control(addr).map_err(|e| io_error(ruby, "control bind failed", e))
+        })
+        .transpose()?;
 
     let mut builder = tokio::runtime::Builder::new_multi_thread();
     builder.enable_all().thread_name("kino-tokio");
@@ -108,11 +123,16 @@ pub fn server_start(ruby: &Ruby, config: magnus::RHash) -> Result<(u64, u16), Er
         request_timeout_ms,
         max_body_size,
         timeouts: std::sync::atomic::AtomicU64::new(0),
+        state: std::sync::atomic::AtomicU8::new(registry::STATE_BOOTING),
+        respawns: std::sync::atomic::AtomicU64::new(0),
+        quarantine_replacements: std::sync::atomic::AtomicU64::new(0),
+        topology: registry::Topology { mode, workers, threads, batch },
         https: acceptor.is_some(),
         access_log: log_requests.then(|| crate::logsink::Sink::new(std::io::stdout())),
         lanes,
         lane_cursor: std::sync::atomic::AtomicUsize::new(0),
         pin_slab: Arc::new(crate::pin::PinSlab::new()),
+        queue_histogram: registry::QueueHistogram::new(),
     });
 
     let tokio_listener = {
@@ -130,8 +150,28 @@ pub fn server_start(ruby: &Ruby, config: magnus::RHash) -> Result<(u64, u16), Er
     *server.runtime.lock() = Some(runtime);
 
     let id = server.id;
+    let control_port = match control_bind {
+        // Not yet in the registry: on failure Ruby never learns this id, so
+        // nothing could ever reach it to shut it down. The accept loop's
+        // task holds its own Arc back to `server` (stored inside its own
+        // `runtime` field), so just dropping our handle would leak the
+        // runtime forever; take it out and stop it explicitly instead.
+        // Safe to block here: this is the plain Ruby thread, no async
+        // context above it.
+        Some(bind) => match crate::control::start(bind, server.clone(), control_token) {
+            Ok(port) => port,
+            Err(e) => {
+                // A plain drop blocks until the accept loop's task (its
+                // only task, idling on accept/shutdown) is torn down; the
+                // runtime only ever had this one thing to cancel.
+                drop(server.runtime.lock().take());
+                return Err(io_error(ruby, "control start failed", e));
+            }
+        },
+        None => None,
+    };
     registry::insert(server);
-    Ok((id, local_port))
+    Ok((id, local_port, control_port))
 }
 
 /// Slowloris guard for TLS: a client that completes the TCP connect but then
@@ -353,6 +393,7 @@ async fn handle_request(
         slot: None,
         pin_slab: server.pin_slab.clone(),
         responder,
+        enqueued_at: std::time::Instant::now(),
     });
 
     // Drop guard, not manual decrement: when a client aborts mid-request,
@@ -518,7 +559,24 @@ pub fn register_worker(ruby: &Ruby, server_id: u64) -> Result<usize, Error> {
 
 pub fn stop_accepting(_ruby: &Ruby, server_id: u64) -> Result<(), Error> {
     if let Some(server) = registry::try_get(server_id) {
+        server.state.store(registry::STATE_DRAINING, Ordering::Relaxed);
         let _ = server.shutdown_tx.send(true);
+    }
+    Ok(())
+}
+
+/// Ruby reports the worker pool up; /ready starts answering 200.
+pub fn control_ready(_ruby: &Ruby, server_id: u64) -> Result<(), Error> {
+    if let Some(server) = registry::try_get(server_id) {
+        server.state.store(registry::STATE_READY, Ordering::Relaxed);
+    }
+    Ok(())
+}
+
+/// One worker respawn, recorded by the Ruby supervisor.
+pub fn record_respawn(_ruby: &Ruby, server_id: u64) -> Result<(), Error> {
+    if let Some(server) = registry::try_get(server_id) {
+        server.respawns.fetch_add(1, Ordering::Relaxed);
     }
     Ok(())
 }
@@ -546,6 +604,12 @@ fn abort_slot(slot: &WorkerSlot) {
             responder.respond_500_if_unsent();
         }
     }
+    // A dead worker holds nothing: every request it had is answered above
+    // (or already was), so the slot is quiescent from here on. Without
+    // this, a crashed worker's slot reports in_flight>=1 forever (the
+    // supervisor never reuses a slot after a crash), wedging /stats,
+    // /metrics and server.stats with a phantom busy worker.
+    slot.in_flight.store(0, Ordering::Relaxed);
     // Lane mode: this worker is dead. Close its lane so the dispatcher
     // skips it, and drain anything queued; dropping each ctx fires the
     // Drop-500 backstop so those clients aren't left hanging.
@@ -608,14 +672,14 @@ pub fn log_error(message: String) {
 }
 
 /// Full stats snapshot: [queued, in_flight, served, rejected, timeouts,
-/// lane_depths]. lane_depths is nil unless lane dispatch is on.
+/// respawns, lane_depths]. lane_depths is nil unless lane dispatch is on.
 #[allow(clippy::type_complexity)]
 pub fn server_stats(
     _ruby: &Ruby,
     server_id: u64,
-) -> Result<(usize, usize, u64, u64, u64, Option<Vec<usize>>), Error> {
+) -> Result<(usize, usize, u64, u64, u64, u64, Option<Vec<usize>>), Error> {
     let Some(server) = registry::try_get(server_id) else {
-        return Ok((0, 0, 0, 0, 0, None));
+        return Ok((0, 0, 0, 0, 0, 0, None));
     };
     let lane_depths = server.lane_depths();
     let queued = server.req_rx.len() + lane_depths.as_ref().map_or(0, |d| d.iter().sum::<usize>());
@@ -625,8 +689,54 @@ pub fn server_stats(
         server.served.load(Ordering::Relaxed),
         server.rejected.load(Ordering::Relaxed),
         server.timeouts.load(Ordering::Relaxed),
+        server.respawns.load(Ordering::Relaxed),
         lane_depths,
     ))
+}
+
+/// Queue-wait count and summed seconds for Server#stats parity. Zeros when
+/// the server is gone.
+pub fn queue_time(_ruby: &Ruby, server_id: u64) -> Result<(u64, f64), Error> {
+    let Some(server) = registry::try_get(server_id) else {
+        return Ok((0, 0.0));
+    };
+    let h = server.queue_histogram.snapshot();
+    Ok((h.count, h.sum_seconds()))
+}
+
+/// One worker slot's [index, served, in_flight, busy_ms, quarantined] row.
+pub type WorkerStatRow = (usize, u64, usize, u64, bool);
+
+/// Per-slot rows for Server#stats parity: [index, served, in_flight,
+/// busy_ms, quarantined] each. Empty when the server is gone.
+pub fn worker_stats(
+    _ruby: &Ruby,
+    server_id: u64,
+) -> Result<Vec<WorkerStatRow>, Error> {
+    let Some(server) = registry::try_get(server_id) else {
+        return Ok(Vec::new());
+    };
+    Ok(crate::control::collect_worker_status(&server)
+        .into_iter()
+        .map(|w| (w.index, w.served, w.in_flight, w.busy_ms, w.quarantined))
+        .collect())
+}
+
+/// Mark a slot quarantined (the monitor has abandoned it as wedged).
+pub fn quarantine_slot(ruby: &Ruby, server_id: u64, worker_id: usize) -> Result<(), Error> {
+    if let Some(server) = registry::try_get(server_id) {
+        let slot = server.slot(ruby, worker_id)?;
+        slot.quarantined.store(true, Ordering::Relaxed);
+    }
+    Ok(())
+}
+
+/// One replacement spawned by the quarantine monitor.
+pub fn record_quarantine_replacement(_ruby: &Ruby, server_id: u64) -> Result<(), Error> {
+    if let Some(server) = registry::try_get(server_id) {
+        server.quarantine_replacements.fetch_add(1, Ordering::Relaxed);
+    }
+    Ok(())
 }
 
 #[cfg(test)]

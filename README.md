@@ -230,6 +230,8 @@ server = Kino::Server.new(app,
   max_body_size: 50 * 1024 * 1024,  # bytes before a 413; nil = let a proxy handle it
   on_error: ->(e, env) { ErrorTracker.capture(e) },  # after the client got its 500
   shutdown_timeout: 30,       # drain deadline
+  control_bind: "127.0.0.1:9293",   # monitoring: /stats /metrics /ready /live; port 0 reads back via server.control_port
+  control_token: ENV["KINO_CONTROL_TOKEN"],  # optional Bearer auth for /stats + /metrics
   tls: { cert: "cert.pem", key: "key.pem" },  # file paths or inline PEM
 )
 server.start
@@ -320,6 +322,44 @@ after the client got its 500—the only place a tracker sees errors
 raised while the response was being written (in `:ractor` mode, build
 the handler with `Ractor.shareable_proc`).
 
+## Lifecycle hooks
+
+Kino fires four lifecycle hooks alongside `on_error`, split by firing context.
+
+**Worker-context hooks** run inside the worker and are available to all workers:
+- `after_worker_boot { |worker_id| }`: runs once before the worker begins serving, with its slot id. In `:ractor` mode it runs inside the worker ractor and must be `Ractor.shareable_proc`.
+- `after_request_complete { |env, status| }`: fires inside the worker after each successful response. This is the hot path—leave it unset for zero cost. In `:ractor` mode it must be `Ractor.shareable_proc`.
+
+**Main-context hooks** run on the main thread, outside workers, and are plain procs:
+- `after_boot { }`: fires once after the worker pool is up. Wire readiness here—sd_notify, a "server ready" metric, and so on.
+- `on_worker_exit { |worker_index, error| }`: fires when a worker exits, with its index and the crash cause (or nil on a clean exit).
+
+`after_worker_boot`'s argument is the worker's slot id, while in `:ractor` mode `on_worker_exit`'s argument identifies the exited ractor (`0`..`workers - 1`)—a different number space—so don't correlate boot and exit by that number in `:ractor` mode.
+
+A raising hook is logged and never kills a worker.
+
+## Stuck-worker quarantine
+
+`quarantine_timeout: seconds` (or `quarantine_timeout 60` in `kino.rb`)
+quarantines a dispatch slot whose request has run longer than the deadline
+and spawns a replacement worker to restore capacity—distinct from
+`request_timeout`, which gives the client a 504 but leaves the slot
+occupied. `quarantine_max` (default: the worker count in `:ractor` mode,
+workers × threads in `:threaded`) caps the total number of replacement
+events over the process lifetime—past it the monitor stops replacing and
+the server runs at reduced capacity.
+
+The wedged worker is never interrupted or force-killed, and its slot stays
+quarantined for good. In `:threaded` mode, if the blocked thread
+eventually returns, it keeps serving requests on that same slot—but the
+slot itself stays flagged quarantined (busy_ms reported as 0) for the rest
+of the process; in `:ractor` mode the wedged ractor (and its supervisor
+thread) leaks until the process exits, since a wedged ractor cannot be
+safely interrupted. Monitor quarantine activity via `server.stats`
+(top-level `quarantined` count and per-slot `worker_status[].quarantined`
+flag), `GET /stats` (same), and `GET /metrics` (`kino_quarantined_workers`
+gauge and `kino_quarantine_replacements_total` counter).
+
 ## Stats
 
 `server.stats` returns a live snapshot: the configuration plus counters
@@ -330,7 +370,7 @@ cost):
 server.stats
 # => {mode: :ractor, lanes: false, workers: 8, threads: 1, batch: 1,
 #     respawns: 0, queued: 0, in_flight: 2, served: 1041, rejected: 0,
-#     timeouts: 0}
+#     timeouts: 0, worker_status: [...]}
 # plus lane_depths: [...] when lane dispatch is on
 ```
 
@@ -340,6 +380,39 @@ From the outside, `kill -USR1 <pid>` prints the same snapshot as one line
 ```
 Kino stats: mode=:ractor lanes=false workers=8 threads=1 batch=1 respawns=0 queued=0 in_flight=2 served=1041 rejected=0 timeouts=0
 ```
+
+For pull-based monitoring, `control_bind "127.0.0.1:9293"` (or a
+`unix://` path) serves a read-only **control plane** from the native
+layer on its own thread—it keeps answering even while every Ruby worker
+is busy or stuck, and reports `draining` through a graceful shutdown:
+
+- `GET /stats`—the same snapshot as `server.stats`, as JSON (plus
+  `state` and `version`).
+- `GET /metrics`—Prometheus text format (`kino_requests_served_total`,
+  `kino_queue_depth`, `kino_ready`, …).
+
+Both `/stats` and `/metrics` also break the counters down per dispatch
+slot: `/stats` carries a `worker_status` array (`index`, `served`,
+`in_flight`, `busy_ms`) and `/metrics` emits `kino_worker_*{worker="N"}`
+series, one entry per execution slot (`workers × threads`)—a crashed
+worker's slot is never reused, so it stays in the list with its counters
+frozen where they stopped, meaning the array (and its `worker="N"` metric
+series) grows by one across every respawn. `busy_ms` is how long the
+slot's current request has been running (0 when idle), so a single slot
+climbing while the rest sit at 0 is your stuck worker.
+
+The `/stats` response and `server.stats` carry `queue_time` (count and
+summed seconds), and `/metrics` exposes `kino_request_queue_seconds`—a
+Prometheus histogram of queue-wait time, the worker-saturation signal.
+Counts admitted requests only; a 503 after queue wait goes to `rejected`,
+not `queue_time`.
+
+- `GET /ready`—`200` when serving, `503` while booting or draining:
+  wire it to your load balancer or Kubernetes readiness probe.
+- `GET /live`—`200` whenever the process is alive: the liveness probe.
+
+`control_token "..."` puts `/stats` and `/metrics` behind
+`Authorization: Bearer`; the probes stay open.
 
 ## Logging
 

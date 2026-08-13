@@ -11,6 +11,20 @@ use parking_lot::{Mutex, RwLock};
 use crate::request::RequestCtx;
 use crate::response::Responder;
 
+/// Lifecycle as seen by the control plane's /ready.
+pub const STATE_BOOTING: u8 = 0;
+pub const STATE_READY: u8 = 1;
+pub const STATE_DRAINING: u8 = 2;
+
+/// Boot-time configuration echoed by /stats. Stored resolved: mode is
+/// "ractor" or "threaded", never "auto".
+pub struct Topology {
+    pub mode: String,
+    pub workers: usize,
+    pub threads: usize,
+    pub batch: usize,
+}
+
 /// Requests travel through channels boxed: one heap allocation at accept
 /// time instead of moving ~300 bytes by value through every channel hop.
 pub type BoxedCtx = Box<RequestCtx>;
@@ -45,6 +59,15 @@ pub struct ServerInner {
     /// 413 (truthful Content-Length) or a mid-stream abort (chunked/lying).
     pub max_body_size: usize,
     pub timeouts: AtomicU64,
+    /// Lifecycle for /ready: booting until Ruby reports the workers up,
+    /// draining once stop_accepting runs. Relaxed everywhere (advisory).
+    pub state: std::sync::atomic::AtomicU8,
+    /// Worker respawns, recorded from the Ruby supervisor. Lives here so
+    /// the control plane reads it without touching Ruby.
+    pub respawns: AtomicU64,
+    /// Replacements spawned by the quarantine monitor (Relaxed, advisory).
+    pub quarantine_replacements: AtomicU64,
+    pub topology: Topology,
     pub https: bool,
     /// Native access log sink (None unless log_requests is on).
     pub access_log: Option<crate::logsink::Sink>,
@@ -55,6 +78,9 @@ pub struct ServerInner {
     /// GC roots for zero-copy response buffers (pin.rs). The Ruby Server
     /// object holds the marking PinKeeper for this slab.
     pub pin_slab: Arc<crate::pin::PinSlab>,
+    /// Queue-wait histogram: recorded at admit (queue.rs), emitted by the
+    /// control plane.
+    pub queue_histogram: QueueHistogram,
 }
 
 /// One per worker *thread* (slot count = workers × threads). The interrupt
@@ -72,11 +98,89 @@ pub struct WorkerSlot {
     pub lane_tx: Mutex<Option<flume::Sender<BoxedCtx>>>,
     pub lane_rx: Option<flume::Receiver<BoxedCtx>>,
     pub parked: std::sync::atomic::AtomicBool,
+    /// Per-slot sensors (Relaxed, advisory). served/in_flight mirror the
+    /// global counters at slot granularity; last_started_ms (stamped on
+    /// admit) drives busy-age (wedge) reporting.
+    pub served: AtomicU64,
+    pub in_flight: AtomicUsize,
+    pub last_started_ms: AtomicU64,
+    /// Set by the quarantine monitor when this slot is abandoned as wedged:
+    /// excluded from wedge detection, and its busy_ms is reported as 0.
+    pub quarantined: std::sync::atomic::AtomicBool,
 }
 
 /// Per-lane depth cap: small, so a slow handler can only ever delay this
 /// many queued neighbors (work stealing rescues them anyway).
 pub const LANE_DEPTH: usize = 4;
+
+/// Fixed queue-wait bucket boundaries in microseconds (0.5ms .. 10s),
+/// ascending. Emitted in seconds. Not a knob (YAGNI).
+pub const QUEUE_BOUNDS_US: [u64; 14] = [
+    500, 1_000, 2_500, 5_000, 10_000, 25_000, 50_000, 100_000,
+    250_000, 500_000, 1_000_000, 2_500_000, 5_000_000, 10_000_000,
+];
+
+/// Queue-wait histogram: per-bucket counts plus an overflow (the implicit
+/// +Inf bucket), the sum of waits, and the total count. Relaxed atomics,
+/// advisory like the other counters.
+pub struct QueueHistogram {
+    pub buckets: [AtomicU64; QUEUE_BOUNDS_US.len()],
+    pub overflow: AtomicU64,
+    pub sum_us: AtomicU64,
+    pub count: AtomicU64,
+}
+
+/// A plain (non-atomic) snapshot for the control thread to emit.
+pub struct QueueHistogramSnapshot {
+    pub buckets: [u64; QUEUE_BOUNDS_US.len()],
+    pub overflow: u64,
+    pub sum_us: u64,
+    pub count: u64,
+}
+
+impl QueueHistogram {
+    pub fn new() -> Self {
+        QueueHistogram {
+            buckets: std::array::from_fn(|_| AtomicU64::new(0)),
+            overflow: AtomicU64::new(0),
+            sum_us: AtomicU64::new(0),
+            count: AtomicU64::new(0),
+        }
+    }
+
+    /// Place one wait in its bucket (first bound >= wait, else overflow) and
+    /// update sum and count. A linear scan over 14 bounds is trivial.
+    pub fn record(&self, wait_us: u64) {
+        match QUEUE_BOUNDS_US.iter().position(|&bound| wait_us <= bound) {
+            Some(i) => self.buckets[i].fetch_add(1, Ordering::Relaxed),
+            None => self.overflow.fetch_add(1, Ordering::Relaxed),
+        };
+        self.sum_us.fetch_add(wait_us, Ordering::Relaxed);
+        self.count.fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub fn snapshot(&self) -> QueueHistogramSnapshot {
+        QueueHistogramSnapshot {
+            buckets: std::array::from_fn(|i| self.buckets[i].load(Ordering::Relaxed)),
+            overflow: self.overflow.load(Ordering::Relaxed),
+            sum_us: self.sum_us.load(Ordering::Relaxed),
+            count: self.count.load(Ordering::Relaxed),
+        }
+    }
+}
+
+impl Default for QueueHistogram {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl QueueHistogramSnapshot {
+    /// Summed queue wait, converted from the stored microseconds to seconds.
+    pub fn sum_seconds(&self) -> f64 {
+        self.sum_us as f64 / 1_000_000.0
+    }
+}
 
 impl WorkerSlot {
     fn new(lanes: bool) -> Self {
@@ -92,6 +196,10 @@ impl WorkerSlot {
             lane_tx: Mutex::new(lane_tx),
             lane_rx,
             parked: std::sync::atomic::AtomicBool::new(false),
+            served: AtomicU64::new(0),
+            in_flight: AtomicUsize::new(0),
+            last_started_ms: AtomicU64::new(0),
+            quarantined: std::sync::atomic::AtomicBool::new(false),
         }
     }
 }
@@ -188,11 +296,16 @@ pub fn test_server(lanes: bool, queue_depth: usize) -> Arc<ServerInner> {
         request_timeout_ms: 0,
         max_body_size: 0,
         timeouts: AtomicU64::new(0),
+        state: std::sync::atomic::AtomicU8::new(STATE_BOOTING),
+        respawns: AtomicU64::new(0),
+        quarantine_replacements: AtomicU64::new(0),
+        topology: Topology { mode: "threaded".to_string(), workers: 0, threads: 0, batch: 1 },
         https: false,
         access_log: None,
         lanes,
         lane_cursor: AtomicUsize::new(0),
         pin_slab: Arc::new(crate::pin::PinSlab::new()),
+        queue_histogram: QueueHistogram::new(),
     })
 }
 
@@ -272,5 +385,47 @@ mod tests {
         let a = next_server_id();
         let b = next_server_id();
         assert_ne!(a, b);
+    }
+
+    #[test]
+    fn servers_boot_in_the_booting_state_with_zero_respawns() {
+        let server = test_server(false, 4);
+        assert_eq!(server.state.load(Ordering::Relaxed), STATE_BOOTING);
+        assert_eq!(server.respawns.load(Ordering::Relaxed), 0);
+        assert_eq!(server.topology.batch, 1);
+    }
+
+    #[test]
+    fn fresh_slot_has_zeroed_per_worker_sensors() {
+        let server = test_server(false, 4);
+        server.register_worker();
+        let slots = server.slots.read();
+        let slot = &slots[0];
+        assert_eq!(slot.served.load(Ordering::Relaxed), 0);
+        assert_eq!(slot.in_flight.load(Ordering::Relaxed), 0);
+        assert_eq!(slot.last_started_ms.load(Ordering::Relaxed), 0);
+    }
+
+    #[test]
+    fn fresh_slot_is_not_quarantined() {
+        let server = test_server(false, 4);
+        server.register_worker();
+        assert!(!server.slots.read()[0].quarantined.load(Ordering::Relaxed));
+        assert_eq!(server.quarantine_replacements.load(Ordering::Relaxed), 0);
+    }
+
+    #[test]
+    fn queue_histogram_buckets_by_wait() {
+        let h = QueueHistogram::new();
+        h.record(400);        // <= 500 -> bucket 0
+        h.record(500);        // == 500 -> bucket 0 (inclusive)
+        h.record(600);        // (500, 1000] -> bucket 1
+        h.record(20_000_000); // > last bound -> overflow
+        let s = h.snapshot();
+        assert_eq!(s.buckets[0], 2);
+        assert_eq!(s.buckets[1], 1);
+        assert_eq!(s.overflow, 1);
+        assert_eq!(s.count, 4);
+        assert_eq!(s.sum_us, 400 + 500 + 600 + 20_000_000);
     }
 }
