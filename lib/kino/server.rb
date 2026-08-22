@@ -27,6 +27,29 @@ module Kino
       !@tls.nil?
     end
 
+    # @return [Boolean] whether the bind is a unix domain socket
+    #   ("unix:///path/to.sock")
+    def unix?
+      @bind.start_with?("unix://")
+    end
+
+    # Where the server listens, once started: `http://host:port`
+    # (`https` under TLS), or the `unix://` socket path.
+    # @return [String]
+    def url
+      unix? ? @bind : "http#{"s" if tls?}://#{@bind}:#{@port}"
+    end
+
+    # Where the control plane listens, once started, or nil when it is
+    # off: `http://host:port`, or its `unix://` socket path.
+    # @return [String, nil]
+    def control_url
+      return nil unless @control_bind
+      return @control_bind if @control_bind.start_with?("unix://")
+
+      "http://#{@control_bind.rpartition(":").first}:#{@control_port}"
+    end
+
     # Settings precedence: explicit kwargs > config_file DSL > defaults.
     #
     # @param app [#call] a Rack 3 application
@@ -72,6 +95,9 @@ module Kino
       @shutdown_timeout = settings[:shutdown_timeout]
       @tokio_threads = settings[:tokio_threads]
       @tls = validate_tls(settings[:tls])
+      if @tls && unix?
+        raise ArgumentError, "TLS is not supported on a unix socket bind; terminate TLS at the proxy in front"
+      end
       @pidfile = settings[:pidfile]
       @control_bind = settings[:control_bind]&.to_s
       @control_token = settings[:control_token]&.to_s

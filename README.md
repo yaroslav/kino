@@ -218,7 +218,7 @@ Or embedded, with everything spelled out:
 
 ```ruby
 server = Kino::Server.new(app,
-  bind: "127.0.0.1",
+  bind: "127.0.0.1",          # or "unix:///run/kino.sock" behind a proxy
   port: 9292,                 # 0 = ephemeral; read back via server.port
   workers: Kino.available_parallelism, # ractors (parallelism); the default
   threads: 1,                 # per worker; ractor default 1, threaded default 3

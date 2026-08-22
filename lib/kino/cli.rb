@@ -123,7 +123,7 @@ module Kino
     # @return [void]
     def action!(server)
       puts dim("- mode:      #{server.mode}")
-      puts dim("- listening: http#{"s" if server.tls?}://#{server.bind}:#{server.port}")
+      puts dim("- listening: #{server.url}")
       puts dim("- Ctrl-C to drain and stop")
       puts "\n#{bold("Action!")}\n\n"
     end

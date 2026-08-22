@@ -31,6 +31,16 @@ module Kino
 
     def tls?: () -> bool
 
+    # Whether the bind is a unix domain socket ("unix:///path/to.sock").
+    def unix?: () -> bool
+
+    # Where the server listens once started: http(s)://host:port or the
+    # unix:// socket path.
+    def url: () -> String
+
+    # Where the control plane listens once started, or nil when it is off.
+    def control_url: () -> String?
+
     # Settings precedence: explicit kwargs > config_file DSL > defaults.
     def initialize: (rack_app app, ?config_file: String?, **untyped options) -> void
 

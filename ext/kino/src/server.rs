@@ -2,7 +2,7 @@
 //! intake. Ruby is never on these threads; the only contact points are the
 //! flume queue (in) and each request's Responder (out).
 
-use std::net::SocketAddr;
+use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
 use std::time::Duration;
@@ -13,6 +13,7 @@ use hyper_util::rt::TokioIo;
 use magnus::{Error, Ruby};
 use parking_lot::{Mutex, RwLock};
 
+use crate::listen::Listener;
 use crate::registry::{self, BoxedCtx, ServerInner, WorkerSlot};
 use crate::request::RequestCtx;
 use crate::response::{plain_response, HyperResponse, Responder};
@@ -78,15 +79,23 @@ pub fn server_start(ruby: &Ruby, config: magnus::RHash) -> Result<(u64, u16, Opt
         }
     };
 
-    let listener = std::net::TcpListener::bind((bind.as_str(), port))
-        .map_err(|e| io_error(ruby, "bind failed", e))?;
-    listener
-        .set_nonblocking(true)
-        .map_err(|e| io_error(ruby, "listener setup failed", e))?;
+    let listener =
+        Listener::bind(&bind, port).map_err(|e| io_error(ruby, "bind failed", e))?;
+    // Ruby refuses this combination up front; this guards embedders
+    // calling the native layer directly.
+    if acceptor.is_some() && matches!(listener, Listener::Unix(..)) {
+        return Err(Error::new(
+            ruby.exception_arg_error(),
+            "TLS is not supported on a unix socket bind",
+        ));
+    }
     let local_port = listener
-        .local_addr()
-        .map_err(|e| io_error(ruby, "listener setup failed", e))?
-        .port();
+        .port()
+        .map_err(|e| io_error(ruby, "listener setup failed", e))?;
+    let unix_path = match &listener {
+        Listener::Unix(_, path) => Some(path.clone()),
+        Listener::Tcp(_) => None,
+    };
 
     let control_bind_addr: Option<String> = cfg_opt(ruby, config, "control_bind")?;
     let control_token: Option<String> = cfg_opt(ruby, config, "control_token")?;
@@ -128,6 +137,7 @@ pub fn server_start(ruby: &Ruby, config: magnus::RHash) -> Result<(u64, u16, Opt
         quarantine_replacements: std::sync::atomic::AtomicU64::new(0),
         topology: registry::Topology { mode, workers, threads, batch },
         https: acceptor.is_some(),
+        unix_path,
         access_log: log_requests.then(|| crate::logsink::Sink::new(std::io::stdout())),
         lanes,
         lane_cursor: std::sync::atomic::AtomicUsize::new(0),
@@ -137,8 +147,7 @@ pub fn server_start(ruby: &Ruby, config: magnus::RHash) -> Result<(u64, u16, Opt
 
     let tokio_listener = {
         let _guard = runtime.enter();
-        tokio::net::TcpListener::from_std(listener)
-            .map_err(|e| io_error(ruby, "listener setup failed", e))?
+        AsyncListener::from_std(listener).map_err(|e| io_error(ruby, "listener setup failed", e))?
     };
     runtime.spawn(accept_loop(
         tokio_listener,
@@ -182,8 +191,59 @@ pub fn server_start(ruby: &Ruby, config: magnus::RHash) -> Result<(u64, u16, Opt
 /// timeout: not a knob.
 const TLS_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
 
+/// What a unix-socket connection reports as its addresses. The peer is
+/// local by definition (REMOTE_ADDR 127.0.0.1), and a socket has no port,
+/// so SERVER_PORT falls back to http's default when the Host header names
+/// none, the way Puma reports unix-socket requests.
+const UNIX_PEER: SocketAddr = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0);
+const UNIX_LOCAL: SocketAddr = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 80);
+
+/// The accept loop's listener: TCP (optionally behind TLS), or a unix
+/// socket, which carries plain HTTP only.
+enum AsyncListener {
+    Tcp(tokio::net::TcpListener),
+    Unix(tokio::net::UnixListener),
+}
+
+/// One accepted connection, before the protocol layer sees it.
+enum Conn {
+    Tcp(tokio::net::TcpStream),
+    Unix(tokio::net::UnixStream),
+}
+
+impl AsyncListener {
+    /// Register the bound listener with the current runtime.
+    fn from_std(listener: Listener) -> std::io::Result<AsyncListener> {
+        Ok(match listener {
+            Listener::Tcp(listener) => AsyncListener::Tcp(tokio::net::TcpListener::from_std(listener)?),
+            Listener::Unix(listener, _) => {
+                AsyncListener::Unix(tokio::net::UnixListener::from_std(listener)?)
+            }
+        })
+    }
+
+    /// The next connection with its (peer, local) addresses.
+    async fn accept(&self) -> std::io::Result<(Conn, SocketAddr, SocketAddr)> {
+        match self {
+            AsyncListener::Tcp(listener) => {
+                let (stream, remote_addr) = listener.accept().await?;
+                // Small responses must not wait on Nagle + delayed ACK.
+                let _ = stream.set_nodelay(true);
+                let local_addr = stream
+                    .local_addr()
+                    .unwrap_or_else(|_| SocketAddr::from(([0, 0, 0, 0], 0)));
+                Ok((Conn::Tcp(stream), remote_addr, local_addr))
+            }
+            AsyncListener::Unix(listener) => {
+                let (stream, _) = listener.accept().await?;
+                Ok((Conn::Unix(stream), UNIX_PEER, UNIX_LOCAL))
+            }
+        }
+    }
+}
+
 async fn accept_loop(
-    listener: tokio::net::TcpListener,
+    listener: AsyncListener,
     acceptor: Option<tokio_rustls::TlsAcceptor>,
     server: Arc<ServerInner>,
     max_connections: usize,
@@ -202,25 +262,20 @@ async fn accept_loop(
                 Err(_) => break, // semaphore closed
             },
         };
-        let (stream, remote_addr) = tokio::select! {
+        let (conn, remote_addr, local_addr) = tokio::select! {
             _ = shutdown_rx.changed() => break,
             accepted = listener.accept() => match accepted {
-                Ok(pair) => pair,
+                Ok(accepted) => accepted,
                 Err(_) => continue, // transient accept error; permit drops, retry
             },
         };
-        // Small responses must not wait on Nagle + delayed ACK.
-        let _ = stream.set_nodelay(true);
-        let local_addr = stream
-            .local_addr()
-            .unwrap_or_else(|_| SocketAddr::from(([0, 0, 0, 0], 0)));
         let server = server.clone();
         let acceptor = acceptor.clone();
         tokio::spawn(async move {
             // Held for the connection's lifetime; dropping it frees a slot.
             let _permit = permit;
-            match acceptor {
-                Some(acceptor) => {
+            match (conn, acceptor) {
+                (Conn::Tcp(stream), Some(acceptor)) => {
                     // Handshake failures (port scans, plain HTTP to a TLS
                     // port) and stalled handshakes (slowloris) just drop the
                     // connection; the timeout bounds the latter.
@@ -228,7 +283,13 @@ async fn accept_loop(
                     let Ok(Ok(tls)) = handshake.await else { return };
                     serve_connection(tls, server, remote_addr, local_addr).await;
                 }
-                None => serve_connection(stream, server, remote_addr, local_addr).await,
+                (Conn::Tcp(stream), None) => {
+                    serve_connection(stream, server, remote_addr, local_addr).await
+                }
+                // TLS over a unix socket is refused at bind time.
+                (Conn::Unix(stream), _) => {
+                    serve_connection(stream, server, remote_addr, local_addr).await
+                }
             }
         });
     }
@@ -650,6 +711,10 @@ pub fn shutdown_runtime(_ruby: &Ruby, server_id: u64, timeout_ms: u64) -> Result
     if let Some(server) = registry::remove(server_id) {
         if let Some(runtime) = server.runtime.lock().take() {
             runtime.shutdown_timeout(Duration::from_millis(timeout_ms));
+        }
+        // The listener is closed with the runtime; its socket file is not.
+        if let Some(path) = &server.unix_path {
+            crate::listen::cleanup_unix(path);
         }
     }
     Ok(())

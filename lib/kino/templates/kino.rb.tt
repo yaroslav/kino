@@ -8,7 +8,9 @@
 ## Network
 
 # Address to listen on. Use "0.0.0.0" to accept connections from other
-# machines.
+# machines, or "unix:///run/kino.sock" to listen on a unix domain socket
+# behind a proxy such as nginx (the port below is then unused; a stale
+# socket file is reclaimed, a live one refused).
 # bind "127.0.0.1"
 
 # Port to listen on.

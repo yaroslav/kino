@@ -144,7 +144,9 @@ module Kino
         @config = config
       end
 
-      # Address to listen on ("0.0.0.0" accepts non-local connections).
+      # Address to listen on: a host ("0.0.0.0" accepts non-local
+      # connections), or "unix:///path/to.sock" for a unix domain socket
+      # (then `port` is unused).
       def bind(host) = @config.set(:bind, host)
 
       # Port to listen on; 0 picks an ephemeral port.

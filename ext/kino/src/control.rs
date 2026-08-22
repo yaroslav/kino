@@ -300,32 +300,9 @@ pub enum ControlBind {
 /// Claim the control address. Both arms bind synchronously so a
 /// conflict raises at boot, like the main listener.
 pub fn bind_control(addr: &str) -> std::io::Result<ControlBind> {
-    if let Some(path) = addr.strip_prefix("unix://") {
-        let path = std::path::PathBuf::from(path);
-        // A path that already exists is either a live listener (refuse: do
-        // not steal it) or a stale file left behind by a crashed process
-        // (safe to unlink and reclaim). Probe with a connect: a successful
-        // connect means someone is accepting on it right now.
-        match std::os::unix::net::UnixStream::connect(&path) {
-            Ok(_) => {
-                return Err(std::io::Error::new(
-                    std::io::ErrorKind::AddrInUse,
-                    "control socket is in use",
-                ));
-            }
-            Err(e) if e.kind() == std::io::ErrorKind::ConnectionRefused => {
-                match std::fs::remove_file(&path) {
-                    Ok(()) => {}
-                    Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
-                    Err(e) => return Err(e),
-                }
-            }
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
-            Err(e) => return Err(e),
-        }
-        let listener = std::os::unix::net::UnixListener::bind(&path)?;
-        listener.set_nonblocking(true)?;
-        Ok(ControlBind::Unix(listener, path))
+    if let Some(path) = crate::listen::unix_path(addr) {
+        let listener = crate::listen::bind_unix(path)?;
+        Ok(ControlBind::Unix(listener, path.to_path_buf()))
     } else {
         let listener = std::net::TcpListener::bind(addr)?;
         listener.set_nonblocking(true)?;

@@ -1,5 +1,10 @@
 ## [Unreleased]
 
+- `bind "unix:///path/to.sock"` listens on a unix domain socket, the
+  usual shape behind nginx: a stale socket file is reclaimed, a live one
+  is refused, and the file is removed on shutdown. `port` is unused on
+  it and TLS is rejected (terminate TLS at the proxy). Requests arriving
+  over the socket report `REMOTE_ADDR` 127.0.0.1.
 - `workers` now defaults to `Kino.available_parallelism`, the CPUs the
   process may actually use: the affinity mask and, in a container, the
   cgroup CPU quota (a pod limited to 2 CPUs on a 64-core node gets 2
