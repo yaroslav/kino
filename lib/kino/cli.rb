@@ -200,7 +200,7 @@ module Kino
     def option_parser(options)
       OptionParser.new do |opts|
         opts.banner = "Usage: kino [options] [rackup file (default: config.ru)]"
-        opts.on("-C", "--config FILE", "Config file (default: kino.rb if present)") { |v| options[:config_file] = v }
+        opts.on("-C", "--config FILE", "Config file (default: kino.rb, then config/kino.rb)") { |v| options[:config_file] = v }
         opts.on("--init [PATH]", "Write a commented sample config (default: kino.rb) and exit") do |v|
           options[:init_path] = v || "kino.rb"
         end
@@ -236,14 +236,13 @@ module Kino
       require "kino"
       require "rack"
 
-      config_file = options[:config_file]
-      config_file ||= ("kino.rb" if File.exist?("kino.rb"))
+      config_file = options[:config_file] || Configuration.default_path
 
       config = Configuration.new
       config.load_file(config_file) if config_file
       config.merge!(options[:overrides])
       # Default port 9292 when neither the file nor a flag chose one.
-      config.set(:port, 9292) unless config.set?(:port)
+      config.set(:port, Configuration::DEFAULT_SERVING_PORT) unless config.set?(:port)
       config
     end
 

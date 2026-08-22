@@ -42,8 +42,11 @@ module Kino
     # served, rejected, timeouts, respawns, lane_depths when lanes are on).
     def stats: () -> stats_hash
 
-    # Production entry point: start, banner, signal traps, block until done.
+    # Production entry point: build the server and #run it.
     def self.run: (rack_app app, **untyped opts) -> Server
+
+    # Serve until shut down: start, banner, signal traps, block until done.
+    def run: () -> self
 
     # INT/TERM drain gracefully (second signal force-exits); USR1 prints stats.
     def self.trap_signals: (Server server) -> void
@@ -53,6 +56,12 @@ module Kino
     DEFAULTS: Hash[Symbol, untyped]
     SETTINGS: Array[Symbol]
     SAMPLE_TEMPLATE: String
+    DEFAULT_PATHS: Array[String]
+    DEFAULT_SERVING_PORT: Integer
+
+    # The first of DEFAULT_PATHS (kino.rb, config/kino.rb) present in the
+    # working directory.
+    def self.default_path: () -> String?
 
     # The fully commented sample config (see `kino --init`).
     def self.sample: () -> String
@@ -185,6 +194,24 @@ module Kino
       def close: () -> void
 
       def reopen: (*untyped) -> self
+    end
+  end
+end
+
+module Rackup
+  module Handler
+    # The Rack handler behind `rackup -s kino` and `rails server -u kino`.
+    module Kino
+      # Boot a server for app and block until shutdown; yields the built,
+      # not yet started server to hosts that want a handle on it.
+      def self.run: (::Kino::rack_app app, **untyped options) ?{ (::Kino::Server) -> void } -> ::Kino::Server
+
+      # The -O options rackup lists for this handler.
+      def self.valid_options: () -> Hash[String, String]
+
+      # Host options translated into Kino::Server kwargs, with precedence
+      # typed > config file > host defaults > Kino defaults.
+      def self.server_options: (Hash[Symbol, untyped] options) -> Hash[Symbol, untyped]
     end
   end
 end

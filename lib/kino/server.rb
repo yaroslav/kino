@@ -195,22 +195,34 @@ module Kino
       @supervisor ? @supervisor.join : @worker_threads.each(&:join)
     end
 
-    # Production entry point: start, print the banner, trap INT/TERM for
-    # graceful shutdown (second signal force-exits), block until done.
-    # The `kino` CLI funnels into this too (CLI#serve).
+    # Production entry point: build the server and {#run} it. The `kino`
+    # CLI funnels into this too (CLI#serve).
     #
     # @param app [#call] a Rack 3 application
     # @param opts [Hash] see #initialize
     # @return [Kino::Server] the (stopped) server, after shutdown
     def self.run(app, **opts)
-      server = new(app, **opts)
+      new(app, **opts).run
+    end
+
+    # Serve until shut down: start, print the banner, trap INT/TERM for
+    # graceful shutdown (second signal force-exits), block until done.
+    # The Rack handler calls this on a server it built itself.
+    #
+    # @return [self] after shutdown
+    def run
+      # Startup output must land immediately even when stdout is a pipe or
+      # file (process supervisors, `kino > server.log`, `rails server`
+      # under Docker); block buffering would hold the banner back until
+      # exit.
+      $stdout.sync = true
       CLI.opening_credits
-      server.start
-      CLI.action!(server)
+      start
+      CLI.action!(self)
       CLI.fin_at_exit
-      trap_signals(server)
-      server.wait
-      server
+      self.class.trap_signals(self)
+      wait
+      self
     end
 
     # Signal handling shared by Server.run and the kino CLI: INT/TERM drain

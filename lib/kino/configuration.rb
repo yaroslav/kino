@@ -45,6 +45,21 @@ module Kino
     # Source template for {.sample}.
     SAMPLE_TEMPLATE = File.expand_path("templates/kino.rb.tt", __dir__)
 
+    # Where the `kino` CLI and the Rack handler look for a config file when
+    # none is named: the project root first, then the Rails-style config/.
+    DEFAULT_PATHS = %w[kino.rb config/kino.rb].freeze
+
+    # The port the CLI and the Rack handler serve on when neither a flag
+    # nor the file chose one (Server.new itself defaults to an ephemeral
+    # port, for embedding).
+    DEFAULT_SERVING_PORT = 9292
+
+    # The first of {DEFAULT_PATHS} that exists in the working directory.
+    # @return [String, nil]
+    def self.default_path
+      DEFAULT_PATHS.find { |path| File.exist?(path) }
+    end
+
     # The fully-commented sample config (see `kino --init`).
     # @return [String]
     def self.sample

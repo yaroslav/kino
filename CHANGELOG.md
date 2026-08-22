@@ -1,3 +1,16 @@
+## [Unreleased]
+
+- Rack handler: `rails server -u kino` and `rackup -s kino` boot Kino
+  through `Rackup::Handler::Kino`, reading the same config file as the
+  `kino` CLI with the host's flags on top; `rackup -s kino --help` lists
+  the `-O` options (Workers, Threads, Mode, Config).
+- The config file is also looked up at `config/kino.rb` (the Rails
+  layout) when there is no `kino.rb`, by the CLI and the handler alike.
+- `Kino::Server#run` serves an already built server the way
+  `Kino::Server.run` does (banner, signal traps, block until shutdown),
+  and syncs stdout there so the banner is never held back by block
+  buffering under a pipe, whichever entry point booted the server.
+
 ## [0.3.0] - 2026-08-13
 
 - Queue-time histogram: `/metrics` exposes `kino_request_queue_seconds`, a

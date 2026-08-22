@@ -9,10 +9,6 @@
 # process-global bits an executable owns.
 
 Warning[:experimental] = false
-# Startup output must land immediately even when stdout is a pipe or file
-# (process supervisors, `kino > server.log`); block buffering would hold
-# the banner back until exit.
-$stdout.sync = true
 
 # Running from a git checkout (no installed gem, no bundler context):
 # prefer the checkout's own lib so `require "kino"` resolves.
