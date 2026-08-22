@@ -41,6 +41,7 @@ Gem::Specification.new do |spec|
   spec.add_dependency "rack", ">= 3.1"
   spec.add_dependency "rb_sys", "~> 0.9.128"
 
+  spec.add_development_dependency "rackup", "~> 2.2"
   spec.add_development_dependency "rake", "~> 13.0"
   spec.add_development_dependency "rake-compiler"
   spec.add_development_dependency "rbs", "~> 4.0"

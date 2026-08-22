@@ -196,6 +196,12 @@ bundle exec kino           # picks up config.ru + kino.rb, serves on :9292
 (After a standalone `gem install`, the `kino` command works without
 `bundle exec`.)
 
+Prefer your framework's own command? Kino ships a Rack handler, so
+`rails server -u kino` and `rackup -s kino` boot it too. They read the
+same `kino.rb` (or `config/kino.rb`), the host's `-p`/`-b` flags win over
+the file, and `rackup -s kino -O Workers=4 -O Mode=threaded` reaches the
+rest (`rackup -s kino --help` lists them).
+
 No Rust compiler needed: released versions ship precompiled native gems
 for Linux (x86_64/aarch64, glibc and musl) and macOS (arm64). On other
 platforms the gem compiles at install time; that needs a Rust toolchain,
@@ -255,8 +261,10 @@ server.shutdown               # graceful: drain → deadline → abort straggler
 
 ## Config file and CLI
 
-Settings can live in a Puma-style Ruby DSL file. Precedence: explicit
-kwargs and CLI flags > config file > defaults.
+Settings can live in a Puma-style Ruby DSL file: `kino.rb` in the
+working directory, or `config/kino.rb` (the Rails layout), is picked up
+automatically; `-C PATH` names any other. Precedence: explicit kwargs
+and CLI flags > config file > defaults.
 
 ```ruby
 # kino.rb
@@ -491,8 +499,9 @@ optional in Rack 3.
 
 ## Rails
 
-Rails (edge) runs on Kino today in `:threaded` mode; see
-`examples/rails-hello`. Ractor-mode Rails is blocked upstream. The exact
+Rails (edge) runs on Kino today in `:threaded` mode (`rails server -u
+kino`, or the `kino` CLI); see `examples/rails-hello`. Ractor-mode Rails
+is blocked upstream. The exact
 blockers, the `Ruby::Box` findings, and what would unlock it are written
 up in [doc/rails-on-ractors.md](doc/rails-on-ractors.md). The example
 ships a probe script that re-tests against whatever Rails you bundle.
