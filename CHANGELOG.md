@@ -1,4 +1,4 @@
-## [Unreleased]
+## [0.4.0] - 2026-08-22
 
 - Rack handler: `rails server -u kino` and `rackup -s kino` boot Kino
   through `Rackup::Handler::Kino`, reading the same config file as the

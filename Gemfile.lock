@@ -1,7 +1,7 @@
 PATH
   remote: .
   specs:
-    kino (0.3.0)
+    kino (0.4.0)
       logger (>= 1.6)
       rack (>= 3.1)
       rb_sys (~> 0.9.128)
@@ -220,7 +220,7 @@ CHECKSUMS
   io-stream (0.14.0) sha256=07d9b13ea2066ccbbc761fff8d69ad5a31e47561d31e02cc271f3ed9c1a8f1cd
   irb (1.18.0) sha256=de9454a0703a54704b9811a5ef31a60c86949fbf4013fcf244fabc7c775248e3
   json (2.21.2) sha256=1f1d3b7cf2b3ba1a69beca0bb6db13d5438b80bff3cd54cdaaa620b9b07c1c6a
-  kino (0.3.0)
+  kino (0.4.0)
   language_server-protocol (3.17.0.6) sha256=5ef2c0c138f8267e1bc631d3328347d354f96724b0af22f2c79516120443b7f0
   lint_roller (1.1.0) sha256=2c0c845b632a7d172cb849cc90c1bce937a28c5c8ccccb50dfd46a485003cc87
   localhost (1.8.0) sha256=df7ea825b4f64949c588c17efac86bc47ddc4460d723778abe933b71759b2701
