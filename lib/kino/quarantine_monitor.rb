@@ -21,7 +21,10 @@ module Kino
 
     def start
       @running = true
-      @thread = Thread.new { run }
+      @thread = Thread.new do
+        Thread.current.name = "quarantine"
+        run
+      end
       self
     end
 
@@ -35,14 +38,14 @@ module Kino
     def run
       tick while @running
     rescue => e
-      Native.log_error("quarantine monitor crashed: #{e.class}: #{e.message}")
+      Log.error("quarantine monitor crashed: #{e.class}: #{e.message}")
     end
 
     def tick
       scan_slots
     rescue => e
       # A bad tick must never kill the monitor.
-      Native.log_error("quarantine tick error: #{e.class}: #{e.message}")
+      Log.error("quarantine tick error: #{e.class}: #{e.message}")
     ensure
       sleep @tick
     end
@@ -53,7 +56,7 @@ module Kino
 
         if @outstanding >= @max
           unless @at_cap_logged
-            Native.log_error("quarantine at cap (#{@max}); serving at reduced capacity")
+            Log.warn("quarantine at cap (#{@max}); serving at reduced capacity")
             @at_cap_logged = true
           end
           next

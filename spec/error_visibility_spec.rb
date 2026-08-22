@@ -1,7 +1,5 @@
 # frozen_string_literal: true
 
-require "tempfile"
-
 # Errors caught by the worker rescue must be visible to the app's
 # monitoring (on_error hook, backtrace in the log), and spec-violating
 # header values must be coerced like Puma coerces them, not turned into
@@ -154,24 +152,10 @@ RSpec.describe "error visibility" do
         end
       end
 
-      expect(log).to include("RuntimeError: kaput with backtrace")
-      # The frame that raised must be nameable from the log line.
-      expect(log).to match(/error_visibility_spec\.rb:\d+/)
-    end
-  end
-
-  # Native log lines go to fd 2 via Rust eprintln!, invisible to Ruby's
-  # $stderr object: capture by swapping the file descriptor itself.
-  def capture_native_stderr
-    original = $stderr.dup
-    Tempfile.create("kino-stderr") do |captured|
-      $stderr.reopen(captured)
-      yield
-      $stderr.flush
-      captured.rewind
-      captured.read
-    ensure
-      $stderr.reopen(original)
+      # The headline names the request, the error, and the raise site in
+      # the app's own code, relative to the working directory.
+      expect(log).to match(%r{500 GET / · RuntimeError: kaput with backtrace \(spec/error_visibility_spec\.rb:\d+})
+      expect(log).to match(%r{^    spec/error_visibility_spec\.rb:\d+:in })
     end
   end
 end

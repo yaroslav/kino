@@ -27,6 +27,29 @@ module Kino
       !@tls.nil?
     end
 
+    # @return [Boolean] whether the bind is a unix domain socket
+    #   ("unix:///path/to.sock")
+    def unix?
+      @bind.start_with?("unix://")
+    end
+
+    # Where the server listens, once started: `http://host:port`
+    # (`https` under TLS), or the `unix://` socket path.
+    # @return [String]
+    def url
+      unix? ? @bind : "http#{"s" if tls?}://#{@bind}:#{@port}"
+    end
+
+    # Where the control plane listens, once started, or nil when it is
+    # off: `http://host:port`, or its `unix://` socket path.
+    # @return [String, nil]
+    def control_url
+      return nil unless @control_bind
+      return @control_bind if @control_bind.start_with?("unix://")
+
+      "http://#{@control_bind.rpartition(":").first}:#{@control_port}"
+    end
+
     # Settings precedence: explicit kwargs > config_file DSL > defaults.
     #
     # @param app [#call] a Rack 3 application
@@ -54,7 +77,12 @@ module Kino
       @worker_hooks = WorkerHooks.new(
         on_error: @on_error,
         after_worker_boot: @after_worker_boot,
-        after_request_complete: @after_request_complete
+        after_request_complete: @after_request_complete,
+        # The access log's GC and allocation figures come from the VM's
+        # process-wide counters, so they are measured only where one
+        # request at a time can own them: the GVL serializes :threaded
+        # mode, and a single ractor has nothing to race.
+        access_timing: !!settings[:log_requests] && (@mode == :threaded || @workers == 1)
       )
       # Default threads per mode: 1 in :ractor (threads inside a ractor
       # share its lock; a measured +17% on fast handlers; raise `workers`
@@ -72,6 +100,9 @@ module Kino
       @shutdown_timeout = settings[:shutdown_timeout]
       @tokio_threads = settings[:tokio_threads]
       @tls = validate_tls(settings[:tls])
+      if @tls && unix?
+        raise ArgumentError, "TLS is not supported on a unix socket bind; terminate TLS at the proxy in front"
+      end
       @pidfile = settings[:pidfile]
       @control_bind = settings[:control_bind]&.to_s
       @control_token = settings[:control_token]&.to_s
@@ -234,14 +265,14 @@ module Kino
       # kill -USR1 <pid> prints a one-line stats snapshot (find the pid in
       # the pidfile when configured).
       trap("USR1") do
-        Thread.new { $stdout.puts Kino::CLI.stats_line(server.stats) }
+        Thread.new { Log.info(CLI.stats_line(server.stats)) }
       end
       signaled = false
       %w[INT TERM].each do |signal|
         trap(signal) do
           Process.exit!(1) if signaled
           signaled = true
-          $stderr.write("Kino: draining (signal again to force exit)\n")
+          Log.warn("draining (signal again to force exit)")
           # Trap context forbids mutexes; do the real work on a thread.
           Thread.new { server.shutdown }
         end
@@ -282,6 +313,8 @@ module Kino
     def spawn_worker_thread
       worker_id = Native.register_worker(@id)
       Thread.new do
+        # Named so log lines from inside say which worker spoke.
+        Thread.current.name = "worker-#{worker_id}"
         error = nil
         begin
           Worker.run(@id, worker_id, @app, @batch, @worker_hooks)
@@ -454,7 +487,7 @@ module Kino
       if @supervisor
         # Ractors cannot be force-killed; their clients were already freed
         # by abort_all_inflight. The stuck ractor leaks until process exit.
-        Native.log_error("shutdown deadline passed with stuck ractor workers") unless @supervisor.done?
+        Log.error("shutdown deadline passed with stuck ractor workers") unless @supervisor.done?
       else
         threads = @worker_threads_lock.synchronize { @worker_threads.dup }
         threads.each { |thread| thread.kill if thread.alive? }
@@ -486,10 +519,10 @@ module Kino
         :ractor
       when :auto
         if !Ractor.shareable?(@app)
-          warn "Kino: app is not Ractor-shareable; falling back to mode: :threaded"
+          Log.warn("app is not Ractor-shareable; falling back to mode: :threaded")
           :threaded
         elsif (name = unshareable_worker_hook_name)
-          warn "Kino: #{name} hook is not Ractor-shareable; falling back to mode: :threaded"
+          Log.warn("#{name} hook is not Ractor-shareable; falling back to mode: :threaded")
           :threaded
         else
           :ractor

@@ -91,6 +91,7 @@ module Kino
 
     def supervise(index)
       Thread.new do
+        Thread.current.name = "supervisor-#{index}"
         crashes = 0
         loop do
           ractor, worker_ids = spawn_worker(index)
@@ -109,7 +110,7 @@ module Kino
 
             crashes += 1
             Native.record_respawn(@server_id)
-            Native.log_error("worker ractor #{index} crashed (#{cause.class}: #{cause.message}); respawning")
+            Log.error("worker-#{index} crashed (#{cause.class}: #{cause.message}); respawning")
             # Policy (crash recovery): unlimited respawn
             # keeps the server up under rare crashes but turns a
             # crash-on-every-request bug into a busy loop. A circuit breaker
@@ -129,12 +130,16 @@ module Kino
         @worker_slots[worker_index] = worker_ids
         worker_ids.each { |id| @slot_to_worker[id] = worker_index }
       end
-      ractor = Ractor.new(@server_id, worker_ids, @app, @batch, @hooks) do |server_id, ids, app, batch, hooks|
-        ids.map do |id|
+      # Named so log lines from inside say which worker spoke: the ractor
+      # alone for a single thread, `worker-N/thread-M` for more.
+      ractor = Ractor.new(@server_id, worker_ids, @app, @batch, @hooks,
+        name: "worker-#{worker_index}") do |server_id, ids, app, batch, hooks|
+        ids.each_with_index.map do |id, position|
           Thread.new do
             # Crashes surface via Ractor#value in the supervisor; don't also
             # spray the backtrace to stderr from inside the dying ractor.
             Thread.current.report_on_exception = false
+            Thread.current.name = "thread-#{position + 1}" if ids.size > 1
             Kino::Worker.run(server_id, id, app, batch, hooks)
           end
         end.each(&:join)

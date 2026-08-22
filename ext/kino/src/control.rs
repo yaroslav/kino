@@ -300,32 +300,9 @@ pub enum ControlBind {
 /// Claim the control address. Both arms bind synchronously so a
 /// conflict raises at boot, like the main listener.
 pub fn bind_control(addr: &str) -> std::io::Result<ControlBind> {
-    if let Some(path) = addr.strip_prefix("unix://") {
-        let path = std::path::PathBuf::from(path);
-        // A path that already exists is either a live listener (refuse: do
-        // not steal it) or a stale file left behind by a crashed process
-        // (safe to unlink and reclaim). Probe with a connect: a successful
-        // connect means someone is accepting on it right now.
-        match std::os::unix::net::UnixStream::connect(&path) {
-            Ok(_) => {
-                return Err(std::io::Error::new(
-                    std::io::ErrorKind::AddrInUse,
-                    "control socket is in use",
-                ));
-            }
-            Err(e) if e.kind() == std::io::ErrorKind::ConnectionRefused => {
-                match std::fs::remove_file(&path) {
-                    Ok(()) => {}
-                    Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
-                    Err(e) => return Err(e),
-                }
-            }
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
-            Err(e) => return Err(e),
-        }
-        let listener = std::os::unix::net::UnixListener::bind(&path)?;
-        listener.set_nonblocking(true)?;
-        Ok(ControlBind::Unix(listener, path))
+    if let Some(path) = crate::listen::unix_path(addr) {
+        let listener = crate::listen::bind_unix(path)?;
+        Ok(ControlBind::Unix(listener, path.to_path_buf()))
     } else {
         let listener = std::net::TcpListener::bind(addr)?;
         listener.set_nonblocking(true)?;
@@ -405,20 +382,26 @@ fn run(
 ) {
     let runtime = match tokio::runtime::Builder::new_current_thread().enable_all().build() {
         Ok(runtime) => runtime,
-        Err(e) => return crate::server::log_error(format!("control runtime failed: {e}")),
+        Err(e) => return native_error(format!("control runtime failed: {e}")),
     };
     runtime.block_on(async move {
         match bind {
             ControlBind::Tcp(listener, _) => match tokio::net::TcpListener::from_std(listener) {
                 Ok(listener) => serve(TcpOrUnix::Tcp(listener), server, token, stop_rx).await,
-                Err(e) => crate::server::log_error(format!("control listener failed: {e}")),
+                Err(e) => native_error(format!("control listener failed: {e}")),
             },
             ControlBind::Unix(listener, _) => match tokio::net::UnixListener::from_std(listener) {
                 Ok(listener) => serve(TcpOrUnix::Unix(listener), server, token, stop_rx).await,
-                Err(e) => crate::server::log_error(format!("control listener failed: {e}")),
+                Err(e) => native_error(format!("control listener failed: {e}")),
             },
         }
     });
+}
+
+/// A failure inside the native layer itself, reported as the "native"
+/// source: no Ruby ractor or thread spoke.
+fn native_error(message: String) {
+    crate::log::emit(crate::log::Level::Error, "native", &message);
 }
 
 enum TcpOrUnix {

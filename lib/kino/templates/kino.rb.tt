@@ -8,7 +8,9 @@
 ## Network
 
 # Address to listen on. Use "0.0.0.0" to accept connections from other
-# machines.
+# machines, or "unix:///run/kino.sock" to listen on a unix domain socket
+# behind a proxy such as nginx (the port below is then unused; a stale
+# socket file is reclaimed, a live one refused).
 # bind "127.0.0.1"
 
 # Port to listen on.
@@ -22,7 +24,8 @@
 
 # How many workers to run. Each worker handles requests independently;
 # in :ractor mode every worker runs Ruby in parallel on its own core.
-# Default: one per CPU core.
+# Default: the CPUs this process may use (Kino.available_parallelism:
+# the affinity mask and, in a container, the cgroup CPU quota).
 # workers 8
 
 # Threads inside each worker. More threads help when your app spends
@@ -74,9 +77,12 @@
 # for quick handlers; behavior under heavy overload differs slightly.
 # lanes false
 
-# Print one line per request to stdout, colored by status on a
-# terminal. This is the server's view: it includes requests your app
-# never saw, such as 503s. Recommended in development.
+# Log every request to stdout: an arrival line before the app runs and a
+# completion line after it, colored by status on a terminal, with a
+# timing breakdown (time in Ruby with its GC pause and allocations, the
+# server's own overhead, and queue wait). This is the server's view: it
+# includes requests your app never saw, such as 503s. Recommended in
+# development; cheap enough for production.
 # log_requests false
 
 # Called when a worker catches an app or delivery error, after the client

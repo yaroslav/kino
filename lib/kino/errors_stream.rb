@@ -2,17 +2,18 @@
 
 module Kino
   # @private
-  # rack.errors: stateless writer into the native logger. Frozen singleton,
+  # rack.errors: stateless writer into the server log (one line per
+  # call, labelled like every other line Kino writes). Frozen singleton,
   # which also makes it Ractor-shareable; one instance serves all workers.
   class ErrorsStream
     def puts(message)
-      Native.log_error(message.to_s)
+      Log.error(message.to_s.chomp)
       nil
     end
 
     def write(message)
       message = message.to_s
-      Native.log_error(message)
+      Log.error(message.chomp)
       message.bytesize
     end
 

@@ -20,6 +20,9 @@ module Kino
   # High-resolution sleep on the OS clock with the GVL released.
   def self.sleep: (Numeric seconds) -> nil
 
+  # CPUs this process may use (affinity mask and cgroup quota); never below 1.
+  def self.available_parallelism: () -> Integer
+
   class Server
     attr_reader port: Integer?
     attr_reader control_port: Integer?
@@ -27,6 +30,16 @@ module Kino
     attr_reader bind: String
 
     def tls?: () -> bool
+
+    # Whether the bind is a unix domain socket ("unix:///path/to.sock").
+    def unix?: () -> bool
+
+    # Where the server listens once started: http(s)://host:port or the
+    # unix:// socket path.
+    def url: () -> String
+
+    # Where the control plane listens once started, or nil when it is off.
+    def control_url: () -> String?
 
     # Settings precedence: explicit kwargs > config_file DSL > defaults.
     def initialize: (rack_app app, ?config_file: String?, **untyped options) -> void
@@ -175,6 +188,27 @@ module Kino
 
     # Pretty-printed report; true when the app is ractor-ready.
     def self.print_report: (rack_app app, ?io: IO) -> bool
+  end
+
+  # Server log lines, `kino[<pid>] <source>: message`; safe inside worker
+  # ractors, so hooks may log through it.
+  module Log
+    FRAMES: Integer
+    WORKING_DIR: String
+
+    def self.info: (untyped message) -> void
+    def self.warn: (untyped message) -> void
+    def self.error: (untyped message) -> void
+
+    # The failed-request report: request line, error, and an app-first
+    # backtrace relative to the working directory.
+    def self.exception: (Exception error, Hash[String, untyped] env, ?status: Integer) -> void
+
+    # The `kino[<pid>] <source>:` tag.
+    def self.label: () -> String
+
+    # The ractor and/or thread name, or `main`.
+    def self.source: () -> String
   end
 
   # A ::Logger writing through the native async sink.

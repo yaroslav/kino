@@ -69,6 +69,8 @@ pub struct ServerInner {
     pub quarantine_replacements: AtomicU64,
     pub topology: Topology,
     pub https: bool,
+    /// The socket file of a `unix://` bind, removed at shutdown.
+    pub unix_path: Option<std::path::PathBuf>,
     /// Native access log sink (None unless log_requests is on).
     pub access_log: Option<crate::logsink::Sink>,
     /// Lane-dispatch mode: per-worker queues, awake-preferring dispatch.
@@ -301,6 +303,7 @@ pub fn test_server(lanes: bool, queue_depth: usize) -> Arc<ServerInner> {
         quarantine_replacements: AtomicU64::new(0),
         topology: Topology { mode: "threaded".to_string(), workers: 0, threads: 0, batch: 1 },
         https: false,
+        unix_path: None,
         access_log: None,
         lanes,
         lane_cursor: AtomicUsize::new(0),

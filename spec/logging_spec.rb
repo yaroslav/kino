@@ -92,13 +92,40 @@ RSpec.describe "logging" do
           lines = nil
           50.times do
             lines = File.read(out)
-            break if lines.scan('"GET ').size >= 3
+            break if lines.scan("← ").size >= 3
             sleep 0.05
           end
 
-          expect(lines).to match(/127\.0\.0\.1 \[.+\] "GET \/ HTTP\/1\.1" 200 \d+\.\dms/)
-          expect(lines).to match(/"GET \/missing HTTP\/1\.1" 404/)
-          expect(lines).to match(/"GET \/moved HTTP\/1\.1" 301/)
+          stamp = /^\d{4}-\d\d-\d\d \d\d:\d\d:\d\d [+-]\d{4} /
+          # An arrival record lands before the app runs, a completion after.
+          expect(lines).to match(/#{stamp}→ GET \/  from 127\.0\.0\.1$/)
+          expect(lines).to match(/#{stamp}← 200 GET \/  \d+\.\dms \(ruby \d+\.\dms \[gc \d+\.\dms; \S+ obj\]; kino \d+\.\dms; wait \d+\.\dms\)$/)
+          expect(lines).to match(/← 404 GET \/missing  \d+\.\dms/)
+          expect(lines).to match(/← 301 GET \/moved  \d+\.\dms/)
+          # A blank line sets one request apart from the next.
+          expect(lines).to match(/wait \d+\.\dms\)\n\n/)
+        end
+      end
+    end
+
+    it "leaves out the GC and allocation figures when parallel ractors would blur them" do
+      app = <<~RU
+        run Ractor.shareable_proc { |_env| [200, {"content-type" => "text/plain"}, ["ok"]] }
+      RU
+
+      Dir.mktmpdir("kino-access") do |dir|
+        with_cli_server(dir, "workers 2\nthreads 1\nmode :ractor\nlog_requests true\n", app) do |port, out|
+          expect(Net::HTTP.get_response("127.0.0.1", "/", port).code).to eq("200")
+
+          lines = nil
+          50.times do
+            lines = File.read(out)
+            break if lines.include?("← ")
+            sleep 0.05
+          end
+
+          expect(lines).to match(/← 200 GET \/  \d+\.\dms \(ruby \d+\.\dms; kino \d+\.\dms; wait \d+\.\dms\)$/)
+          expect(lines).not_to include("[gc")
         end
       end
     end

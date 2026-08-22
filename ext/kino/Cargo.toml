@@ -26,7 +26,9 @@ hyper-util = { version = "0.1", features = ["server", "tokio", "http1"] }
 http = "1"
 http-body-util = "0.1"
 bytes = "1"
-httpdate = "1"
+# Local-time stamps for the access log: the system zone only (no bundled
+# tzdb, no serde), which keeps the dependency tree to jiff itself.
+jiff = { version = "0.2", default-features = false, features = ["std", "tz-system", "tzdb-zoneinfo"] }
 # ring (not the default aws-lc-rs) as the rustls crypto provider: it
 # cross-compiles cleanly in rb-sys-dock containers, while aws-lc-sys wants
 # cmake and a per-target C toolchain.

@@ -44,6 +44,41 @@ pub struct RequestCtx {
     /// When this request entered the queue, for the queue-wait histogram.
     /// Stamped at ctx creation; read once at admit (queue.rs).
     pub enqueued_at: std::time::Instant,
+    /// Whether the access log wants timing: decided at intake, read on
+    /// the way out, so an idle log costs nothing per request.
+    pub timed: bool,
+    /// Queue wait, stamped at admit (queue.rs): the log's `wait`.
+    pub wait: std::time::Duration,
+    /// When a worker took the request; elapsed at the response head it is
+    /// the log's `ruby`.
+    pub admitted_at: std::time::Instant,
+    /// GC pause and objects allocated during the app call, when the
+    /// worker measured them (Request#timing).
+    pub gc: Option<(std::time::Duration, u64)>,
+}
+
+impl RequestCtx {
+    /// The timing this request carries to the access log.
+    fn timing(&self) -> crate::access_log::Timing {
+        crate::access_log::Timing {
+            wait: self.wait,
+            ruby: self.admitted_at.elapsed(),
+            gc: self.gc,
+        }
+    }
+}
+
+/// Attach the request's timing to a response head when the access log
+/// wants it; the extension is the one allocation an idle log skips.
+fn timed(
+    ctx: &RequestCtx,
+    builder: hyper::http::response::Builder,
+) -> hyper::http::response::Builder {
+    if ctx.timed {
+        builder.extension(ctx.timing())
+    } else {
+        builder
+    }
 }
 
 impl Drop for RequestCtx {
@@ -233,7 +268,7 @@ pub fn respond_simple(
     body: RString,
 ) -> Result<bool, Error> {
     let ctx = request.0.borrow();
-    let builder = build_head(status, headers)?;
+    let builder = timed(&ctx, build_head(status, headers)?);
     let bytes = body_bytes(&ctx, body);
     let response = builder
         .body(full_body(bytes))
@@ -252,6 +287,13 @@ fn body_bytes(ctx: &RequestCtx, body: RString) -> Bytes {
 }
 
 impl Request {
+    /// The worker's measurements around the app call, for the access log's
+    /// breakdown: the GC pause in nanoseconds and the objects allocated.
+    /// Called only when the access log is on.
+    pub fn set_timing(_ruby: &Ruby, rb_self: &Request, gc_nanos: u64, allocs: u64) {
+        rb_self.0.borrow_mut().gc = Some((std::time::Duration::from_nanos(gc_nanos), allocs));
+    }
+
     /// Next chunk of the request body, at most `max_len` bytes; nil at EOF.
     /// Blocks (GVL released) until the client sends more.
     pub fn read_body(
@@ -306,7 +348,7 @@ impl Request {
         headers: RHash,
     ) -> Result<bool, Error> {
         let ctx = rb_self.0.borrow();
-        let builder = build_head(status, headers)?;
+        let builder = timed(&ctx, build_head(status, headers)?);
         ctx.responder
             .send_stream_head(builder)
             .map_err(|e| invalid_response(ruby, e))
@@ -429,6 +471,10 @@ pub fn test_ctx() -> crate::registry::BoxedCtx {
         pin_slab: Arc::new(crate::pin::PinSlab::new()),
         responder: Arc::new(Responder::new(head_tx)),
         enqueued_at: std::time::Instant::now(),
+        timed: false,
+        wait: std::time::Duration::ZERO,
+        admitted_at: std::time::Instant::now(),
+        gc: None,
     })
 }
 

@@ -58,7 +58,7 @@ RSpec.describe "server stats" do
     line = Kino::CLI.stats_line({mode: :ractor, served: 42,
       worker_status: [{index: 0, served: 1, in_flight: 0, busy_ms: 0}]})
 
-    expect(line).to include("Kino stats:")
+    expect(line).to start_with("stats ")
     expect(line).to include("mode=:ractor")
     expect(line).to include("served=42")
     expect(line).not_to include("worker_status")

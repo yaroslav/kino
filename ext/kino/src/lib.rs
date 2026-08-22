@@ -4,9 +4,13 @@
 #[global_allocator]
 static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
 
+mod access_log;
 mod control;
+mod cpus;
 mod env_strings;
 mod gvl;
+mod listen;
+mod log;
 mod logsink;
 mod mono;
 mod pin;
@@ -62,8 +66,12 @@ fn init(ruby: &Ruby) -> Result<(), Error> {
         function!(server::interrupt_all_workers, 1),
     )?;
     native.define_singleton_method("shutdown_runtime", function!(server::shutdown_runtime, 2))?;
-    native.define_singleton_method("log_error", function!(server::log_error, 1))?;
+    native.define_singleton_method("log_line", function!(log::log_line, 3))?;
     native.define_singleton_method("sleep_chunk", function!(timer::sleep_chunk, 1))?;
+    native.define_singleton_method(
+        "available_parallelism",
+        function!(cpus::available_parallelism, 0),
+    )?;
     native.define_singleton_method("log_device_open", function!(logsink::device_open, 1))?;
     native.define_singleton_method("log_device_write", function!(logsink::device_write, 2))?;
     native.define_singleton_method("log_device_close", function!(logsink::device_close, 1))?;
@@ -87,6 +95,7 @@ fn init(ruby: &Ruby) -> Result<(), Error> {
     request.define_method("write_chunk", method!(Request::write_chunk, 1))?;
     request.define_method("finish", method!(Request::finish, 0))?;
     request.define_method("abort", method!(Request::abort, 0))?;
+    request.define_method("timing", method!(Request::set_timing, 2))?;
 
     // Force-resolve the TypedData class cache on the main ractor: magnus
     // resolves it lazily on first wrap, and a racy first resolution from two
