@@ -220,7 +220,7 @@ Or embedded, with everything spelled out:
 server = Kino::Server.new(app,
   bind: "127.0.0.1",
   port: 9292,                 # 0 = ephemeral; read back via server.port
-  workers: Etc.nprocessors,   # ractors (parallelism)
+  workers: Kino.available_parallelism, # ractors (parallelism); the default
   threads: 1,                 # per worker; ractor default 1, threaded default 3
   mode: :auto,                # :auto | :ractor | :threaded
   queue_depth: 1024,          # bounded queue; overflow → 503

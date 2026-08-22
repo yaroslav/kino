@@ -20,6 +20,9 @@ module Kino
   # High-resolution sleep on the OS clock with the GVL released.
   def self.sleep: (Numeric seconds) -> nil
 
+  # CPUs this process may use (affinity mask and cgroup quota); never below 1.
+  def self.available_parallelism: () -> Integer
+
   class Server
     attr_reader port: Integer?
     attr_reader control_port: Integer?

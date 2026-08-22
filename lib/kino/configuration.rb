@@ -1,7 +1,5 @@
 # frozen_string_literal: true
 
-require "etc"
-
 module Kino
   # Server settings with Puma-style precedence:
   #   explicit Server.new kwargs > config file DSL > defaults.
@@ -11,7 +9,7 @@ module Kino
     DEFAULTS = {
       bind: "127.0.0.1",
       port: 0,
-      workers: nil, # resolved to Etc.nprocessors in #to_h
+      workers: nil, # resolved to Kino.available_parallelism in #to_h
       threads: nil, # resolved per mode in Server: 1 in :ractor, 3 in :threaded
       mode: :auto,
       queue_depth: 1024,
@@ -113,7 +111,7 @@ module Kino
     # @return [Hash{Symbol => Object}] every setting, defaults filled in
     def to_h
       SETTINGS.to_h { |key| [key, self[key]] }.tap do |h|
-        h[:workers] ||= Etc.nprocessors
+        h[:workers] ||= Kino.available_parallelism
       end
     end
 

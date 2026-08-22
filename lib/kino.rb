@@ -33,6 +33,16 @@ module Kino
     remaining = Native.sleep_chunk(remaining) while remaining.positive?
     nil
   end
+
+  # How many CPUs this process may actually use: the `workers` default.
+  # Unlike `Etc.nprocessors`, this honours a cgroup CPU quota (a container
+  # limited to 2 CPUs on a 64-core host gets 2, not 64) as well as the
+  # affinity mask; a fractional quota rounds up. Never below 1.
+  #
+  # @return [Integer]
+  def self.available_parallelism
+    Native.available_parallelism
+  end
 end
 
 require_relative "kino/cli"

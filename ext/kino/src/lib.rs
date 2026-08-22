@@ -5,6 +5,7 @@
 static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
 
 mod control;
+mod cpus;
 mod env_strings;
 mod gvl;
 mod logsink;
@@ -64,6 +65,10 @@ fn init(ruby: &Ruby) -> Result<(), Error> {
     native.define_singleton_method("shutdown_runtime", function!(server::shutdown_runtime, 2))?;
     native.define_singleton_method("log_error", function!(server::log_error, 1))?;
     native.define_singleton_method("sleep_chunk", function!(timer::sleep_chunk, 1))?;
+    native.define_singleton_method(
+        "available_parallelism",
+        function!(cpus::available_parallelism, 0),
+    )?;
     native.define_singleton_method("log_device_open", function!(logsink::device_open, 1))?;
     native.define_singleton_method("log_device_write", function!(logsink::device_write, 2))?;
     native.define_singleton_method("log_device_close", function!(logsink::device_close, 1))?;

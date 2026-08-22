@@ -1,3 +1,10 @@
+## [Unreleased]
+
+- `workers` now defaults to `Kino.available_parallelism`, the CPUs the
+  process may actually use: the affinity mask and, in a container, the
+  cgroup CPU quota (a pod limited to 2 CPUs on a 64-core node gets 2
+  workers, not 64). `Etc.nprocessors` only ever saw the mask.
+
 ## [0.3.0] - 2026-08-13
 
 - Queue-time histogram: `/metrics` exposes `kino_request_queue_seconds`, a

@@ -22,7 +22,8 @@
 
 # How many workers to run. Each worker handles requests independently;
 # in :ractor mode every worker runs Ruby in parallel on its own core.
-# Default: one per CPU core.
+# Default: the CPUs this process may use (Kino.available_parallelism:
+# the affinity mask and, in a container, the cgroup CPU quota).
 # workers 8
 
 # Threads inside each worker. More threads help when your app spends
