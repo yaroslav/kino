@@ -77,9 +77,12 @@
 # for quick handlers; behavior under heavy overload differs slightly.
 # lanes false
 
-# Print one line per request to stdout, colored by status on a
-# terminal. This is the server's view: it includes requests your app
-# never saw, such as 503s. Recommended in development.
+# Log every request to stdout: an arrival line before the app runs and a
+# completion line after it, colored by status on a terminal, with a
+# timing breakdown (time in Ruby with its GC pause and allocations, the
+# server's own overhead, and queue wait). This is the server's view: it
+# includes requests your app never saw, such as 503s. Recommended in
+# development; cheap enough for production.
 # log_requests false
 
 # Called when a worker catches an app or delivery error, after the client

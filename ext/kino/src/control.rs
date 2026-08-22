@@ -382,20 +382,26 @@ fn run(
 ) {
     let runtime = match tokio::runtime::Builder::new_current_thread().enable_all().build() {
         Ok(runtime) => runtime,
-        Err(e) => return crate::server::log_error(format!("control runtime failed: {e}")),
+        Err(e) => return native_error(format!("control runtime failed: {e}")),
     };
     runtime.block_on(async move {
         match bind {
             ControlBind::Tcp(listener, _) => match tokio::net::TcpListener::from_std(listener) {
                 Ok(listener) => serve(TcpOrUnix::Tcp(listener), server, token, stop_rx).await,
-                Err(e) => crate::server::log_error(format!("control listener failed: {e}")),
+                Err(e) => native_error(format!("control listener failed: {e}")),
             },
             ControlBind::Unix(listener, _) => match tokio::net::UnixListener::from_std(listener) {
                 Ok(listener) => serve(TcpOrUnix::Unix(listener), server, token, stop_rx).await,
-                Err(e) => crate::server::log_error(format!("control listener failed: {e}")),
+                Err(e) => native_error(format!("control listener failed: {e}")),
             },
         }
     });
+}
+
+/// A failure inside the native layer itself, reported as the "native"
+/// source: no Ruby ractor or thread spoke.
+fn native_error(message: String) {
+    crate::log::emit(crate::log::Level::Error, "native", &message);
 }
 
 enum TcpOrUnix {

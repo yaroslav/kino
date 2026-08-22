@@ -100,14 +100,14 @@ module Kino
       end.join
     end
 
-    # One-line stats dump (the SIGUSR1 handler's output). Excludes
+    # One-line stats dump (what the SIGUSR1 handler logs). Excludes
     # worker_status: it's an array with one entry per execution slot, and
     # printing it inline would break the one-line contract (see /stats for
     # per-worker detail).
     # @param stats [Hash{Symbol => Object}] see {Kino::Server#stats}
     # @return [String]
     def stats_line(stats)
-      dim("Kino stats: #{stats.except(:worker_status).map { |k, v| "#{k}=#{v.inspect}" }.join(" ")}")
+      "stats #{stats.except(:worker_status).map { |k, v| "#{k}=#{v.inspect}" }.join(" ")}"
     end
 
     # The two banner halves around Server#start: credits before, the ready
@@ -119,13 +119,25 @@ module Kino
       puts dim("\nKino #{VERSION} presents:")
     end
 
+    # The ready block: what this process is (Ruby build with its JIT and
+    # parser flags, environment, topology, pid) and where it listens.
     # @param server [Kino::Server] a started server
     # @return [void]
     def action!(server)
-      puts dim("- mode:      #{server.mode}")
+      stats = server.stats
+      puts dim("- ruby:      #{RUBY_DESCRIPTION}")
+      puts dim("- env:       #{ENV["RAILS_ENV"] || ENV["RACK_ENV"] || "development"}")
+      puts dim("- mode:      #{server.mode}, #{count(stats[:workers], "worker")} × #{count(stats[:threads], "thread")}")
+      puts dim("- pid:       #{Process.pid}")
       puts dim("- listening: #{server.url}")
+      puts dim("- control:   #{server.control_url}") if server.control_url
       puts dim("- Ctrl-C to drain and stop")
       puts "\n#{bold("Action!")}\n\n"
+    end
+
+    # "1 worker", "8 workers".
+    def count(number, noun)
+      "#{number} #{noun}#{"s" unless number == 1}"
     end
 
     # Roll credits when the process ends: normal exit or crash (at_exit
@@ -252,6 +264,6 @@ module Kino
     end
 
     private_class_method :print_help, :option_parser, :write_sample,
-      :resolve_config, :serve
+      :resolve_config, :serve, :count
   end
 end

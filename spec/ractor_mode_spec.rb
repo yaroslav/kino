@@ -47,8 +47,10 @@ RSpec.describe "ractor mode" do
     it "falls back to :threaded for an unshareable app, with a warning" do
       unshareable = ->(_env) { [200, {}, ["hi"]] }
       server = nil
-      expect { server = Kino::Server.new(unshareable, mode: :auto) }
-        .to output(/not Ractor-shareable.*falling back/).to_stderr
+
+      warning = capture_native_stderr { server = Kino::Server.new(unshareable, mode: :auto) }
+
+      expect(warning).to match(/kino\[\d+\] main: app is not Ractor-shareable; falling back/)
       expect(server.mode).to eq(:threaded)
     end
 

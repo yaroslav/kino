@@ -371,18 +371,17 @@ async fn handle_request(
     let (parts, body) = req.into_parts();
 
     // Access-log metadata is captured only when logging is on: one Instant
-    // read plus one small String per request.
-    let log_meta = server.access_log.as_ref().map(|_| {
+    // read plus two small Strings per request. The arrival record is
+    // queued now, before the app sees the request, so a hang shows as an
+    // arrow with no answer; the completion record follows the response.
+    let log_meta = server.access_log.as_ref().map(|log| {
         let target = match parts.uri.query() {
             Some(q) => format!("{}?{}", parts.uri.path(), q),
             None => parts.uri.path().to_string(),
         };
-        (
-            std::time::Instant::now(),
-            parts.method.to_string(),
-            target,
-            parts.version,
-        )
+        let method = parts.method.to_string();
+        log.write_line(crate::access_log::arrival(&method, &target, remote_addr.ip()));
+        (std::time::Instant::now(), method, target)
     });
 
     // Body-size guard: an honestly-declared oversize body is refused with a
@@ -439,6 +438,7 @@ async fn handle_request(
 
     let (head_tx, head_rx) = tokio::sync::oneshot::channel();
     let responder = Arc::new(Responder::new(head_tx));
+    let now = std::time::Instant::now();
     let ctx = Box::new(RequestCtx {
         method: parts.method,
         uri: parts.uri,
@@ -454,7 +454,11 @@ async fn handle_request(
         slot: None,
         pin_slab: server.pin_slab.clone(),
         responder,
-        enqueued_at: std::time::Instant::now(),
+        enqueued_at: now,
+        timed: server.access_log.is_some(),
+        wait: Duration::ZERO,
+        admitted_at: now,
+        gc: None,
     });
 
     // Drop guard, not manual decrement: when a client aborts mid-request,
@@ -533,17 +537,20 @@ async fn handle_request(
         }
     };
 
-    if let (Some(log), Some((start, method, target, version))) =
-        (server.access_log.as_ref(), log_meta)
-    {
-        let status = response.status().as_u16();
-        let line = format!(
-            "{} [{}] \"{method} {target} {version:?}\" {status} {:.1}ms",
-            remote_addr.ip(),
-            httpdate::fmt_http_date(std::time::SystemTime::now()),
-            start.elapsed().as_secs_f64() * 1000.0
-        );
-        log.write_line(crate::style::status_colored(status, &line));
+    if let (Some(log), Some((start, method, target))) = (server.access_log.as_ref(), log_meta) {
+        // The worker attached its timing to the response head; a 503 or
+        // 504 never reached a worker and carries none.
+        let timing = response
+            .extensions()
+            .get::<crate::access_log::Timing>()
+            .copied();
+        log.write_line(crate::access_log::completion(
+            response.status().as_u16(),
+            &method,
+            &target,
+            start.elapsed(),
+            timing,
+        ));
     }
 
     Ok(branded(response))
@@ -728,12 +735,6 @@ pub fn pin_keeper(
 ) -> Result<magnus::typed_data::Obj<crate::pin::PinKeeper>, Error> {
     let server = registry::get(ruby, server_id)?;
     Ok(ruby.obj_wrap(crate::pin::PinKeeper(server.pin_slab.clone())))
-}
-
-/// Errors print in red on color terminals. Covers worker errors,
-/// supervisor crash reports, and everything apps write to rack.errors.
-pub fn log_error(message: String) {
-    eprintln!("{}", crate::style::red(&format!("[Kino] {message}")));
 }
 
 /// Full stats snapshot: [queued, in_flight, served, rejected, timeouts,

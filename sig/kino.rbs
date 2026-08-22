@@ -181,6 +181,27 @@ module Kino
     def self.print_report: (rack_app app, ?io: IO) -> bool
   end
 
+  # Server log lines, `kino[<pid>] <source>: message`; safe inside worker
+  # ractors, so hooks may log through it.
+  module Log
+    FRAMES: Integer
+    WORKING_DIR: String
+
+    def self.info: (untyped message) -> void
+    def self.warn: (untyped message) -> void
+    def self.error: (untyped message) -> void
+
+    # The failed-request report: request line, error, and an app-first
+    # backtrace relative to the working directory.
+    def self.exception: (Exception error, Hash[String, untyped] env, ?status: Integer) -> void
+
+    # The `kino[<pid>] <source>:` tag.
+    def self.label: () -> String
+
+    # The ractor and/or thread name, or `main`.
+    def self.source: () -> String
+  end
+
   # A ::Logger writing through the native async sink.
   class Logger < ::Logger
     # path: a file (created/appended) or nil for stdout.

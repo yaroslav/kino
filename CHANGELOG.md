@@ -1,5 +1,26 @@
 ## [Unreleased]
 
+- The access log is two records per request: an arrival line queued
+  before the app runs (a hang shows as an arrow with no answer) and a
+  status-tinted completion line with a timing breakdown of `ruby`,
+  `kino`, and `wait`, the `ruby` part carrying the GC pause and objects
+  allocated where one request at a time can own the VM's counters
+  (`:threaded`, or `:ractor` with `workers 1`). Local timestamps with
+  their UTC offset; a blank line between requests. The former one-line
+  format is gone.
+- A failed request is reported as `500 GET /path · Class: message (site)`
+  followed by its backtrace relative to the working directory, the app's
+  own frames first, the rest folded into `… N more`.
+- Every line Kino logs about itself (draining, a crash and its respawn,
+  hook failures, quarantine, the USR1 stats line, `rack.errors`) reads
+  `kino[<pid>] <source>: message`, the source naming the worker that
+  spoke (`worker-3`, `worker-3/thread-2`) or `main`; worker ractors and
+  threads now carry those names. The label is dim, yellow, or red by
+  level on color terminals. `Kino::Log.info`, `.warn`, and `.error` are
+  public, for hooks.
+- The startup banner lists the Ruby build with its JIT and parser flags,
+  the environment, the topology, the pid, and the control-plane address
+  when one is bound.
 - `bind "unix:///path/to.sock"` listens on a unix domain socket, the
   usual shape behind nginx: a stale socket file is reclaimed, a live one
   is refused, and the file is removed on shutdown. `port` is unused on

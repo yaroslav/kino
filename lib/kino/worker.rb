@@ -70,7 +70,16 @@ module Kino
     def serve(env, app, hooks)
       request = env[KINO_REQUEST]
       env[RACK_INPUT] ||= Input.new(request)
-      status, headers, body = app.call(env)
+      if hooks&.access_timing
+        # The access log's breakdown: the VM's cumulative GC time and
+        # allocation count, differenced around the app call.
+        gc_before = GC.total_time
+        allocated_before = GC.stat(:total_allocated_objects)
+        status, headers, body = app.call(env)
+        request.timing(GC.total_time - gc_before, GC.stat(:total_allocated_objects) - allocated_before)
+      else
+        status, headers, body = app.call(env)
+      end
 
       if body.respond_to?(:to_ary)
         chunks = join_chunks(body.to_ary)
@@ -99,19 +108,10 @@ module Kino
       # delivery errors (they happen after app.call returned, so no
       # middleware can see them); its own failures are logged, not raised,
       # because nothing may escape this block and kill the worker.
-      Native.log_error(error_log_line(e))
+      Log.exception(e, env)
       request.abort
       HookFire.fire(hooks&.on_error, "on_error", e, env)
       NOT_FUSED
-    end
-
-    # First frames only: the raise site is at the top, and Rails stacks
-    # run hundreds of middleware frames deep. Hooks get the full exception.
-    BACKTRACE_FRAMES = 12
-
-    def error_log_line(error)
-      ["#{error.class}: #{error.message}",
-        *(error.backtrace || []).first(BACKTRACE_FRAMES)].join("\n  ")
     end
 
     def deliver_streaming(request, status, headers, body, input)
@@ -159,7 +159,6 @@ module Kino
     end
 
     private_class_method :handle_one, :process, :serve, :deliver_streaming,
-      :join_chunks, :error_log_line, :fire_after_worker_boot,
-      :fire_after_request_complete
+      :join_chunks, :fire_after_worker_boot, :fire_after_request_complete
   end
 end

@@ -7,5 +7,7 @@ module Kino
   # several bare procs. Any member may be nil. A Data instance is frozen,
   # so it is Ractor.shareable? exactly when its members are (nil, or a
   # Ractor.shareable_proc), letting it ride the ractor boundary like the app.
-  WorkerHooks = Data.define(:on_error, :after_worker_boot, :after_request_complete)
+  # `access_timing` rides along: whether the worker measures the GC pause
+  # and allocations around each app call for the access log's breakdown.
+  WorkerHooks = Data.define(:on_error, :after_worker_boot, :after_request_complete, :access_timing)
 end

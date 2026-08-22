@@ -46,6 +46,7 @@ module Kino
 end
 
 require_relative "kino/cli"
+require_relative "kino/log"
 require_relative "kino/logger"
 require_relative "kino/check"
 require_relative "kino/input"

@@ -374,11 +374,11 @@ server.stats
 # plus lane_depths: [...] when lane dispatch is on
 ```
 
-From the outside, `kill -USR1 <pid>` prints the same snapshot as one line
+From the outside, `kill -USR1 <pid>` logs the same snapshot as one line
 (pair it with `pidfile` to find the pid):
 
 ```
-Kino stats: mode=:ractor lanes=false workers=8 threads=1 batch=1 respawns=0 queued=0 in_flight=2 served=1041 rejected=0 timeouts=0
+kino[4213] main: stats mode=:ractor lanes=false workers=8 threads=1 batch=1 respawns=0 queued=0 in_flight=2 served=1041 rejected=0 timeouts=0
 ```
 
 For pull-based monitoring, `control_bind "127.0.0.1:9293"` (or a
@@ -422,15 +422,27 @@ box). There are two native pieces. Both write through a lock-free
 channel to a Rust flusher thread, so request threads never take a log
 mutex and never make a write syscall:
 
-- **Access log** (`log_requests true`): one line per request to stdout,
-  including the 503s that never reach your app. Recommended in
-  development; cheap enough for production. On color terminals the
-  lines are tinted by status class: 2xx green, 3xx yellow, 4xx maroon,
-  5xx bright red:
+- **Access log** (`log_requests true`): two records per request to
+  stdout, including the 503s that never reach your app. The arrival line
+  is queued before the app runs, so a request that hangs shows as an
+  arrow with no answer; the completion line carries the status, the
+  total, and a timing breakdown: `ruby` is the time the request spent in
+  Ruby (with the GC pause and the objects allocated during it), `kino`
+  the server's own overhead, `wait` the queue time before a worker took
+  it. Recommended in development; cheap enough for production. On color
+  terminals the completion line is tinted by status class: 2xx green,
+  3xx yellow, 4xx maroon, 5xx bright red:
 
   ```
-  127.0.0.1 [Tue, 10 Jun 2026 13:39:56 GMT] "GET / HTTP/1.1" 200 0.1ms
+  2026-08-22 14:03:11 +0300 → GET /users?q=1  from 127.0.0.1
+  2026-08-22 14:03:11 +0300 ← 200 GET /users?q=1  12.4ms (ruby 9.1ms [gc 0.8ms; 1.5k obj]; kino 3.2ms; wait 0.1ms)
   ```
+
+  The GC and allocation figures come from the VM's process-wide
+  counters, so they appear only where one request at a time can own
+  them: in `:threaded` mode, or in `:ractor` mode with `workers 1`.
+  Parallel ractors would bill each other's work, so there the breakdown
+  is `(ruby; kino; wait)` alone.
 
 - **`Kino::Logger`**: a `::Logger` over the same async sink, for your
   app's own logging (`Kino::Logger.new("log/production.log")`, or no
@@ -472,6 +484,27 @@ of the buffer, and when you log faster than the disk can take (over 100k
 lines/s), the sink drops lines instead of blocking request threads.
 These trade-offs are measured in
 [doc/benchmarks.md](doc/benchmarks.md#logging-costs).
+
+**Server lines.** Everything Kino says about itself (draining, a crash
+and its respawn, a hook that raised, quarantine, the stats line,
+`rack.errors`) reads `kino[<pid>] <source>: message`, the source being
+the worker that spoke, `worker-3` (or `worker-3/thread-2` in a
+multi-threaded ractor), or `main`. On color terminals the label is dim
+for notes, yellow for warnings, red for errors; the message stays plain.
+A failed request gets a report instead of a bare backtrace: the request
+line, the error, and where it raised in your code, then the trace with
+your frames first, relative to the working directory, and the rest
+folded:
+
+```
+kino[4213] worker-2: 500 GET /boom · RuntimeError: kaboom (app.rb:12:in 'explode')
+    app.rb:12:in 'explode'
+    /usr/lib/ruby/gems/4.0.0/gems/rack-3.2.7/lib/rack/builder.rb:...
+    … 38 more
+```
+
+Hooks can log through the same channel with `Kino::Log.info`, `.warn`,
+and `.error`; it is safe inside worker ractors.
 
 ## Timer waits
 
