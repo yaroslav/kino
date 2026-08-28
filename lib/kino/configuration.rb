@@ -26,6 +26,8 @@ module Kino
       after_request_complete: nil,
       on_worker_exit: nil,
       shutdown_timeout: 30,
+      io_shards: false,
+      io_threads: nil,
       tokio_threads: nil,
       tls: nil,
       environment: nil,
@@ -148,6 +150,8 @@ module Kino
     #   queue_depth 2048
     #   queue_timeout 0.5
     #   shutdown_timeout 15
+    #   io_shards true
+    #   io_threads 6
     #   tokio_threads 4
     #   tls cert: "cert.pem", key: "key.pem"
     #
@@ -228,6 +232,12 @@ module Kino
 
       # Graceful-shutdown drain deadline in seconds.
       def shutdown_timeout(seconds) = @config.set(:shutdown_timeout, seconds)
+
+      # Run native HTTP I/O on current-thread shards instead of Tokio's shared pool.
+      def io_shards(enabled = true) = @config.set(:io_shards, !!enabled)
+
+      # Native HTTP I/O shard count; default with io_shards: half available CPUs.
+      def io_threads(count) = @config.set(:io_threads, count && Integer(count))
 
       # Threads for the tokio (Rust I/O) runtime; default: one per core.
       def tokio_threads(count) = @config.set(:tokio_threads, Integer(count))

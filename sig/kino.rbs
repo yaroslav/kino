@@ -126,6 +126,8 @@ module Kino
       def after_request_complete: (?^(Hash[String, untyped], Integer) -> void handler) ?{ (Hash[String, untyped], Integer) -> void } -> untyped
       def on_worker_exit: (?^(Integer, Exception?) -> void handler) ?{ (Integer, Exception?) -> void } -> untyped
       def shutdown_timeout: (Numeric seconds) -> untyped
+      def io_shards: (?boolish enabled) -> untyped
+      def io_threads: (int? count) -> untyped
       def tokio_threads: (int count) -> untyped
       def tls: (cert: String, key: String) -> untyped
       def environment: (String | Symbol env) -> untyped

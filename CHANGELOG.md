@@ -1,3 +1,10 @@
+## Unreleased
+
+- Add opt-in `io_shards true`: accepted HTTP connections can run on
+  current-thread Tokio I/O shards instead of Tokio's shared multi-thread
+  runtime, reducing scheduler contention on very fast handlers. `io_threads`
+  sets the shard count; otherwise Kino uses half the available CPUs.
+
 ## [0.4.0] - 2026-08-22
 
 - Rack handler: `rails server -u kino` and `rackup -s kino` boot Kino

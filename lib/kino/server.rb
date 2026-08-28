@@ -98,6 +98,17 @@ module Kino
       @lanes = !!settings[:lanes]
       @log_requests = !!settings[:log_requests]
       @shutdown_timeout = settings[:shutdown_timeout]
+      @io_shards = !!settings[:io_shards]
+      @io_threads =
+        if settings[:io_threads].nil?
+          nil
+        else
+          Integer(settings[:io_threads])
+        end
+      if @io_threads && @io_threads < 1
+        raise ArgumentError, "io_threads must be >= 1"
+      end
+      Log.warn("io_threads has no effect unless io_shards is true") if @io_threads && !@io_shards
       @tokio_threads = settings[:tokio_threads]
       @tls = validate_tls(settings[:tls])
       if @tls && unix?
@@ -145,6 +156,8 @@ module Kino
           request_timeout_ms: @request_timeout_ms,
           max_connections: @max_connections,
           max_body_size: @max_body_size,
+          io_shards: @io_shards,
+          io_threads: @io_threads,
           tokio_threads: @tokio_threads,
           tls_cert: @tls&.fetch(:cert), tls_key: @tls&.fetch(:key),
           lanes: @lanes, log_requests: @log_requests,

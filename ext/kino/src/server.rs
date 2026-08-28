@@ -14,7 +14,7 @@ use magnus::{Error, Ruby};
 use parking_lot::{Mutex, RwLock};
 
 use crate::listen::Listener;
-use crate::registry::{self, BoxedCtx, ServerInner, WorkerSlot};
+use crate::registry::{self, BoxedCtx, RuntimeHandle, ServerInner, WorkerSlot};
 use crate::request::RequestCtx;
 use crate::response::{plain_response, HyperResponse, Responder};
 
@@ -56,6 +56,8 @@ pub fn server_start(ruby: &Ruby, config: magnus::RHash) -> Result<(u64, u16, Opt
     let request_timeout_ms: u64 = cfg_opt::<u64>(ruby, config, "request_timeout_ms")?.unwrap_or(0);
     let max_body_size: usize = cfg_opt::<usize>(ruby, config, "max_body_size")?.unwrap_or(0);
     let max_connections: usize = cfg_opt::<usize>(ruby, config, "max_connections")?.unwrap_or(1024);
+    let io_shards: bool = cfg_opt(ruby, config, "io_shards")?.unwrap_or(false);
+    let io_threads: usize = cfg_opt::<usize>(ruby, config, "io_threads")?.unwrap_or(0);
     let tokio_threads: usize = cfg_opt::<usize>(ruby, config, "tokio_threads")?.unwrap_or(0);
     let tls_cert: Option<String> = cfg_opt(ruby, config, "tls_cert")?;
     let tls_key: Option<String> = cfg_opt(ruby, config, "tls_key")?;
@@ -79,8 +81,7 @@ pub fn server_start(ruby: &Ruby, config: magnus::RHash) -> Result<(u64, u16, Opt
         }
     };
 
-    let listener =
-        Listener::bind(&bind, port).map_err(|e| io_error(ruby, "bind failed", e))?;
+    let listener = Listener::bind(&bind, port).map_err(|e| io_error(ruby, "bind failed", e))?;
     // Ruby refuses this combination up front; this guards embedders
     // calling the native layer directly.
     if acceptor.is_some() && matches!(listener, Listener::Unix(..)) {
@@ -106,24 +107,16 @@ pub fn server_start(ruby: &Ruby, config: magnus::RHash) -> Result<(u64, u16, Opt
         })
         .transpose()?;
 
-    let mut builder = tokio::runtime::Builder::new_multi_thread();
-    builder.enable_all().thread_name("kino-tokio");
-    if tokio_threads > 0 {
-        builder.worker_threads(tokio_threads);
-    }
-    let runtime = builder
-        .build()
-        .map_err(|e| io_error(ruby, "tokio runtime failed", e))?;
-
     let (req_tx, req_rx) = flume::bounded(queue_depth);
     let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+    let (runtime_shutdown_tx, runtime_shutdown_rx) = tokio::sync::watch::channel(false);
 
     let server = Arc::new(ServerInner {
         id: registry::next_server_id(),
         req_tx: Mutex::new(Some(req_tx)),
         req_rx,
         shutdown_tx,
-        runtime: Mutex::new(None),
+        runtime: Mutex::new(RuntimeHandle::None),
         slots: RwLock::new(Vec::new()),
         in_flight: std::sync::atomic::AtomicUsize::new(0),
         served: std::sync::atomic::AtomicU64::new(0),
@@ -135,7 +128,12 @@ pub fn server_start(ruby: &Ruby, config: magnus::RHash) -> Result<(u64, u16, Opt
         state: std::sync::atomic::AtomicU8::new(registry::STATE_BOOTING),
         respawns: std::sync::atomic::AtomicU64::new(0),
         quarantine_replacements: std::sync::atomic::AtomicU64::new(0),
-        topology: registry::Topology { mode, workers, threads, batch },
+        topology: registry::Topology {
+            mode,
+            workers,
+            threads,
+            batch,
+        },
         https: acceptor.is_some(),
         unix_path,
         access_log: log_requests.then(|| crate::logsink::Sink::new(std::io::stdout())),
@@ -145,18 +143,44 @@ pub fn server_start(ruby: &Ruby, config: magnus::RHash) -> Result<(u64, u16, Opt
         queue_histogram: registry::QueueHistogram::new(),
     });
 
-    let tokio_listener = {
-        let _guard = runtime.enter();
-        AsyncListener::from_std(listener).map_err(|e| io_error(ruby, "listener setup failed", e))?
-    };
-    runtime.spawn(accept_loop(
-        tokio_listener,
-        acceptor,
-        server.clone(),
-        max_connections,
-        shutdown_rx,
-    ));
-    *server.runtime.lock() = Some(runtime);
+    if io_shards {
+        let threads = crate::io_shards::spawn(
+            listener,
+            acceptor,
+            server.clone(),
+            max_connections,
+            shutdown_rx,
+            runtime_shutdown_rx,
+            crate::io_shards::thread_count(io_threads, tokio_threads),
+        )
+        .map_err(|e| io_error(ruby, "tokio runtime failed", e))?;
+        *server.runtime.lock() = RuntimeHandle::Shards {
+            shutdown_tx: runtime_shutdown_tx,
+            threads,
+        };
+    } else {
+        let mut builder = tokio::runtime::Builder::new_multi_thread();
+        builder.enable_all().thread_name("kino-tokio");
+        if tokio_threads > 0 {
+            builder.worker_threads(tokio_threads);
+        }
+        let runtime = builder
+            .build()
+            .map_err(|e| io_error(ruby, "tokio runtime failed", e))?;
+        let tokio_listener = {
+            let _guard = runtime.enter();
+            AsyncListener::from_std(listener)
+                .map_err(|e| io_error(ruby, "listener setup failed", e))?
+        };
+        runtime.spawn(accept_loop(
+            tokio_listener,
+            acceptor,
+            server.clone(),
+            max_connections,
+            shutdown_rx,
+        ));
+        *server.runtime.lock() = RuntimeHandle::MultiThread(runtime);
+    }
 
     let id = server.id;
     let control_port = match control_bind {
@@ -173,7 +197,8 @@ pub fn server_start(ruby: &Ruby, config: magnus::RHash) -> Result<(u64, u16, Opt
                 // A plain drop blocks until the accept loop's task (its
                 // only task, idling on accept/shutdown) is torn down; the
                 // runtime only ever had this one thing to cancel.
-                drop(server.runtime.lock().take());
+                let _ = server.shutdown_tx.send(true);
+                std::mem::take(&mut *server.runtime.lock()).shutdown(Duration::from_millis(1_000));
                 return Err(io_error(ruby, "control start failed", e));
             }
         },
@@ -189,7 +214,7 @@ pub fn server_start(ruby: &Ruby, config: magnus::RHash) -> Result<(u64, u16, Opt
 /// serving, i.e. after the handshake). A handshake is a few round trips, so
 /// this is generous even for a high-latency client. Fixed, like the header
 /// timeout: not a knob.
-const TLS_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
+pub(crate) const TLS_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// What a unix-socket connection reports as its addresses. The peer is
 /// local by definition (REMOTE_ADDR 127.0.0.1), and a socket has no port,
@@ -200,22 +225,24 @@ const UNIX_LOCAL: SocketAddr = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 
 
 /// The accept loop's listener: TCP (optionally behind TLS), or a unix
 /// socket, which carries plain HTTP only.
-enum AsyncListener {
+pub(crate) enum AsyncListener {
     Tcp(tokio::net::TcpListener),
     Unix(tokio::net::UnixListener),
 }
 
 /// One accepted connection, before the protocol layer sees it.
-enum Conn {
+pub(crate) enum Conn {
     Tcp(tokio::net::TcpStream),
     Unix(tokio::net::UnixStream),
 }
 
 impl AsyncListener {
     /// Register the bound listener with the current runtime.
-    fn from_std(listener: Listener) -> std::io::Result<AsyncListener> {
+    pub(crate) fn from_std(listener: Listener) -> std::io::Result<AsyncListener> {
         Ok(match listener {
-            Listener::Tcp(listener) => AsyncListener::Tcp(tokio::net::TcpListener::from_std(listener)?),
+            Listener::Tcp(listener) => {
+                AsyncListener::Tcp(tokio::net::TcpListener::from_std(listener)?)
+            }
             Listener::Unix(listener, _) => {
                 AsyncListener::Unix(tokio::net::UnixListener::from_std(listener)?)
             }
@@ -223,7 +250,7 @@ impl AsyncListener {
     }
 
     /// The next connection with its (peer, local) addresses.
-    async fn accept(&self) -> std::io::Result<(Conn, SocketAddr, SocketAddr)> {
+    pub(crate) async fn accept(&self) -> std::io::Result<(Conn, SocketAddr, SocketAddr)> {
         match self {
             AsyncListener::Tcp(listener) => {
                 let (stream, remote_addr) = listener.accept().await?;
@@ -274,23 +301,7 @@ async fn accept_loop(
         tokio::spawn(async move {
             // Held for the connection's lifetime; dropping it frees a slot.
             let _permit = permit;
-            match (conn, acceptor) {
-                (Conn::Tcp(stream), Some(acceptor)) => {
-                    // Handshake failures (port scans, plain HTTP to a TLS
-                    // port) and stalled handshakes (slowloris) just drop the
-                    // connection; the timeout bounds the latter.
-                    let handshake = tokio::time::timeout(TLS_HANDSHAKE_TIMEOUT, acceptor.accept(stream));
-                    let Ok(Ok(tls)) = handshake.await else { return };
-                    serve_connection(tls, server, remote_addr, local_addr).await;
-                }
-                (Conn::Tcp(stream), None) => {
-                    serve_connection(stream, server, remote_addr, local_addr).await
-                }
-                // TLS over a unix socket is refused at bind time.
-                (Conn::Unix(stream), _) => {
-                    serve_connection(stream, server, remote_addr, local_addr).await
-                }
-            }
+            serve_conn(conn, acceptor, server, remote_addr, local_addr).await;
         });
     }
 }
@@ -302,7 +313,7 @@ async fn accept_loop(
 /// proxy's job; the actual hazard was having no default at all.
 const HEADER_READ_TIMEOUT: Duration = Duration::from_secs(15);
 
-async fn serve_connection<I>(
+pub(crate) async fn serve_connection<I>(
     io: I,
     server: Arc<ServerInner>,
     remote_addr: SocketAddr,
@@ -325,6 +336,32 @@ async fn serve_connection<I>(
         .auto_date_header(false)
         .serve_connection(TokioIo::new(io), service)
         .await;
+}
+
+pub(crate) async fn serve_conn(
+    conn: Conn,
+    acceptor: Option<tokio_rustls::TlsAcceptor>,
+    server: Arc<ServerInner>,
+    remote_addr: SocketAddr,
+    local_addr: SocketAddr,
+) {
+    match (conn, acceptor) {
+        (Conn::Tcp(stream), Some(acceptor)) => {
+            // Handshake failures (port scans, plain HTTP to a TLS port) and
+            // stalled handshakes (slowloris) just drop the connection; the
+            // timeout bounds the latter.
+            let handshake = tokio::time::timeout(TLS_HANDSHAKE_TIMEOUT, acceptor.accept(stream));
+            let Ok(Ok(tls)) = handshake.await else { return };
+            serve_connection(tls, server, remote_addr, local_addr).await;
+        }
+        (Conn::Tcp(stream), None) => {
+            serve_connection(stream, server, remote_addr, local_addr).await;
+        }
+        // TLS over a unix socket is refused at bind time.
+        (Conn::Unix(stream), _) => {
+            serve_connection(stream, server, remote_addr, local_addr).await;
+        }
+    }
 }
 
 /// The 503 every rejection path returns; counted for stats. Branding
@@ -380,7 +417,11 @@ async fn handle_request(
             None => parts.uri.path().to_string(),
         };
         let method = parts.method.to_string();
-        log.write_line(crate::access_log::arrival(&method, &target, remote_addr.ip()));
+        log.write_line(crate::access_log::arrival(
+            &method,
+            &target,
+            remote_addr.ip(),
+        ));
         (std::time::Instant::now(), method, target)
     });
 
@@ -627,7 +668,9 @@ pub fn register_worker(ruby: &Ruby, server_id: u64) -> Result<usize, Error> {
 
 pub fn stop_accepting(_ruby: &Ruby, server_id: u64) -> Result<(), Error> {
     if let Some(server) = registry::try_get(server_id) {
-        server.state.store(registry::STATE_DRAINING, Ordering::Relaxed);
+        server
+            .state
+            .store(registry::STATE_DRAINING, Ordering::Relaxed);
         let _ = server.shutdown_tx.send(true);
     }
     Ok(())
@@ -716,9 +759,8 @@ pub fn interrupt_all_workers(_ruby: &Ruby, server_id: u64) -> Result<(), Error> 
 
 pub fn shutdown_runtime(_ruby: &Ruby, server_id: u64, timeout_ms: u64) -> Result<(), Error> {
     if let Some(server) = registry::remove(server_id) {
-        if let Some(runtime) = server.runtime.lock().take() {
-            runtime.shutdown_timeout(Duration::from_millis(timeout_ms));
-        }
+        let _ = server.shutdown_tx.send(true);
+        std::mem::take(&mut *server.runtime.lock()).shutdown(Duration::from_millis(timeout_ms));
         // The listener is closed with the runtime; its socket file is not.
         if let Some(path) = &server.unix_path {
             crate::listen::cleanup_unix(path);
@@ -775,10 +817,7 @@ pub type WorkerStatRow = (usize, u64, usize, u64, bool);
 
 /// Per-slot rows for Server#stats parity: [index, served, in_flight,
 /// busy_ms, quarantined] each. Empty when the server is gone.
-pub fn worker_stats(
-    _ruby: &Ruby,
-    server_id: u64,
-) -> Result<Vec<WorkerStatRow>, Error> {
+pub fn worker_stats(_ruby: &Ruby, server_id: u64) -> Result<Vec<WorkerStatRow>, Error> {
     let Some(server) = registry::try_get(server_id) else {
         return Ok(Vec::new());
     };
@@ -800,7 +839,9 @@ pub fn quarantine_slot(ruby: &Ruby, server_id: u64, worker_id: usize) -> Result<
 /// One replacement spawned by the quarantine monitor.
 pub fn record_quarantine_replacement(_ruby: &Ruby, server_id: u64) -> Result<(), Error> {
     if let Some(server) = registry::try_get(server_id) {
-        server.quarantine_replacements.fetch_add(1, Ordering::Relaxed);
+        server
+            .quarantine_replacements
+            .fetch_add(1, Ordering::Relaxed);
     }
     Ok(())
 }
@@ -851,7 +892,10 @@ mod tests {
         server.register_worker();
         server.slots.read()[0].lane_tx.lock().take();
 
-        assert!(matches!(try_dispatch(&server, test_ctx()), Dispatch::Closed));
+        assert!(matches!(
+            try_dispatch(&server, test_ctx()),
+            Dispatch::Closed
+        ));
     }
 
     #[test]
@@ -894,9 +938,7 @@ mod tests {
         let server = test_server(true, 4);
         server.register_worker();
         server.register_worker();
-        server.slots.read()[0]
-            .parked
-            .store(true, Ordering::Relaxed);
+        server.slots.read()[0].parked.store(true, Ordering::Relaxed);
 
         // Both dispatches land on the awake lane (slot 1), regardless of
         // where the rotating cursor starts.

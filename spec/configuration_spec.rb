@@ -57,6 +57,8 @@ RSpec.describe Kino::Configuration do
       queue_depth 2048
       queue_timeout 0.5
       shutdown_timeout 15
+      io_shards true
+      io_threads 6
       tokio_threads 4
       tls cert: "cert.pem", key: "key.pem"
     CONFIG
@@ -71,8 +73,29 @@ RSpec.describe Kino::Configuration do
     expect(config[:queue_depth]).to eq(2048)
     expect(config[:queue_timeout]).to eq(0.5)
     expect(config[:shutdown_timeout]).to eq(15)
+    expect(config[:io_shards]).to eq(true)
+    expect(config[:io_threads]).to eq(6)
     expect(config[:tokio_threads]).to eq(4)
     expect(config[:tls]).to eq(cert: "cert.pem", key: "key.pem")
+  end
+
+  it "validates native I/O thread count" do
+    app = ->(_env) { [200, {}, []] }
+
+    expect {
+      Kino::Server.new(app, io_shards: true, io_threads: 0)
+    }.to raise_error(ArgumentError, /io_threads/)
+    expect {
+      Kino::Server.new(app, io_shards: true, io_threads: false)
+    }.to raise_error(TypeError)
+  end
+
+  it "warns when io_threads is set without io_shards" do
+    app = ->(_env) { [200, {}, []] }
+
+    err = capture_native_stderr { Kino::Server.new(app, io_threads: 2) }
+
+    expect(err).to include("io_threads has no effect unless io_shards is true")
   end
 
   it "lets explicit options win over the config file" do

@@ -5,6 +5,7 @@
 
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, OnceLock, Weak};
+use std::time::{Duration, Instant};
 
 use parking_lot::{Mutex, RwLock};
 
@@ -32,6 +33,45 @@ pub type BoxedCtx = Box<RequestCtx>;
 /// Probed on every take; keys are our own ids, so ahash over SipHash.
 type HashMap<K, V> = std::collections::HashMap<K, V, ahash::RandomState>;
 
+pub enum RuntimeHandle {
+    None,
+    MultiThread(tokio::runtime::Runtime),
+    Shards {
+        shutdown_tx: tokio::sync::watch::Sender<bool>,
+        threads: Vec<std::thread::JoinHandle<()>>,
+    },
+}
+
+impl Default for RuntimeHandle {
+    fn default() -> Self {
+        RuntimeHandle::None
+    }
+}
+
+impl RuntimeHandle {
+    pub fn shutdown(self, timeout: Duration) {
+        match self {
+            RuntimeHandle::None => {}
+            RuntimeHandle::MultiThread(runtime) => runtime.shutdown_timeout(timeout),
+            RuntimeHandle::Shards {
+                shutdown_tx,
+                threads,
+            } => {
+                let _ = shutdown_tx.send(true);
+                let deadline = Instant::now() + timeout;
+                for thread in threads {
+                    while !thread.is_finished() && Instant::now() < deadline {
+                        std::thread::sleep(Duration::from_millis(1));
+                    }
+                    if thread.is_finished() {
+                        let _ = thread.join();
+                    }
+                }
+            }
+        }
+    }
+}
+
 /// One per `Kino::Server`. Owns the tokio runtime, the request queue and the
 /// worker slots.
 pub struct ServerInner {
@@ -42,9 +82,9 @@ pub struct ServerInner {
     pub req_rx: flume::Receiver<BoxedCtx>,
     /// Signals the accept loop to stop. Watch channel: `true` = draining.
     pub shutdown_tx: tokio::sync::watch::Sender<bool>,
-    /// Runtime is kept so we can shut it down explicitly; in an Option so
-    /// `shutdown_runtime` can take ownership out of the Arc.
-    pub runtime: Mutex<Option<tokio::runtime::Runtime>>,
+    /// Runtime is taken at shutdown. Multi-threaded tokio and sharded I/O
+    /// carry different teardown state, so keep that shape explicit.
+    pub runtime: Mutex<RuntimeHandle>,
     pub slots: RwLock<Vec<Arc<WorkerSlot>>>,
     pub in_flight: AtomicUsize,
     /// Requests handed to Ruby workers (admitted), and requests rejected
@@ -118,8 +158,8 @@ pub const LANE_DEPTH: usize = 4;
 /// Fixed queue-wait bucket boundaries in microseconds (0.5ms .. 10s),
 /// ascending. Emitted in seconds. Not a knob (YAGNI).
 pub const QUEUE_BOUNDS_US: [u64; 14] = [
-    500, 1_000, 2_500, 5_000, 10_000, 25_000, 50_000, 100_000,
-    250_000, 500_000, 1_000_000, 2_500_000, 5_000_000, 10_000_000,
+    500, 1_000, 2_500, 5_000, 10_000, 25_000, 50_000, 100_000, 250_000, 500_000, 1_000_000,
+    2_500_000, 5_000_000, 10_000_000,
 ];
 
 /// Queue-wait histogram: per-bucket counts plus an overflow (the implicit
@@ -289,7 +329,7 @@ pub fn test_server(lanes: bool, queue_depth: usize) -> Arc<ServerInner> {
         req_tx: Mutex::new(Some(req_tx)),
         req_rx,
         shutdown_tx,
-        runtime: Mutex::new(None),
+        runtime: Mutex::new(RuntimeHandle::None),
         slots: RwLock::new(Vec::new()),
         in_flight: AtomicUsize::new(0),
         served: AtomicU64::new(0),
@@ -301,7 +341,12 @@ pub fn test_server(lanes: bool, queue_depth: usize) -> Arc<ServerInner> {
         state: std::sync::atomic::AtomicU8::new(STATE_BOOTING),
         respawns: AtomicU64::new(0),
         quarantine_replacements: AtomicU64::new(0),
-        topology: Topology { mode: "threaded".to_string(), workers: 0, threads: 0, batch: 1 },
+        topology: Topology {
+            mode: "threaded".to_string(),
+            workers: 0,
+            threads: 0,
+            batch: 1,
+        },
         https: false,
         unix_path: None,
         access_log: None,
@@ -420,9 +465,9 @@ mod tests {
     #[test]
     fn queue_histogram_buckets_by_wait() {
         let h = QueueHistogram::new();
-        h.record(400);        // <= 500 -> bucket 0
-        h.record(500);        // == 500 -> bucket 0 (inclusive)
-        h.record(600);        // (500, 1000] -> bucket 1
+        h.record(400); // <= 500 -> bucket 0
+        h.record(500); // == 500 -> bucket 0 (inclusive)
+        h.record(600); // (500, 1000] -> bucket 1
         h.record(20_000_000); // > last bound -> overflow
         let s = h.snapshot();
         assert_eq!(s.buckets[0], 2);

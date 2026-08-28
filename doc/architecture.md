@@ -11,10 +11,13 @@ tokio (Rust threads)                          Ruby
 └──────────────────────────┘                     └────────────────────────────┘
 ```
 
-All network I/O lives in Rust on a tokio multi-threaded runtime; hyper
-parses HTTP/1.1 and handles keep-alive; rustls terminates TLS. Ruby never
-touches a socket. Each request becomes a Rust-side `RequestCtx` pushed to a
-bounded flume MPMC queue; Ruby workers pull from it.
+All network I/O lives in Rust on tokio runtimes; hyper parses HTTP/1.1 and
+handles keep-alive; rustls terminates TLS. The default is Tokio's
+multi-thread runtime. With `io_shards true`, one current-thread runtime
+accepts connections and assigns them to current-thread I/O shards, where
+each connection stays for its lifetime. Ruby never touches a socket. Each
+request becomes a Rust-side `RequestCtx` pushed to a bounded flume MPMC
+queue; Ruby workers pull from it.
 
 ## Topology
 

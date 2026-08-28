@@ -86,7 +86,10 @@ mod tests {
 
     #[test]
     fn unix_path_recognises_only_the_unix_scheme() {
-        assert_eq!(unix_path("unix:///run/kino.sock").unwrap().to_str(), Some("/run/kino.sock"));
+        assert_eq!(
+            unix_path("unix:///run/kino.sock").unwrap().to_str(),
+            Some("/run/kino.sock")
+        );
         assert!(unix_path("127.0.0.1").is_none());
         assert!(unix_path("unix.example.com").is_none());
     }
