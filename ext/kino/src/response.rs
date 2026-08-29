@@ -10,7 +10,7 @@
 //! makes `write_chunk` block in Ruby, with the GVL released.
 
 use std::io;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
 
 use bytes::Bytes;
 use http_body_util::{combinators::BoxBody, BodyExt, Full, StreamBody};
@@ -23,8 +23,19 @@ pub type HyperResponse = hyper::Response<ResponseBody>;
 
 const STREAM_BUFFER: usize = 8;
 
+/// Why the body forwarder stopped pulling a request body: read_body turns
+/// these into raised errors instead of a (truncated) clean EOF.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum BodyAbandon {
+    Oversize,
+    TimedOut,
+}
+
 pub struct Responder {
     responded: AtomicBool,
+    /// The forwarder's abandonment flag rides in the one per-request shared
+    /// allocation rather than its own Arc. 0 = none, 1/2 = BodyAbandon.
+    body_abandoned: AtomicU8,
     head_tx: Mutex<Option<tokio::sync::oneshot::Sender<HyperResponse>>>,
     body_tx: Mutex<Option<flume::Sender<FrameResult>>>,
 }
@@ -33,8 +44,28 @@ impl Responder {
     pub fn new(head_tx: tokio::sync::oneshot::Sender<HyperResponse>) -> Self {
         Responder {
             responded: AtomicBool::new(false),
+            body_abandoned: AtomicU8::new(0),
             head_tx: Mutex::new(Some(head_tx)),
             body_tx: Mutex::new(None),
+        }
+    }
+
+    /// Record why the body forwarder gave up; the store happens before the
+    /// sender drops, so a reader that saw Disconnected sees the flag too.
+    pub fn abandon_body(&self, why: BodyAbandon) {
+        let code = match why {
+            BodyAbandon::Oversize => 1,
+            BodyAbandon::TimedOut => 2,
+        };
+        self.body_abandoned.store(code, Ordering::Relaxed);
+    }
+
+    /// Whether (and why) the forwarder abandoned the request body.
+    pub fn body_abandoned(&self) -> Option<BodyAbandon> {
+        match self.body_abandoned.load(Ordering::Relaxed) {
+            1 => Some(BodyAbandon::Oversize),
+            2 => Some(BodyAbandon::TimedOut),
+            _ => None,
         }
     }
 

@@ -24,14 +24,10 @@ pub struct RequestCtx {
     pub local_addr: SocketAddr,
     pub https: bool,
     /// Request body, streamed from hyper through a bounded channel: hyper is
-    /// only polled as Ruby consumes, so inbound backpressure is free.
-    pub body_rx: flume::Receiver<Bytes>,
-    /// Set by the body forwarder when the body exceeded max_body_size: turns
-    /// the next read into an error instead of a (truncated) clean EOF.
-    pub body_overflow: Arc<std::sync::atomic::AtomicBool>,
-    /// Set by the body forwarder when the client stalled past the idle
-    /// deadline: the next read raises so the worker reclaims its slot.
-    pub body_timeout: Arc<std::sync::atomic::AtomicBool>,
+    /// only polled as Ruby consumes, so inbound backpressure is free. None
+    /// when no byte can ever arrive (most GETs): bodyless requests skip the
+    /// channel allocation entirely.
+    pub body_rx: Option<flume::Receiver<Bytes>>,
     /// When a frame is bigger than read_body's max_len, the rest waits here.
     pub leftover: Option<Bytes>,
     /// The owning worker slot (set at admit time, queue.rs); its interrupt
@@ -250,10 +246,14 @@ pub fn build_env(ruby: &Ruby, ctx: &RequestCtx) -> Result<RHash, Error> {
     Ok(env)
 }
 
-/// Bodyless requests get their channel sender dropped at accept time, so
-/// "disconnected and empty" means no byte can ever arrive.
+/// Bodyless requests carry no channel at all; a present channel that is
+/// disconnected and empty (EOF already reached) also has nothing left.
 fn body_possible(ctx: &RequestCtx) -> bool {
-    ctx.leftover.is_some() || !(ctx.body_rx.is_empty() && ctx.body_rx.is_disconnected())
+    ctx.leftover.is_some()
+        || ctx
+            .body_rx
+            .as_ref()
+            .is_some_and(|rx| !(rx.is_empty() && rx.is_disconnected()))
 }
 
 /// Complete response in one shot: status, the Rack headers Hash (iterated
@@ -307,7 +307,9 @@ impl Request {
         let mut chunk = match ctx.leftover.take() {
             Some(bytes) => bytes,
             None => {
-                let body_rx = ctx.body_rx.clone();
+                let Some(body_rx) = ctx.body_rx.clone() else {
+                    return Ok(None); // bodyless request: EOF from the start
+                };
                 let outcome = block_on(&ctx.slot, || {
                     match body_rx.recv_timeout(crate::queue::TICK) {
                         Ok(bytes) => Some(Some(bytes)),
@@ -320,13 +322,12 @@ impl Request {
                     Some(None) => {
                         // Disconnected: a clean EOF, unless the forwarder
                         // abandoned the body (too large, or the client stalled).
-                        if ctx.body_overflow.load(std::sync::atomic::Ordering::Relaxed) {
-                            return Err(body_too_large_error(ruby));
-                        }
-                        if ctx.body_timeout.load(std::sync::atomic::Ordering::Relaxed) {
-                            return Err(body_timeout_error(ruby));
-                        }
-                        return Ok(None); // EOF
+                        use crate::response::BodyAbandon;
+                        return match ctx.responder.body_abandoned() {
+                            Some(BodyAbandon::Oversize) => Err(body_too_large_error(ruby)),
+                            Some(BodyAbandon::TimedOut) => Err(body_timeout_error(ruby)),
+                            None => Ok(None), // EOF
+                        };
                     }
                     None => return Err(interrupted_error(ruby)),
                 }
@@ -453,7 +454,6 @@ fn split_host_port(host: &str, default_port: u16) -> (String, u16) {
 /// fires the Drop-500 backstop into a dropped receiver, which is a no-op.
 #[cfg(test)]
 pub fn test_ctx() -> crate::registry::BoxedCtx {
-    let (_body_tx, body_rx) = flume::bounded(1);
     let (head_tx, _head_rx) = tokio::sync::oneshot::channel();
     Box::new(RequestCtx {
         method: http::Method::GET,
@@ -463,9 +463,7 @@ pub fn test_ctx() -> crate::registry::BoxedCtx {
         remote_addr: "127.0.0.1:40000".parse().expect("static addr"),
         local_addr: "127.0.0.1:9292".parse().expect("static addr"),
         https: false,
-        body_rx,
-        body_overflow: Arc::new(std::sync::atomic::AtomicBool::new(false)),
-        body_timeout: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        body_rx: None,
         leftover: None,
         slot: None,
         pin_slab: Arc::new(crate::pin::PinSlab::new()),
@@ -513,8 +511,7 @@ mod tests {
 
     #[test]
     fn body_possible_reflects_channel_and_leftover_state() {
-        // test_ctx drops its sender immediately: disconnected + empty = no
-        // byte can ever arrive.
+        // test_ctx carries no channel: bodyless by construction.
         let ctx = test_ctx();
         assert!(!body_possible(&ctx));
 
@@ -526,16 +523,23 @@ mod tests {
         // A live sender means bytes may still arrive.
         let (body_tx, body_rx) = flume::bounded(1);
         let mut ctx = test_ctx();
-        ctx.body_rx = body_rx;
+        ctx.body_rx = Some(body_rx);
         assert!(body_possible(&ctx));
         drop(body_tx);
+
+        // A dropped sender with nothing queued: EOF already reached.
+        let (body_tx, body_rx) = flume::bounded::<bytes::Bytes>(1);
+        drop(body_tx);
+        let mut ctx = test_ctx();
+        ctx.body_rx = Some(body_rx);
+        assert!(!body_possible(&ctx));
 
         // Disconnected but with a queued chunk: still readable.
         let (body_tx, body_rx) = flume::bounded(1);
         body_tx.send(bytes::Bytes::from_static(b"x")).unwrap();
         drop(body_tx);
         let mut ctx = test_ctx();
-        ctx.body_rx = body_rx;
+        ctx.body_rx = Some(body_rx);
         assert!(body_possible(&ctx));
     }
 }

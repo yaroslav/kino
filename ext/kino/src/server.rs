@@ -437,18 +437,18 @@ async fn handle_request(
     let oversize =
         max_body > 0 && content_length(&parts.headers).is_some_and(|len| len > max_body as u64);
 
+    let (head_tx, head_rx) = tokio::sync::oneshot::channel();
+    let responder = Arc::new(Responder::new(head_tx));
+
     // Stream the request body through a bounded channel: hyper is polled
     // only as fast as the Ruby side consumes (inbound backpressure), and the
     // forwarder dropping the sender is EOF. Bodyless requests (most GETs)
-    // skip the forwarder task entirely: dropping the sender IS the EOF.
-    let (body_tx, body_rx) = flume::bounded::<bytes::Bytes>(8);
-    let body_overflow = Arc::new(std::sync::atomic::AtomicBool::new(false));
-    let body_timeout = Arc::new(std::sync::atomic::AtomicBool::new(false));
-    if oversize || hyper::body::Body::is_end_stream(&body) {
-        drop(body_tx);
+    // skip the channel and the forwarder task entirely: no channel IS the EOF.
+    let body_rx = if oversize || hyper::body::Body::is_end_stream(&body) {
+        None
     } else {
-        let overflow = body_overflow.clone();
-        let timed_out = body_timeout.clone();
+        let (body_tx, body_rx) = flume::bounded::<bytes::Bytes>(8);
+        let responder = responder.clone();
         tokio::spawn(async move {
             let mut body = body;
             let mut total: u64 = 0;
@@ -461,7 +461,7 @@ async fn handle_request(
                     Ok(Some(Ok(frame))) => frame,
                     Ok(Some(Err(_))) | Ok(None) => break, // body error or clean EOF
                     Err(_) => {
-                        timed_out.store(true, Ordering::Relaxed);
+                        responder.abandon_body(crate::response::BodyAbandon::TimedOut);
                         break;
                     }
                 };
@@ -470,7 +470,7 @@ async fn handle_request(
                     if max_body > 0 && total > max_body as u64 {
                         // Past the cap: flag it and stop pulling. Dropping the
                         // sender unblocks read_body, which then raises.
-                        overflow.store(true, Ordering::Relaxed);
+                        responder.abandon_body(crate::response::BodyAbandon::Oversize);
                         break;
                     }
                     if body_tx.send_async(data).await.is_err() {
@@ -479,10 +479,9 @@ async fn handle_request(
                 }
             }
         });
-    }
+        Some(body_rx)
+    };
 
-    let (head_tx, head_rx) = tokio::sync::oneshot::channel();
-    let responder = Arc::new(Responder::new(head_tx));
     let now = std::time::Instant::now();
     let ctx = Box::new(RequestCtx {
         method: parts.method,
@@ -493,8 +492,6 @@ async fn handle_request(
         local_addr,
         https: server.https,
         body_rx,
-        body_overflow,
-        body_timeout,
         leftover: None,
         slot: None,
         pin_slab: server.pin_slab.clone(),
