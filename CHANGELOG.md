@@ -1,4 +1,4 @@
-## Unreleased
+## [0.5.0] - 2026-08-29
 
 - Add opt-in `io_shards true`: accepted HTTP connections can run on
   current-thread Tokio I/O shards instead of Tokio's shared multi-thread
