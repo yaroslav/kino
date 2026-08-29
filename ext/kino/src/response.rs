@@ -13,12 +13,15 @@ use std::io;
 use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
 
 use bytes::Bytes;
-use http_body_util::{combinators::BoxBody, BodyExt, Full, StreamBody};
+use http_body_util::{Either, Full, StreamBody};
 use parking_lot::Mutex;
 
 pub type BodyFrame = hyper::body::Frame<Bytes>;
 pub type FrameResult = Result<BodyFrame, io::Error>;
-pub type ResponseBody = BoxBody<Bytes, io::Error>;
+/// Both response shapes as one concrete type: no per-response Box or
+/// vtable, unlike BoxBody. Either erases the two error types itself.
+pub type ResponseBody =
+    Either<Full<Bytes>, StreamBody<flume::r#async::RecvStream<'static, FrameResult>>>;
 pub type HyperResponse = hyper::Response<ResponseBody>;
 
 const STREAM_BUFFER: usize = 8;
@@ -96,7 +99,7 @@ impl Responder {
             return Ok(false);
         };
         let (body_tx, body_rx) = flume::bounded::<FrameResult>(STREAM_BUFFER);
-        let response = builder.body(StreamBody::new(body_rx.into_stream()).boxed())?;
+        let response = builder.body(Either::Right(StreamBody::new(body_rx.into_stream())))?;
         *self.body_tx.lock() = Some(body_tx);
         let _ = tx.send(response);
         Ok(true)
@@ -129,7 +132,7 @@ impl Responder {
 }
 
 pub fn full_body(bytes: Bytes) -> ResponseBody {
-    Full::new(bytes).map_err(|never| match never {}).boxed()
+    Either::Left(Full::new(bytes))
 }
 
 /// Canned plain-text response, built entirely on the Rust side (used for
