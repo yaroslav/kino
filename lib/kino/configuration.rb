@@ -237,7 +237,7 @@ module Kino
       def io_shards(enabled = true) = @config.set(:io_shards, !!enabled)
 
       # Native HTTP I/O shard count; default with io_shards: half available CPUs.
-      def io_threads(count) = @config.set(:io_threads, count && Integer(count))
+      def io_threads(count) = @config.set(:io_threads, Integer(count))
 
       # Threads for the tokio (Rust I/O) runtime; default: one per core.
       def tokio_threads(count) = @config.set(:tokio_threads, Integer(count))

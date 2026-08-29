@@ -115,7 +115,10 @@ pub fn plain_response(status: u16, message: &'static str) -> HyperResponse {
 mod tests {
     use super::*;
 
-    fn pair() -> (Responder, tokio::sync::oneshot::Receiver<HyperResponse>) {
+    fn pair() -> (
+        Responder,
+        tokio::sync::oneshot::Receiver<HyperResponse>,
+    ) {
         let (head_tx, head_rx) = tokio::sync::oneshot::channel();
         (Responder::new(head_tx), head_rx)
     }

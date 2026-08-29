@@ -16,8 +16,10 @@ io_shards = variant.end_with?("-shards")
 port = Integer(ARGV[1] || 9292)
 workers = Integer(ARGV[2] || Etc.nprocessors)
 threads = Integer(ARGV[3] || 3)
-tokio_threads = ARGV[4] && ((ARGV[4] == "-") ? nil : Integer(ARGV[4]))
-io_threads = ARGV[5] && ((ARGV[5] == "-") ? nil : Integer(ARGV[5]))
+# "-" is the skip-this-positional placeholder.
+opt_int = ->(arg) { Integer(arg) if arg && arg != "-" }
+tokio_threads = opt_int.call(ARGV[4])
+io_threads = opt_int.call(ARGV[5])
 log_requests = ENV["LOG_REQUESTS"] == "1" # for the logging-cost study
 
 puts "Kino #{Kino::VERSION}: mode=#{mode} lanes=#{lanes} io_shards=#{io_shards} port=#{port} " \

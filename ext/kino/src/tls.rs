@@ -71,8 +71,7 @@ WJ2lRijROyX9v7f8aSQlb6kEwKhI8kG8SbeUc+zbKkzGgRXNaZHY/mAa
     #[test]
     fn missing_file_paths_error_without_panicking() {
         let err = build_acceptor("/nonexistent/cert.pem", "/nonexistent/key.pem")
-            .err()
-            .expect("missing files");
+            .err().expect("missing files");
         assert!(err.contains("cannot read"));
     }
 
@@ -84,20 +83,14 @@ WJ2lRijROyX9v7f8aSQlb6kEwKhI8kG8SbeUc+zbKkzGgRXNaZHY/mAa
 
     #[test]
     fn pem_without_a_key_is_rejected() {
-        let err = build_acceptor(CERT, CERT)
-            .err()
-            .expect("a cert is not a key");
+        let err = build_acceptor(CERT, CERT).err().expect("a cert is not a key");
         assert!(err.contains("no private key found"));
     }
 
     #[test]
     fn mismatched_cert_and_garbage_key_are_rejected() {
-        let err = build_acceptor(
-            CERT,
-            "-----BEGIN PRIVATE KEY-----\ngarbage\n-----END PRIVATE KEY-----",
-        )
-        .err()
-        .expect("garbage key");
+        let err = build_acceptor(CERT, "-----BEGIN PRIVATE KEY-----\ngarbage\n-----END PRIVATE KEY-----")
+            .err().expect("garbage key");
         assert!(!err.is_empty());
     }
 }

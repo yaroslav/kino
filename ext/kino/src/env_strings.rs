@@ -302,11 +302,7 @@ mod tests {
     fn common_headers_are_lowercase_and_unique() {
         let mut seen = std::collections::HashSet::new();
         for header in COMMON_HEADERS {
-            assert_eq!(
-                *header,
-                header.to_ascii_lowercase(),
-                "{header} must be lowercase"
-            );
+            assert_eq!(*header, header.to_ascii_lowercase(), "{header} must be lowercase");
             assert!(seen.insert(*header), "{header} listed twice");
         }
     }
@@ -315,11 +311,7 @@ mod tests {
     fn common_methods_are_uppercase_and_unique() {
         let mut seen = std::collections::HashSet::new();
         for method in COMMON_METHODS {
-            assert_eq!(
-                *method,
-                method.to_ascii_uppercase(),
-                "{method} must be uppercase"
-            );
+            assert_eq!(*method, method.to_ascii_uppercase(), "{method} must be uppercase");
             assert!(seen.insert(*method), "{method} listed twice");
         }
     }

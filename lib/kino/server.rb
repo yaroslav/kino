@@ -99,12 +99,7 @@ module Kino
       @log_requests = !!settings[:log_requests]
       @shutdown_timeout = settings[:shutdown_timeout]
       @io_shards = !!settings[:io_shards]
-      @io_threads =
-        if settings[:io_threads].nil?
-          nil
-        else
-          Integer(settings[:io_threads])
-        end
+      @io_threads = Integer(settings[:io_threads]) unless settings[:io_threads].nil?
       if @io_threads && @io_threads < 1
         raise ArgumentError, "io_threads must be >= 1"
       end

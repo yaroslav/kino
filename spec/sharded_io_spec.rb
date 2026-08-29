@@ -71,7 +71,27 @@ RSpec.describe "sharded native I/O" do
     shutdown.join
   ensure
     release << true if release
+    server&.shutdown
     shutdown&.join
+  end
+
+  it "returns from shutdown by the deadline even with an open connection" do
+    app = ->(_env) { [200, {"content-type" => "text/plain"}, ["ok"]] }
+    server = Kino::Server.new(app, mode: :threaded, workers: 1, threads: 1,
+      io_shards: true, io_threads: 2).start
+
+    # A raw connection that never completes a request: the shard holds it
+    # open, so only the teardown deadline can end the drain.
+    socket = TCPSocket.new("127.0.0.1", server.port)
+    socket.write("GET / HTTP/1.1\r\n")
+
+    started = Process.clock_gettime(Process::CLOCK_MONOTONIC)
+    server.shutdown(timeout: 1)
+    elapsed = Process.clock_gettime(Process::CLOCK_MONOTONIC) - started
+
+    expect(elapsed).to be < 5
+  ensure
+    socket&.close
     server&.shutdown
   end
 end
