@@ -5,6 +5,7 @@
 
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, OnceLock, Weak};
+use std::time::{Duration, Instant};
 
 use parking_lot::{Mutex, RwLock};
 
@@ -32,6 +33,48 @@ pub type BoxedCtx = Box<RequestCtx>;
 /// Probed on every take; keys are our own ids, so ahash over SipHash.
 type HashMap<K, V> = std::collections::HashMap<K, V, ahash::RandomState>;
 
+/// What runs the server's I/O, taken out at shutdown. The default
+/// multi-thread runtime and sharded I/O carry different teardown state,
+/// so the shape stays explicit instead of parallel optional fields.
+#[derive(Default)]
+pub enum RuntimeHandle {
+    /// Not started yet, or already shut down.
+    #[default]
+    None,
+    MultiThread(tokio::runtime::Runtime),
+    /// The shards' final-teardown signal and every I/O thread (shards plus
+    /// the acceptor).
+    Shards {
+        shutdown_tx: tokio::sync::watch::Sender<bool>,
+        threads: Vec<std::thread::JoinHandle<()>>,
+    },
+}
+
+impl RuntimeHandle {
+    /// Stop the I/O side, giving in-flight work `timeout` to finish. A
+    /// thread that misses the deadline is abandoned rather than joined:
+    /// a wedged shard must not hang `Server#shutdown`, which promises to
+    /// return by its deadline.
+    pub fn shutdown(self, timeout: Duration) {
+        match self {
+            RuntimeHandle::None => {}
+            RuntimeHandle::MultiThread(runtime) => runtime.shutdown_timeout(timeout),
+            RuntimeHandle::Shards { shutdown_tx, threads } => {
+                let _ = shutdown_tx.send(true);
+                let deadline = Instant::now() + timeout;
+                for thread in threads {
+                    while !thread.is_finished() && Instant::now() < deadline {
+                        std::thread::sleep(Duration::from_millis(1));
+                    }
+                    if thread.is_finished() {
+                        let _ = thread.join();
+                    }
+                }
+            }
+        }
+    }
+}
+
 /// One per `Kino::Server`. Owns the tokio runtime, the request queue and the
 /// worker slots.
 pub struct ServerInner {
@@ -42,9 +85,9 @@ pub struct ServerInner {
     pub req_rx: flume::Receiver<BoxedCtx>,
     /// Signals the accept loop to stop. Watch channel: `true` = draining.
     pub shutdown_tx: tokio::sync::watch::Sender<bool>,
-    /// Runtime is kept so we can shut it down explicitly; in an Option so
-    /// `shutdown_runtime` can take ownership out of the Arc.
-    pub runtime: Mutex<Option<tokio::runtime::Runtime>>,
+    /// Runtime is kept so we can shut it down explicitly; `shutdown_runtime`
+    /// takes ownership out of the Arc.
+    pub runtime: Mutex<RuntimeHandle>,
     pub slots: RwLock<Vec<Arc<WorkerSlot>>>,
     pub in_flight: AtomicUsize,
     /// Requests handed to Ruby workers (admitted), and requests rejected
@@ -289,7 +332,7 @@ pub fn test_server(lanes: bool, queue_depth: usize) -> Arc<ServerInner> {
         req_tx: Mutex::new(Some(req_tx)),
         req_rx,
         shutdown_tx,
-        runtime: Mutex::new(None),
+        runtime: Mutex::new(RuntimeHandle::None),
         slots: RwLock::new(Vec::new()),
         in_flight: AtomicUsize::new(0),
         served: AtomicU64::new(0),
@@ -316,6 +359,38 @@ pub fn test_server(lanes: bool, queue_depth: usize) -> Arc<ServerInner> {
 mod tests {
     use super::*;
     use crate::request::test_ctx;
+
+    #[test]
+    fn shards_shutdown_joins_threads_that_observe_the_signal() {
+        let (shutdown_tx, rx) = tokio::sync::watch::channel(false);
+        let thread = std::thread::spawn(move || {
+            while !*rx.borrow() {
+                std::thread::sleep(Duration::from_millis(1));
+            }
+        });
+
+        let start = Instant::now();
+        RuntimeHandle::Shards { shutdown_tx, threads: vec![thread] }
+            .shutdown(Duration::from_secs(5));
+
+        // The thread exits on the signal, so the join comes nowhere near
+        // the deadline.
+        assert!(start.elapsed() < Duration::from_secs(1));
+    }
+
+    #[test]
+    fn shards_shutdown_abandons_a_wedged_thread_at_the_deadline() {
+        let (shutdown_tx, _rx) = tokio::sync::watch::channel(false);
+        let wedged = std::thread::spawn(|| std::thread::sleep(Duration::from_secs(30)));
+
+        let start = Instant::now();
+        RuntimeHandle::Shards { shutdown_tx, threads: vec![wedged] }
+            .shutdown(Duration::from_millis(50));
+
+        let elapsed = start.elapsed();
+        assert!(elapsed >= Duration::from_millis(50));
+        assert!(elapsed < Duration::from_secs(5));
+    }
 
     #[test]
     fn worker_registration_hands_out_sequential_slot_ids() {

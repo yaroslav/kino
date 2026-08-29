@@ -125,8 +125,14 @@
 
 ## Runtime
 
-# Threads for the Rust I/O engine. The default suits most apps; for
-# heavily CPU-bound apps, try 1 to leave more cores for Ruby.
+# Run native HTTP I/O on current-thread shards instead of Tokio's shared
+# worker pool, reducing scheduler contention on very fast handlers.
+# io_shards true
+
+# I/O shard count. Default with io_shards: half available CPUs.
+# io_threads 6
+
+# Threads for the Tokio multi-thread runtime. Default: one per available CPU.
 # tokio_threads 4
 
 ## Control plane

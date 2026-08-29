@@ -259,6 +259,21 @@ server.shutdown               # graceful: drain → deadline → abort straggler
   always counts as "shareable" (classes are), even if calling it touches
   unshareable state. Force `:threaded` for those.
 
+### Sharded I/O
+
+`io_shards true` (off by default) moves HTTP I/O from Tokio's shared
+multi-thread runtime onto current-thread shards: one thread accepts and
+hands each connection to the least-loaded shard, which then owns it for
+its lifetime—no work-stealing, no cross-thread wakeups on the hot path.
+Fast handlers gain double-digit throughput; Ruby-bound endpoints are
+unchanged. Orthogonal to `mode`: it reshapes the Rust side only.
+
+```ruby
+# kino.rb
+io_shards true
+io_threads 4  # optional; default: half the available CPUs
+```
+
 ## Config file and CLI
 
 Settings can live in a Puma-style Ruby DSL file: `kino.rb` in the

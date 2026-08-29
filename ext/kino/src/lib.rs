@@ -9,6 +9,7 @@ mod control;
 mod cpus;
 mod env_strings;
 mod gvl;
+mod io_shards;
 mod listen;
 mod log;
 mod logsink;
