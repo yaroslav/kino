@@ -5,6 +5,8 @@
   runtime, reducing scheduler contention on very fast handlers. `io_threads`
   sets the shard count; otherwise Kino uses half the available CPUs
   ([Patrik Wenger](https://github.com/paddor)).
+- Update Rust dependencies: hyper 1.11.1, rb-sys 0.9.130,
+  rustls-webpki 0.103.15, among others.
 
 ## [0.4.0] - 2026-08-22
 
