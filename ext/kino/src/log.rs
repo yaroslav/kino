@@ -99,7 +99,10 @@ mod tests {
     #[test]
     fn label_is_a_syslog_tag_plus_the_source() {
         assert_eq!(label(4213, "main"), "kino[4213] main:");
-        assert_eq!(label(4213, "worker-3/thread-2"), "kino[4213] worker-3/thread-2:");
+        assert_eq!(
+            label(4213, "worker-3/thread-2"),
+            "kino[4213] worker-3/thread-2:"
+        );
     }
 
     #[test]
@@ -129,7 +132,12 @@ mod tests {
     #[test]
     fn a_report_is_labelled_on_its_first_line_only() {
         assert_eq!(
-            format_line(Level::Error, "kino[1] main:", "500 GET / · X: y\n    a.rb:1", false),
+            format_line(
+                Level::Error,
+                "kino[1] main:",
+                "500 GET / · X: y\n    a.rb:1",
+                false
+            ),
             "kino[1] main: 500 GET / · X: y\n    a.rb:1"
         );
     }

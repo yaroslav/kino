@@ -106,7 +106,14 @@ pub(crate) fn spawn(
         }
     }
 
-    match spawn_acceptor(listener, server, max_connections, accept_shutdown_rx, shard_txs, loads) {
+    match spawn_acceptor(
+        listener,
+        server,
+        max_connections,
+        accept_shutdown_rx,
+        shard_txs,
+        loads,
+    ) {
         Ok(handle) => handles.push(handle),
         Err(error) => {
             join_all(handles);
@@ -123,7 +130,9 @@ fn join_all(handles: Vec<JoinHandle<()>>) {
 }
 
 fn current_thread_runtime() -> std::io::Result<tokio::runtime::Runtime> {
-    tokio::runtime::Builder::new_current_thread().enable_all().build()
+    tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
 }
 
 /// Wait for a just spawned I/O thread to report its runtime up, so a
@@ -140,7 +149,9 @@ fn await_ready(
             let _ = handle.join();
             Err(error)
         }
-        Err(_) => Err(std::io::Error::other(format!("{what} thread exited during startup"))),
+        Err(_) => Err(std::io::Error::other(format!(
+            "{what} thread exited during startup"
+        ))),
     }
 }
 
@@ -198,8 +209,16 @@ fn spawn_acceptor(
                         return;
                     }
                 };
-                accept_loop(listener, server, max_connections, shutdown_rx, shard_txs, loads, ready_tx)
-                    .await;
+                accept_loop(
+                    listener,
+                    server,
+                    max_connections,
+                    shutdown_rx,
+                    shard_txs,
+                    loads,
+                    ready_tx,
+                )
+                .await;
             });
         })?;
     await_ready(handle, ready_rx, "accept")
@@ -267,11 +286,22 @@ async fn serve_accepted(
     let conn = match accepted.conn.into_tokio() {
         Ok(conn) => conn,
         Err(_) => {
-            log::emit(Level::Warn, "tokio", "failed to register a stream on an I/O shard");
+            log::emit(
+                Level::Warn,
+                "tokio",
+                "failed to register a stream on an I/O shard",
+            );
             return;
         }
     };
-    serve_conn(conn, acceptor, server, accepted.remote_addr, accepted.local_addr).await;
+    serve_conn(
+        conn,
+        acceptor,
+        server,
+        accepted.remote_addr,
+        accepted.local_addr,
+    )
+    .await;
 }
 
 /// The sharded accept loop. Same backpressure as the default loop: the
@@ -310,14 +340,27 @@ async fn accept_loop(
         let conn = match into_std(conn) {
             Ok(conn) => conn,
             Err(_) => {
-                log::emit(Level::Warn, "tokio", "failed to detach an accepted stream; connection dropped");
+                log::emit(
+                    Level::Warn,
+                    "tokio",
+                    "failed to detach an accepted stream; connection dropped",
+                );
                 continue;
             }
         };
-        let mut accepted = Accepted { conn, remote_addr, local_addr, permit };
+        let mut accepted = Accepted {
+            conn,
+            remote_addr,
+            local_addr,
+            permit,
+        };
         loop {
             let Some(index) = least_loaded(&loads, &live) else {
-                log::emit(Level::Error, "tokio", "all I/O shards are down; not accepting connections");
+                log::emit(
+                    Level::Error,
+                    "tokio",
+                    "all I/O shards are down; not accepting connections",
+                );
                 server.state.store(STATE_DRAINING, Ordering::Relaxed);
                 break 'accept;
             };
@@ -350,7 +393,10 @@ mod tests {
     use super::{default_thread_count, least_loaded, thread_count, Arc, AtomicUsize};
 
     fn loads(counts: &[usize]) -> Vec<Arc<AtomicUsize>> {
-        counts.iter().map(|&n| Arc::new(AtomicUsize::new(n))).collect()
+        counts
+            .iter()
+            .map(|&n| Arc::new(AtomicUsize::new(n)))
+            .collect()
     }
 
     #[test]
@@ -360,13 +406,19 @@ mod tests {
 
     #[test]
     fn least_loaded_picks_the_emptiest_live_shard() {
-        assert_eq!(least_loaded(&loads(&[3, 0, 1]), &[true, true, true]), Some(1));
+        assert_eq!(
+            least_loaded(&loads(&[3, 0, 1]), &[true, true, true]),
+            Some(1)
+        );
     }
 
     #[test]
     fn least_loaded_routes_around_dead_shards() {
         // The dead shard's count is frozen at 0; it must not win anyway.
-        assert_eq!(least_loaded(&loads(&[3, 0, 1]), &[true, false, true]), Some(2));
+        assert_eq!(
+            least_loaded(&loads(&[3, 0, 1]), &[true, false, true]),
+            Some(2)
+        );
     }
 
     #[test]

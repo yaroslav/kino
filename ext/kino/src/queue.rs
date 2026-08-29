@@ -117,7 +117,8 @@ fn admit(
 ) -> Result<RHash, Error> {
     server.served.fetch_add(1, Ordering::Relaxed);
     slot.served.fetch_add(1, Ordering::Relaxed);
-    slot.last_started_ms.store(crate::mono::mono_ms(), Ordering::Relaxed);
+    slot.last_started_ms
+        .store(crate::mono::mono_ms(), Ordering::Relaxed);
     slot.in_flight.fetch_add(1, Ordering::Relaxed);
     // One clock read serves the histogram and, for the access log, the
     // request's queue wait and the start of its time in Ruby.

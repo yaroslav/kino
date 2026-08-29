@@ -81,8 +81,7 @@ pub fn server_start(ruby: &Ruby, config: magnus::RHash) -> Result<(u64, u16, Opt
         }
     };
 
-    let listener =
-        Listener::bind(&bind, port).map_err(|e| io_error(ruby, "bind failed", e))?;
+    let listener = Listener::bind(&bind, port).map_err(|e| io_error(ruby, "bind failed", e))?;
     // Ruby refuses this combination up front; this guards embedders
     // calling the native layer directly.
     if acceptor.is_some() && matches!(listener, Listener::Unix(..)) {
@@ -128,7 +127,12 @@ pub fn server_start(ruby: &Ruby, config: magnus::RHash) -> Result<(u64, u16, Opt
         state: std::sync::atomic::AtomicU8::new(registry::STATE_BOOTING),
         respawns: std::sync::atomic::AtomicU64::new(0),
         quarantine_replacements: std::sync::atomic::AtomicU64::new(0),
-        topology: registry::Topology { mode, workers, threads, batch },
+        topology: registry::Topology {
+            mode,
+            workers,
+            threads,
+            batch,
+        },
         https: acceptor.is_some(),
         unix_path,
         access_log: log_requests.then(|| crate::logsink::Sink::new(std::io::stdout())),
@@ -153,7 +157,10 @@ pub fn server_start(ruby: &Ruby, config: magnus::RHash) -> Result<(u64, u16, Opt
             crate::io_shards::thread_count(io_threads),
         )
         .map_err(|e| io_error(ruby, "sharded runtime failed", e))?;
-        *server.runtime.lock() = RuntimeHandle::Shards { shutdown_tx: runtime_shutdown_tx, threads };
+        *server.runtime.lock() = RuntimeHandle::Shards {
+            shutdown_tx: runtime_shutdown_tx,
+            threads,
+        };
     } else {
         let mut builder = tokio::runtime::Builder::new_multi_thread();
         builder.enable_all().thread_name("kino-tokio");
@@ -165,7 +172,8 @@ pub fn server_start(ruby: &Ruby, config: magnus::RHash) -> Result<(u64, u16, Opt
             .map_err(|e| io_error(ruby, "tokio runtime failed", e))?;
         let tokio_listener = {
             let _guard = runtime.enter();
-            AsyncListener::from_std(listener).map_err(|e| io_error(ruby, "listener setup failed", e))?
+            AsyncListener::from_std(listener)
+                .map_err(|e| io_error(ruby, "listener setup failed", e))?
         };
         runtime.spawn(accept_loop(
             tokio_listener,
@@ -235,7 +243,9 @@ impl AsyncListener {
     /// Register the bound listener with the current runtime.
     pub(crate) fn from_std(listener: Listener) -> std::io::Result<AsyncListener> {
         Ok(match listener {
-            Listener::Tcp(listener) => AsyncListener::Tcp(tokio::net::TcpListener::from_std(listener)?),
+            Listener::Tcp(listener) => {
+                AsyncListener::Tcp(tokio::net::TcpListener::from_std(listener)?)
+            }
             Listener::Unix(listener, _) => {
                 AsyncListener::Unix(tokio::net::UnixListener::from_std(listener)?)
             }
@@ -318,7 +328,9 @@ pub(crate) async fn serve_conn(
             let Ok(Ok(tls)) = handshake.await else { return };
             serve_connection(tls, server, remote_addr, local_addr).await;
         }
-        (Conn::Tcp(stream), None) => serve_connection(stream, server, remote_addr, local_addr).await,
+        (Conn::Tcp(stream), None) => {
+            serve_connection(stream, server, remote_addr, local_addr).await
+        }
         // TLS over a unix socket is refused at bind time.
         (Conn::Unix(stream), _) => serve_connection(stream, server, remote_addr, local_addr).await,
     }
@@ -409,7 +421,11 @@ async fn handle_request(
             None => parts.uri.path().to_string(),
         };
         let method = parts.method.to_string();
-        log.write_line(crate::access_log::arrival(&method, &target, remote_addr.ip()));
+        log.write_line(crate::access_log::arrival(
+            &method,
+            &target,
+            remote_addr.ip(),
+        ));
         (std::time::Instant::now(), method, target)
     });
 
@@ -656,7 +672,9 @@ pub fn register_worker(ruby: &Ruby, server_id: u64) -> Result<usize, Error> {
 
 pub fn stop_accepting(_ruby: &Ruby, server_id: u64) -> Result<(), Error> {
     if let Some(server) = registry::try_get(server_id) {
-        server.state.store(registry::STATE_DRAINING, Ordering::Relaxed);
+        server
+            .state
+            .store(registry::STATE_DRAINING, Ordering::Relaxed);
         let _ = server.shutdown_tx.send(true);
     }
     Ok(())
@@ -803,10 +821,7 @@ pub type WorkerStatRow = (usize, u64, usize, u64, bool);
 
 /// Per-slot rows for Server#stats parity: [index, served, in_flight,
 /// busy_ms, quarantined] each. Empty when the server is gone.
-pub fn worker_stats(
-    _ruby: &Ruby,
-    server_id: u64,
-) -> Result<Vec<WorkerStatRow>, Error> {
+pub fn worker_stats(_ruby: &Ruby, server_id: u64) -> Result<Vec<WorkerStatRow>, Error> {
     let Some(server) = registry::try_get(server_id) else {
         return Ok(Vec::new());
     };
@@ -828,7 +843,9 @@ pub fn quarantine_slot(ruby: &Ruby, server_id: u64, worker_id: usize) -> Result<
 /// One replacement spawned by the quarantine monitor.
 pub fn record_quarantine_replacement(_ruby: &Ruby, server_id: u64) -> Result<(), Error> {
     if let Some(server) = registry::try_get(server_id) {
-        server.quarantine_replacements.fetch_add(1, Ordering::Relaxed);
+        server
+            .quarantine_replacements
+            .fetch_add(1, Ordering::Relaxed);
     }
     Ok(())
 }
@@ -879,7 +896,10 @@ mod tests {
         server.register_worker();
         server.slots.read()[0].lane_tx.lock().take();
 
-        assert!(matches!(try_dispatch(&server, test_ctx()), Dispatch::Closed));
+        assert!(matches!(
+            try_dispatch(&server, test_ctx()),
+            Dispatch::Closed
+        ));
     }
 
     #[test]
@@ -922,9 +942,7 @@ mod tests {
         let server = test_server(true, 4);
         server.register_worker();
         server.register_worker();
-        server.slots.read()[0]
-            .parked
-            .store(true, Ordering::Relaxed);
+        server.slots.read()[0].parked.store(true, Ordering::Relaxed);
 
         // Both dispatches land on the awake lane (slot 1), regardless of
         // where the rotating cursor starts.
