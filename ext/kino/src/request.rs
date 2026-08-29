@@ -138,7 +138,10 @@ pub fn build_env(ruby: &Ruby, ctx: &RequestCtx) -> Result<RHash, Error> {
     use crate::env_strings;
 
     let s = env_strings::get();
-    let env = ruby.hash_new();
+    // Pre-sized: a dozen static keys plus one per header lands near 30
+    // entries, which a default Hash reaches only via the ar-to-st
+    // migration and a rehash per doubling.
+    let env = ruby.hash_new_capa(32);
     // Opaque -> live RString for this thread's Ruby handle.
     let live = |o: magnus::value::Opaque<RString>| ruby.get_inner(o);
 
