@@ -138,54 +138,73 @@ fn admit(
     Ok(env)
 }
 
-type Checkout = (Arc<ServerInner>, Arc<WorkerSlot>, BoxedCtx);
+/// Per-worker native handle: the registry lookup and slot resolution are
+/// paid once at worker boot instead of on every take. Created inside the
+/// worker thread/ractor that uses it (like Request handles), so ownership
+/// is correct by construction. Holds the server weakly: after teardown the
+/// upgrade fails, which is the same clean shutdown signal the per-take
+/// registry lookup used to give.
+#[magnus::wrap(class = "Kino::Native::Worker", free_immediately)]
+pub struct Worker {
+    server: std::sync::Weak<ServerInner>,
+    slot: Arc<WorkerSlot>,
+}
 
-fn checkout(ruby: &Ruby, server_id: u64, worker_id: usize) -> Result<Option<Checkout>, Error> {
+/// Resolve a (server, worker) pair into a Worker handle; nil when the
+/// server is already gone (the caller treats that as shutdown).
+pub fn worker(ruby: &Ruby, server_id: u64, worker_id: usize) -> Result<Option<Worker>, Error> {
     let Some(server) = registry::try_get(server_id) else {
-        return Ok(None); // server torn down → clean shutdown signal
-    };
-    let slot = server.slot(ruby, worker_id)?;
-
-    // The previous batch is fully answered once the worker comes back.
-    slot.current.lock().clear();
-    slot.in_flight.store(0, Ordering::Relaxed);
-    slot.interrupted.store(false, Ordering::SeqCst);
-
-    Ok(block_take(&server, &slot)?.map(|ctx| (server, slot, ctx)))
-}
-
-/// Take one request; returns its env Hash (request handle inside under
-/// "kino.request") or nil on shutdown. The batch-of-one hot path: no
-/// arrays allocated at all.
-pub fn take_one(ruby: &Ruby, server_id: u64, worker_id: usize) -> Result<Option<RHash>, Error> {
-    match checkout(ruby, server_id, worker_id)? {
-        Some((server, slot, ctx)) => Ok(Some(admit(ruby, &server, &slot, ctx)?)),
-        None => Ok(None),
-    }
-}
-
-/// Take up to `max` requests: block for the first, drain the rest
-/// non-blocking (they only batch when the queue is already deep).
-/// Returns nil on shutdown; otherwise an Array of env Hashes.
-pub fn take_batch(
-    ruby: &Ruby,
-    server_id: u64,
-    worker_id: usize,
-    max: usize,
-) -> Result<Option<RArray>, Error> {
-    let Some((server, slot, first)) = checkout(ruby, server_id, worker_id)? else {
         return Ok(None);
     };
+    let slot = server.slot(ruby, worker_id)?;
+    Ok(Some(Worker {
+        server: Arc::downgrade(&server),
+        slot,
+    }))
+}
 
-    let batch = ruby.ary_new_capa(max.max(1));
-    batch.push(admit(ruby, &server, &slot, first)?)?;
-    for _ in 1..max {
-        match server.req_rx.try_recv() {
-            Ok(ctx) => batch.push(admit(ruby, &server, &slot, ctx)?)?,
-            Err(_) => break,
+impl Worker {
+    fn checkout(&self) -> Result<Option<(Arc<ServerInner>, BoxedCtx)>, Error> {
+        let Some(server) = self.server.upgrade() else {
+            return Ok(None); // server torn down → clean shutdown signal
+        };
+
+        // The previous batch is fully answered once the worker comes back.
+        self.slot.current.lock().clear();
+        self.slot.in_flight.store(0, Ordering::Relaxed);
+        self.slot.interrupted.store(false, Ordering::SeqCst);
+
+        Ok(block_take(&server, &self.slot)?.map(|ctx| (server, ctx)))
+    }
+
+    /// Take one request; returns its env Hash (request handle inside under
+    /// "kino.request") or nil on shutdown. The batch-of-one hot path: no
+    /// arrays allocated at all.
+    pub fn take_one(ruby: &Ruby, rb_self: &Worker) -> Result<Option<RHash>, Error> {
+        match rb_self.checkout()? {
+            Some((server, ctx)) => Ok(Some(admit(ruby, &server, &rb_self.slot, ctx)?)),
+            None => Ok(None),
         }
     }
-    Ok(Some(batch))
+
+    /// Take up to `max` requests: block for the first, drain the rest
+    /// non-blocking (they only batch when the queue is already deep).
+    /// Returns nil on shutdown; otherwise an Array of env Hashes.
+    pub fn take_batch(ruby: &Ruby, rb_self: &Worker, max: usize) -> Result<Option<RArray>, Error> {
+        let Some((server, first)) = rb_self.checkout()? else {
+            return Ok(None);
+        };
+
+        let batch = ruby.ary_new_capa(max.max(1));
+        batch.push(admit(ruby, &server, &rb_self.slot, first)?)?;
+        for _ in 1..max {
+            match server.req_rx.try_recv() {
+                Ok(ctx) => batch.push(admit(ruby, &server, &rb_self.slot, ctx)?)?,
+                Err(_) => break,
+            }
+        }
+        Ok(Some(batch))
+    }
 }
 
 /// The fused hot path: answer `request` (complete response in one shot)
@@ -194,28 +213,25 @@ pub fn take_batch(
 pub fn respond_and_take_one(
     ruby: &Ruby,
     request: &Request,
-    server_id: u64,
-    worker_id: usize,
+    worker: magnus::typed_data::Obj<Worker>,
     status: u16,
     headers: RHash,
     body: RString,
 ) -> Result<Option<RHash>, Error> {
     crate::request::respond_simple(ruby, request, status, headers, body)?;
-    take_one(ruby, server_id, worker_id)
+    Worker::take_one(ruby, &worker)
 }
 
 /// Batch variant of the fused call.
-#[allow(clippy::too_many_arguments)]
 pub fn respond_and_take(
     ruby: &Ruby,
     request: &Request,
-    server_id: u64,
-    worker_id: usize,
+    worker: magnus::typed_data::Obj<Worker>,
     max: usize,
     status: u16,
     headers: RHash,
     body: RString,
 ) -> Result<Option<RArray>, Error> {
     crate::request::respond_simple(ruby, request, status, headers, body)?;
-    take_batch(ruby, server_id, worker_id, max)
+    Worker::take_batch(ruby, &worker, max)
 }

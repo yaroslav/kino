@@ -20,12 +20,16 @@ module Kino
 
     def run(server_id, worker_id, app, batch_size = 1, hooks = nil)
       fire_after_worker_boot(hooks, worker_id)
+      # One resolution of (server, worker) into a native handle; every take
+      # after this skips the registry lookup. nil = server already gone.
+      worker = Native.worker(server_id, worker_id)
+      return unless worker
       if batch_size <= 1
-        env = Native.take_one(server_id, worker_id)
-        env = handle_one(env, server_id, worker_id, app, hooks) while env
+        env = worker.take_one
+        env = handle_one(env, worker, app, hooks) while env
       else
-        batch = Native.take_batch(server_id, worker_id, batch_size)
-        batch = process(batch, server_id, worker_id, app, batch_size, hooks) while batch
+        batch = worker.take_batch(batch_size)
+        batch = process(batch, worker, app, batch_size, hooks) while batch
       end
     end
 
@@ -35,22 +39,21 @@ module Kino
     NOT_FUSED = Object.new.freeze
 
     # Handle one request; returns the next env (fused take) or nil.
-    def handle_one(env, server_id, worker_id, app, hooks)
+    def handle_one(env, worker, app, hooks)
       result = serve(env, app, hooks) do |request, status, headers, chunks|
-        request.respond_and_take_one(server_id, worker_id, status, headers, chunks)
+        request.respond_and_take_one(worker, status, headers, chunks)
       end
-      result.equal?(NOT_FUSED) ? Native.take_one(server_id, worker_id) : result
+      result.equal?(NOT_FUSED) ? worker.take_one : result
     end
 
     # Handle every env in the batch; returns the next batch (the last
     # simple response rides the fused respond_and_take) or nil on shutdown.
-    def process(batch, server_id, worker_id, app, batch_size, hooks)
+    def process(batch, worker, app, batch_size, hooks)
       last = batch.size - 1
       batch.each_with_index do |env, index|
         result = serve(env, app, hooks) do |request, status, headers, chunks|
           if index == last
-            request.respond_and_take(server_id, worker_id, batch_size,
-              status, headers, chunks)
+            request.respond_and_take(worker, batch_size, status, headers, chunks)
           else
             request.send_simple(status, headers, chunks)
             NOT_FUSED
@@ -58,7 +61,7 @@ module Kino
         end
         return result if index == last && !result.equal?(NOT_FUSED)
       end
-      Native.take_batch(server_id, worker_id, batch_size)
+      worker.take_batch(batch_size)
     end
 
     # Run one request through the app. Complete bodies are yielded so the

@@ -1,3 +1,8 @@
+## [Unreleased]
+
+- Leaner request hot path: up to 2-4% more throughput on fast handlers
+  with `lanes` (measured on Linux), no change elsewhere.
+
 ## [0.5.0] - 2026-08-29
 
 - Add opt-in `io_shards true`: accepted HTTP connections can run on

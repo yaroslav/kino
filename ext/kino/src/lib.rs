@@ -41,8 +41,7 @@ fn init(ruby: &Ruby) -> Result<(), Error> {
     let native = module.define_module("Native")?;
     native.define_singleton_method("server_start", function!(server::server_start, 1))?;
     native.define_singleton_method("register_worker", function!(server::register_worker, 1))?;
-    native.define_singleton_method("take_one", function!(queue::take_one, 2))?;
-    native.define_singleton_method("take_batch", function!(queue::take_batch, 3))?;
+    native.define_singleton_method("worker", function!(queue::worker, 2))?;
     native.define_singleton_method("stop_accepting", function!(server::stop_accepting, 1))?;
     native.define_singleton_method("close_queue", function!(server::close_queue, 1))?;
     native.define_singleton_method("queue_stats", function!(server::queue_stats, 1))?;
@@ -84,11 +83,15 @@ fn init(ruby: &Ruby) -> Result<(), Error> {
     native.define_class("PinKeeper", ruby.class_object())?;
     native.define_singleton_method("pin_keeper", function!(server::pin_keeper, 1))?;
 
+    let worker = native.define_class("Worker", ruby.class_object())?;
+    worker.define_method("take_one", method!(queue::Worker::take_one, 0))?;
+    worker.define_method("take_batch", method!(queue::Worker::take_batch, 1))?;
+
     let request = native.define_class("Request", ruby.class_object())?;
-    request.define_method("respond_and_take", method!(queue::respond_and_take, 6))?;
+    request.define_method("respond_and_take", method!(queue::respond_and_take, 5))?;
     request.define_method(
         "respond_and_take_one",
-        method!(queue::respond_and_take_one, 5),
+        method!(queue::respond_and_take_one, 4),
     )?;
     request.define_method("read_body", method!(Request::read_body, 1))?;
     request.define_method("send_simple", method!(crate::request::respond_simple, 3))?;
@@ -98,10 +101,11 @@ fn init(ruby: &Ruby) -> Result<(), Error> {
     request.define_method("abort", method!(Request::abort, 0))?;
     request.define_method("timing", method!(Request::set_timing, 2))?;
 
-    // Force-resolve the TypedData class cache on the main ractor: magnus
-    // resolves it lazily on first wrap, and a racy first resolution from two
-    // worker ractors is the failure mode we must rule out.
+    // Force-resolve the TypedData class caches on the main ractor: magnus
+    // resolves them lazily on first wrap, and a racy first resolution from
+    // two worker ractors is the failure mode we must rule out.
     let _ = <Request as magnus::TypedData>::class(ruby);
+    let _ = <queue::Worker as magnus::TypedData>::class(ruby);
 
     // Frozen env key/value cache: built once here (main ractor, GVL held),
     // shared by every worker ractor afterwards.
