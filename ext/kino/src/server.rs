@@ -419,11 +419,36 @@ async fn serve_connection<I>(
 {
     let http2 = server.http2;
     let max_streams = advertised_streams(server.topology.workers, server.topology.threads);
+    let mut drain = server.shutdown_tx.subscribe();
     let service =
         service_fn(move |req| handle_request(server.clone(), remote_addr, local_addr, req));
-    let _ = conn_builder(http2, max_streams)
-        .serve_connection(TokioIo::new(io), service)
-        .await;
+    let builder = conn_builder(http2, max_streams);
+    let conn = builder.serve_connection(TokioIo::new(io), service);
+    let mut conn = std::pin::pin!(conn);
+    // Serve until done, or switch to graceful shutdown when the drain
+    // signal fires (stop_accepting): the in-flight request finishes and
+    // the connection then closes — `Connection: close` on HTTP/1,
+    // GOAWAY on h2 — so a balancer moves on instead of feeding a
+    // draining server, and teardown never cuts a response mid-stream.
+    // A connection that outlives the drain deadline is still cut by the
+    // runtime teardown, as before.
+    tokio::select! {
+        _ = conn.as_mut() => {}
+        _ = drain_signal(&mut drain) => {
+            conn.as_mut().graceful_shutdown();
+            let _ = conn.as_mut().await;
+        }
+    }
+}
+
+/// Resolve when the server starts draining. A connection accepted just
+/// before the signal may subscribe just after it, and `changed()` alone
+/// would miss that edge, so the current value is checked first; a
+/// dropped sender (teardown) counts as draining too.
+async fn drain_signal(rx: &mut tokio::sync::watch::Receiver<bool>) {
+    if !*rx.borrow_and_update() {
+        let _ = rx.changed().await;
+    }
 }
 
 /// The 503 every rejection path returns; counted for stats. Branding
@@ -1230,6 +1255,95 @@ mod tests {
         assert_eq!(order, ["/two".to_string(), "/one".to_string()]);
     }
 
+    #[tokio::test]
+    async fn drain_finishes_the_in_flight_h2_stream_then_goaways() {
+        use http_body_util::{BodyExt, Full};
+
+        let server = test_server(false, 4);
+        let client_io = spawn_conn(server.clone());
+
+        let (sender, conn) = hyper::client::conn::http2::handshake(
+            hyper_util::rt::TokioExecutor::new(),
+            TokioIo::new(client_io),
+        )
+        .await
+        .expect("h2 handshake");
+        tokio::spawn(conn);
+
+        let mut in_flight_sender = sender.clone();
+        let in_flight = tokio::spawn(async move {
+            let request = hyper::Request::builder()
+                .uri("http://kino.test/inflight")
+                .body(Full::new(bytes::Bytes::new()))
+                .expect("request");
+            in_flight_sender.send_request(request).await
+        });
+
+        // The request is with the worker when the drain fires; its
+        // response must still reach the client through the shutdown.
+        let ctx = take_ctx(&server).await;
+        let _ = server.shutdown_tx.send(true);
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        assert!(ctx.responder.send_response(plain_response(200, "late\n")));
+
+        let response = in_flight.await.expect("join").expect("in-flight served");
+        assert_eq!(response.status(), 200);
+        let body = response.into_body().collect().await.expect("body");
+        assert_eq!(&body.to_bytes()[..], b"late\n");
+
+        // The connection is now GOAWAY'd: a new stream must fail.
+        let mut sender = sender;
+        let request = hyper::Request::builder()
+            .uri("http://kino.test/after")
+            .body(Full::new(bytes::Bytes::new()))
+            .expect("request");
+        assert!(
+            sender.send_request(request).await.is_err(),
+            "a drained connection must not accept new streams"
+        );
+    }
+
+    #[tokio::test]
+    async fn drain_closes_an_h1_connection_after_its_response() {
+        use http_body_util::Full;
+
+        let server = test_server(false, 4);
+        let client_io = spawn_conn(server.clone());
+
+        let (mut sender, conn) = hyper::client::conn::http1::handshake(TokioIo::new(client_io))
+            .await
+            .expect("h1 handshake");
+        tokio::spawn(conn);
+
+        // h1's SendRequest is not Clone: one task drives both requests —
+        // the in-flight one, then (once it completed, so the drain has
+        // been seen) the keep-alive follow-up that must be refused.
+        let req = |path: &str| {
+            hyper::Request::builder()
+                .uri(path.to_string())
+                .header("host", "kino.test")
+                .body(Full::new(bytes::Bytes::new()))
+                .expect("request")
+        };
+        let client = tokio::spawn(async move {
+            let first = sender.send_request(req("/inflight")).await;
+            let second_failed = sender.send_request(req("/after")).await.is_err();
+            (first, second_failed)
+        });
+
+        let ctx = take_ctx(&server).await;
+        let _ = server.shutdown_tx.send(true);
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        assert!(ctx.responder.send_response(plain_response(200, "late\n")));
+
+        let (first, second_failed) = client.await.expect("join");
+        assert_eq!(first.expect("in-flight served").status(), 200);
+        assert!(
+            second_failed,
+            "a drained keep-alive connection must close after its response"
+        );
+    }
+
     #[test]
     fn advertised_streams_tracks_slot_capacity() {
         // Slot capacity, floored for tiny topologies and capped.
@@ -1337,7 +1451,7 @@ mod tests {
 
         let (mut client_io, server_io) = tokio::io::duplex(64 * 1024);
         let conn = tokio::spawn(async move {
-            let _ = conn_builder(true)
+            let _ = conn_builder(true, 200)
                 .serve_connection(
                     TokioIo::new(server_io),
                     service_fn(|_req: hyper::Request<hyper::body::Incoming>| async {
