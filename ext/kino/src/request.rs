@@ -162,6 +162,7 @@ pub fn build_env(ruby: &Ruby, ctx: &RequestCtx) -> Result<RHash, Error> {
     env.aset(live(s.query_string), query)?;
     let protocol = match ctx.version {
         http::Version::HTTP_10 => s.http10,
+        http::Version::HTTP_2 => s.http2,
         _ => s.http11,
     };
     env.aset(live(s.server_protocol), live(protocol))?;
@@ -179,31 +180,6 @@ pub fn build_env(ruby: &Ruby, ctx: &RequestCtx) -> Result<RHash, Error> {
     if !body_possible(ctx) {
         if let Some(null_input) = *s.null_input.read() {
             env.aset(live(s.rack_input), ruby.get_inner(null_input))?;
-        }
-    }
-
-    // SERVER_NAME/PORT: prefer the Host header (HTTP/1.1 requires it),
-    // fall back to the accepted socket's local address.
-    let host_header = ctx.headers.get(http::header::HOST);
-    match host_header {
-        Some(host) => {
-            let local_port = ctx.local_addr.port();
-            env_strings::set_host_env(ruby, env, host.as_bytes(), || {
-                match std::str::from_utf8(host.as_bytes()) {
-                    Ok(h) => split_host_port(h, local_port),
-                    Err(_) => (
-                        String::from_utf8_lossy(host.as_bytes()).into_owned(),
-                        local_port,
-                    ),
-                }
-            })?;
-        }
-        None => {
-            let ip = ctx.local_addr.ip();
-            let port = ctx.local_addr.port();
-            env_strings::set_host_env(ruby, env, format!("\0{ip}:{port}").as_bytes(), || {
-                (ip.to_string(), port)
-            })?;
         }
     }
 
@@ -244,6 +220,47 @@ pub fn build_env(ruby: &Ruby, ctx: &RequestCtx) -> Result<RHash, Error> {
             }
         };
         env.aset(key, value)?;
+    }
+
+    // SERVER_NAME/SERVER_PORT/HTTP_HOST, best source first: the request
+    // URI's authority (every h2 request via :authority; also h1
+    // absolute-form, where it beats Host per RFC 9112), then the Host
+    // header (HTTP/1.1 requires it), then the accepted socket's local
+    // address. Runs after the header loop so an authority-derived
+    // HTTP_HOST wins over a literal host header a proxy forwarded.
+    if let Some(authority) = ctx.uri.authority() {
+        let local_port = ctx.local_addr.port();
+        env_strings::set_authority_env(ruby, env, authority.as_str(), || {
+            (
+                authority.host().to_string(),
+                authority.port_u16().unwrap_or(local_port),
+            )
+        })?;
+    } else {
+        match ctx.headers.get(http::header::HOST) {
+            Some(host) => {
+                let local_port = ctx.local_addr.port();
+                env_strings::set_host_env(
+                    ruby,
+                    env,
+                    host.as_bytes(),
+                    || match std::str::from_utf8(host.as_bytes()) {
+                        Ok(h) => split_host_port(h, local_port),
+                        Err(_) => (
+                            String::from_utf8_lossy(host.as_bytes()).into_owned(),
+                            local_port,
+                        ),
+                    },
+                )?;
+            }
+            None => {
+                let ip = ctx.local_addr.ip();
+                let port = ctx.local_addr.port();
+                env_strings::set_host_env(ruby, env, format!("\0{ip}:{port}").as_bytes(), || {
+                    (ip.to_string(), port)
+                })?;
+            }
+        }
     }
 
     Ok(env)
@@ -510,6 +527,31 @@ mod tests {
         );
         // Empty name (":8080") falls back whole.
         assert_eq!(split_host_port(":8080", 80), (":8080".into(), 80));
+    }
+
+    #[test]
+    fn authority_host_port_derivation() {
+        // The same derivation build_env applies to a URI authority (the
+        // h2 :authority pseudo-header): http::uri does the split, the
+        // socket's local port fills a missing port.
+        let with_port: http::Uri = "https://example.com:8443/x".parse().expect("uri");
+        let authority = with_port.authority().expect("authority");
+        assert_eq!(authority.host(), "example.com");
+        assert_eq!(authority.port_u16(), Some(8443));
+        assert_eq!(authority.as_str(), "example.com:8443");
+
+        let bare: http::Uri = "https://example.com/x".parse().expect("uri");
+        let authority = bare.authority().expect("authority");
+        assert_eq!(authority.host(), "example.com");
+        assert_eq!(authority.port_u16().unwrap_or(9292), 9292);
+
+        // Bracketed IPv6: host() keeps the brackets, matching the h1
+        // split_host_port convention for SERVER_NAME.
+        let v6: http::Uri = "https://[::1]:8443/x".parse().expect("uri");
+        let authority = v6.authority().expect("authority");
+        assert_eq!(authority.host(), "[::1]");
+        assert_eq!(authority.port_u16(), Some(8443));
+        assert_eq!(authority.as_str(), "[::1]:8443");
     }
 
     #[test]

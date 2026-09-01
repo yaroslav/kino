@@ -44,16 +44,17 @@ pub struct EnvStrings {
     pub https: Opaque<RString>,
     pub http10: Opaque<RString>,
     pub http11: Opaque<RString>,
+    pub http2: Opaque<RString>,
     pub methods: HashMap<&'static str, Opaque<RString>>,
     /// lowercase header name -> frozen "HTTP_<UPPER>" key
     pub header_names: HashMap<&'static str, Opaque<RString>>,
-    /// Host-header bytes -> frozen (SERVER_NAME, SERVER_PORT) values, and
-    /// peer IP -> frozen REMOTE_ADDR value. Real traffic has low
-    /// cardinality on both, so these kill 3 string allocations per request.
+    /// Host-header or :authority bytes -> frozen host values, and peer
+    /// IP -> frozen REMOTE_ADDR value. Real traffic has low cardinality
+    /// on both, so these kill 3 string allocations per request.
     /// LRU-bounded: entries are BoxValue-rooted (registered with the GC on
     /// insert, UNregistered on eviction-drop), so a rotating-host attack
     /// recycles cache slots instead of leaking immortal strings.
-    pub hosts: Mutex<lru::LruCache<Vec<u8>, (CachedStr, CachedStr), ahash::RandomState>>,
+    pub hosts: Mutex<lru::LruCache<Vec<u8>, HostEntry, ahash::RandomState>>,
     pub addrs: Mutex<lru::LruCache<IpAddr, CachedStr, ahash::RandomState>>,
     /// Ractor-shareable defaults provided by the Ruby layer at boot:
     /// the frozen rack.errors writer and the frozen null rack.input.
@@ -63,6 +64,18 @@ pub struct EnvStrings {
 
 const HOST_CACHE_CAP: usize = 256;
 const ADDR_CACHE_CAP: usize = 1024;
+
+/// One hosts-cache entry: the frozen SERVER_NAME/SERVER_PORT pair, plus
+/// the frozen full authority ("host[:port]" as sent) used as the
+/// HTTP_HOST value for requests that carry the name in the URI (the h2
+/// :authority pseudo-header) rather than a Host header. Lazily filled:
+/// Host-header entries and the NUL-prefixed socket-fallback entries
+/// never allocate it.
+pub struct HostEntry {
+    name: CachedStr,
+    port: CachedStr,
+    host: Option<CachedStr>,
+}
 
 /// A frozen RString rooted via BoxValue (GC-registered address; unregisters
 /// on Drop, so LRU eviction actually frees the string).
@@ -142,6 +155,8 @@ const COMMON_HEADERS: &[&str] = &[
     "sec-ch-ua-mobile",
     "sec-ch-ua-platform",
     "keep-alive",
+    "priority",
+    "alt-used",
 ];
 
 pub fn cgi_name(lower: &str) -> String {
@@ -194,6 +209,7 @@ pub fn init(ruby: &Ruby) {
         https: frozen(ruby, "https"),
         http10: frozen(ruby, "HTTP/1.0"),
         http11: frozen(ruby, "HTTP/1.1"),
+        http2: frozen(ruby, "HTTP/2"),
         methods,
         header_names,
         hosts: Mutex::new(lru::LruCache::with_hasher(
@@ -249,20 +265,69 @@ pub fn set_host_env(
     let s = get();
     let mut hosts = s.hosts.lock();
     let (name, port) = match hosts.get(host) {
-        Some((name, port)) => (name.get(), port.get()),
+        Some(entry) => (entry.name.get(), entry.port.get()),
         None => {
             let (name_s, port_n) = make();
-            let entry = (
-                CachedStr::new(ruby, &name_s),
-                CachedStr::new(ruby, &port_n.to_string()),
-            );
-            let values = (entry.0.get(), entry.1.get());
-            hosts.put(host.to_vec(), entry); // may evict + free an old pair
+            let entry = HostEntry {
+                name: CachedStr::new(ruby, &name_s),
+                port: CachedStr::new(ruby, &port_n.to_string()),
+                host: None,
+            };
+            let values = (entry.name.get(), entry.port.get());
+            hosts.put(host.to_vec(), entry); // may evict + free an old entry
             values
         }
     };
     env.aset(ruby.get_inner(s.server_name), name)?;
     env.aset(ruby.get_inner(s.server_port), port)?;
+    Ok(())
+}
+
+/// Set SERVER_NAME/SERVER_PORT *and* HTTP_HOST on `env` from the URI
+/// authority (every h2 request via :authority; also h1 absolute-form).
+/// HTTP_HOST is set here because such requests carry no Host header for
+/// the header loop to surface. Same cache and locking contract as
+/// [`set_host_env`]; an entry first created by a Host header upgrades in
+/// place, gaining the full-authority string on first use.
+pub fn set_authority_env(
+    ruby: &Ruby,
+    env: magnus::RHash,
+    authority: &str,
+    make: impl FnOnce() -> (String, u16),
+) -> Result<(), magnus::Error> {
+    let s = get();
+    let mut hosts = s.hosts.lock();
+    let (name, port, host) = match hosts.get_mut(authority.as_bytes()) {
+        Some(entry) => {
+            if entry.host.is_none() {
+                entry.host = Some(CachedStr::new(ruby, authority));
+            }
+            (
+                entry.name.get(),
+                entry.port.get(),
+                entry.host.as_ref().expect("just filled").get(),
+            )
+        }
+        None => {
+            let (name_s, port_n) = make();
+            let entry = HostEntry {
+                name: CachedStr::new(ruby, &name_s),
+                port: CachedStr::new(ruby, &port_n.to_string()),
+                host: Some(CachedStr::new(ruby, authority)),
+            };
+            let values = (
+                entry.name.get(),
+                entry.port.get(),
+                entry.host.as_ref().expect("just built").get(),
+            );
+            hosts.put(authority.as_bytes().to_vec(), entry);
+            values
+        }
+    };
+    env.aset(ruby.get_inner(s.server_name), name)?;
+    env.aset(ruby.get_inner(s.server_port), port)?;
+    let host_key = *s.header_names.get("host").expect("host is a common header");
+    env.aset(ruby.get_inner(host_key), host)?;
     Ok(())
 }
 
