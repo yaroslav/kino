@@ -28,6 +28,15 @@ BENCH_APP = Ractor.shareable_proc do |env|
     # of this repo, which defines the Kino module with just VERSION in it.
     (defined?(Kino) && Kino.respond_to?(:sleep)) ? Kino.sleep(0.005) : sleep(0.005)
     [200, {"content-type" => "text/plain"}, ["io done"]]
+  when "/big-cookie"
+    # HTTP/2-shaped lane: the client sends a ~2 KB cookie with every
+    # request. HPACK indexes it after the first request on a connection;
+    # HTTP/1 re-sends and re-parses it every time.
+    [200, {"content-type" => "text/plain"}, [env["HTTP_COOKIE"].to_s.bytesize.to_s]]
+  when "/upload"
+    # HTTP/2-shaped lane: a multi-frame request body through per-stream
+    # flow control (h1 pays chunked/content-length framing instead).
+    [200, {"content-type" => "text/plain"}, [env["rack.input"].read.bytesize.to_s]]
   else
     [200, {"content-type" => "text/plain"}, ["ok"]]
   end
