@@ -1,5 +1,17 @@
 ## [Unreleased]
 
+- HTTP/2, on by default: `h2` negotiated via ALPN on TLS binds,
+  prior-knowledge h2c served on plaintext, HTTP/1.1 everywhere else on
+  the same port. The Rack env is filled from the `:authority`
+  pseudo-header (`SERVER_PROTOCOL` `"HTTP/2"`, `HTTP_HOST`,
+  `SERVER_NAME`/`SERVER_PORT`), split cookie headers are rejoined, and
+  streamed bodies keep the same backpressure as HTTP/1. Set
+  `http2 false` to pin the server to HTTP/1.
+- Request-body reads drain every already-arrived chunk in one native
+  call instead of one chunk per call. A body split into small frames
+  (HTTP/2 DATA, small h1 chunks) costs one GVL round-trip and one Ruby
+  string per 64 KB read; h2 uploads went from ~half of h1 throughput to
+  parity in the 64 KB upload lane.
 - Leaner request hot path: up to 2-4% more throughput on fast handlers
   with `lanes` (measured on Linux), no change elsewhere.
 

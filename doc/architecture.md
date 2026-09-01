@@ -116,6 +116,38 @@ connection abort mid-stream), interrupt blocked workers, reap
 stragglers → tear down the tokio runtime. Idempotent;
 a second INT/TERM force-exits.
 
+## HTTP/2
+
+One connection builder serves every protocol: hyper-util's auto builder
+picks h2 by ALPN on TLS connections, by the 24-byte preface sniff on
+plaintext (prior-knowledge h2c), and HTTP/1.x otherwise; `http2 false`
+pins the HTTP/1 codec and skips the sniff entirely. Streams multiplex
+into the same bounded queue as keep-alive requests, so h2 concurrency
+is bounded by workers × threads exactly as h1's is, and the bounded
+body channels give per-stream backpressure for free: while the
+forwarder blocks, hyper withholds WINDOW_UPDATE and the client stalls.
+
+The env bridge fills SERVER_NAME/SERVER_PORT/HTTP_HOST from the request
+URI's `:authority` (h2 requests carry no Host header), through the same
+host LRU the Host-header path uses, keyed by the authority bytes;
+SERVER_PROTOCOL is the interned "HTTP/2". h2 trailer frames are dropped
+(Rack has no trailer surface), and the h2 codec itself rejects
+connection-ish headers before they can reach the env.
+
+The upload path needed one h2-shaped fix: `read_body` drains every
+already-queued chunk in a single native call (one GVL round-trip and
+one Ruby string per 64 KB read), because a body arriving as 16 KB DATA
+frames otherwise paid one crossing per frame — that alone took h2
+uploads from half of h1's throughput to parity. A knob sweep over
+hyper's h2 codec (frame size, adaptive windows, window sizes) moved
+nothing after that, so hyper's defaults stay.
+
+Deferred until benchmarks justify them: HPACK-aware env value caching
+(a repeat header becomes a table lookup instead of a re-parse),
+slot-aware flow-control window grants (a memory/abuse lever now, not a
+throughput one), and advertising MAX_CONCURRENT_STREAMS matched to
+slot capacity as load-balancer admission control.
+
 ## Timer waits: `Kino.sleep`
 
 MRI's `sleep` parks the thread on the VM timer, whose wakeups inside
@@ -128,7 +160,8 @@ at the interrupt tick so `Thread#kill` and shutdown stay responsive.
 
 - **tokio + hyper**: the bottleneck is the Ruby dispatch boundary, not raw
   I/O throughput; what matters is HTTP correctness, keep-alive, TLS, and
-  h2-later—hyper's territory. Cross-platform out of the box.
+  h2 (since shipped, via hyper-util's protocol-auto builder)—hyper's
+  territory. Cross-platform out of the box.
 - **monoio**: thread-per-core io_uring looks great in echo-server
   benchmarks, but hyper only works through its poll-io compat layer
   (forfeiting io_uring on the hot path), and the share-nothing advantage
