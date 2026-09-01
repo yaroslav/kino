@@ -130,6 +130,7 @@ module Kino
       def io_threads: (int? count) -> untyped
       def tokio_threads: (int count) -> untyped
       def tls: (cert: String, key: String) -> untyped
+      def http2: (?boolish enabled) -> untyped
       def environment: (String | Symbol env) -> untyped
       def pidfile: (String path) -> untyped
       def control_bind: (String addr) -> String

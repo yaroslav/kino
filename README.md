@@ -145,6 +145,30 @@ doc):
 | /cpu (fib) |         **68,061** |                17,755 |                  48,721 |
 | /io (5 ms) |          **4,530** |                 1,454 |                   1,549 |
 
+### HTTP/2 head-to-head
+
+Kino speaks HTTP/2 natively, so it skips the usual nginx-termination
+hop. All over TLS, h2load, 64 in-flight, same app (different box:
+Docker/Linux, 8 cores — compare ratios, not absolutes, with the tables
+above):
+
+| /plaintext                    |       req/s | /upload (64 KB) |
+|-------------------------------|------------:|----------------:|
+| Kino native h2                | **169,469** |      **21,776** |
+| Kino HTTP/1.1 (same boot)     |     108,908 |          20,953 |
+| nginx h2 → Kino HTTP/1.1      |     106,371 |          1,485¹ |
+| Falcon (native h2)            |      59,371 |          18,997 |
+
+Native h2 is worth ~+50% over HTTP/1.1 on the same server (fewer,
+larger socket operations; HPACK spares re-sending cookies) and ~+60%
+over fronting the same Kino with nginx — the proxy hop is pure cost.
+Uploads, h2's classic weak spot, run at HTTP/1 parity. Full matrix,
+cleartext h2c lanes, and methodology:
+[doc/benchmarks.md](doc/benchmarks.md#http2); reproduce with
+`bench/h2.sh` (Docker).
+
+¹ nginx default-config h2 request-body flow control; see the doc.
+
 ### Rails
 
 Rails is not Ractor-shareable today, so Kino serves it in `:threaded`
@@ -239,6 +263,7 @@ server = Kino::Server.new(app,
   control_bind: "127.0.0.1:9293",   # monitoring: /stats /metrics /ready /live; port 0 reads back via server.control_port
   control_token: ENV["KINO_CONTROL_TOKEN"],  # optional Bearer auth for /stats + /metrics
   tls: { cert: "cert.pem", key: "key.pem" },  # file paths or inline PEM
+  http2: true,                # ALPN h2 on TLS + plaintext h2c; false = HTTP/1 only
 )
 server.start
 server.shutdown               # graceful: drain → deadline → abort stragglers
@@ -273,6 +298,28 @@ unchanged. Orthogonal to `mode`: it reshapes the Rust side only.
 io_shards true
 io_threads 4  # optional; default: half the available CPUs
 ```
+
+### HTTP/2
+
+On by default, on both transports, with nothing to configure:
+
+- **TLS binds** advertise `h2` via ALPN, so browsers and h2-capable
+  clients negotiate HTTP/2 and everything else stays on HTTP/1.1.
+- **Plaintext binds** serve prior-knowledge h2c: a client that opens
+  with the HTTP/2 preface (an h2-preferring load balancer, a gRPC-style
+  backend hop, `curl --http2-prior-knowledge`) gets HTTP/2; ordinary
+  clients are HTTP/1.1 exactly as before. Browsers never do h2 on
+  plaintext, so a certificate-less kino behaves identically for them.
+
+The Rack side is spec-complete on h2: `SERVER_PROTOCOL` is `"HTTP/2"`,
+`HTTP_HOST`/`SERVER_NAME`/`SERVER_PORT` come from the `:authority`
+pseudo-header (h2 requests carry no Host header), split cookie headers
+are rejoined with `"; "`, and streamed uploads flow through the same
+backpressured body channel as HTTP/1. Streams multiplex into the same
+worker slots as keep-alive requests—`workers × threads` bounds
+concurrency either way. (`rack.hijack` stays out on h2 as it is on h1;
+the protocol has no 101 upgrade to hijack anyway.) `http2 false` pins
+the server to HTTP/1 and drops `h2` from ALPN.
 
 ## Config file and CLI
 

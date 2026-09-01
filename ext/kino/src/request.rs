@@ -162,6 +162,7 @@ pub fn build_env(ruby: &Ruby, ctx: &RequestCtx) -> Result<RHash, Error> {
     env.aset(live(s.query_string), query)?;
     let protocol = match ctx.version {
         http::Version::HTTP_10 => s.http10,
+        http::Version::HTTP_2 => s.http2,
         _ => s.http11,
     };
     env.aset(live(s.server_protocol), live(protocol))?;
@@ -182,37 +183,25 @@ pub fn build_env(ruby: &Ruby, ctx: &RequestCtx) -> Result<RHash, Error> {
         }
     }
 
-    // SERVER_NAME/PORT: prefer the Host header (HTTP/1.1 requires it),
-    // fall back to the accepted socket's local address.
-    let host_header = ctx.headers.get(http::header::HOST);
-    match host_header {
-        Some(host) => {
-            let local_port = ctx.local_addr.port();
-            env_strings::set_host_env(ruby, env, host.as_bytes(), || {
-                match std::str::from_utf8(host.as_bytes()) {
-                    Ok(h) => split_host_port(h, local_port),
-                    Err(_) => (
-                        String::from_utf8_lossy(host.as_bytes()).into_owned(),
-                        local_port,
-                    ),
-                }
-            })?;
-        }
-        None => {
-            let ip = ctx.local_addr.ip();
-            let port = ctx.local_addr.port();
-            env_strings::set_host_env(ruby, env, format!("\0{ip}:{port}").as_bytes(), || {
-                (ip.to_string(), port)
-            })?;
-        }
-    }
-
     for name in ctx.headers.keys() {
-        // Single-value fast path (the overwhelming majority).
+        let key = if *name == http::header::CONTENT_TYPE {
+            live(s.content_type)
+        } else if *name == http::header::CONTENT_LENGTH {
+            live(s.content_length)
+        } else {
+            match s.header_names.get(name.as_str()) {
+                Some(cached) => live(*cached),
+                None => ruby.str_new(&env_strings::cgi_name(name.as_str())),
+            }
+        };
+
+        // Single-value fast path (the overwhelming majority); the value
+        // cache turns low-cardinality repeats (UA, accept-*, sec-ch-*)
+        // into a lookup of one frozen string instead of an allocation.
         let mut values = ctx.headers.get_all(name).iter();
         let first = values.next().map(|v| v.as_bytes()).unwrap_or(b"");
-        let value = match values.next() {
-            None => ruby.str_from_slice(first),
+        match values.next() {
+            None => env_strings::set_value_env(ruby, env, key, name.as_str(), first)?,
             Some(second) => {
                 let sep: &[u8] = if name == http::header::COOKIE {
                     b"; "
@@ -229,21 +218,50 @@ pub fn build_env(ruby: &Ruby, ctx: &RequestCtx) -> Result<RHash, Error> {
                     joined.extend_from_slice(sep);
                     joined.extend_from_slice(v.as_bytes());
                 }
-                ruby.str_from_slice(&joined)
+                env.aset(key, ruby.str_from_slice(&joined))?;
             }
-        };
+        }
+    }
 
-        let key = if *name == http::header::CONTENT_TYPE {
-            live(s.content_type)
-        } else if *name == http::header::CONTENT_LENGTH {
-            live(s.content_length)
-        } else {
-            match s.header_names.get(name.as_str()) {
-                Some(cached) => live(*cached),
-                None => ruby.str_new(&env_strings::cgi_name(name.as_str())),
+    // SERVER_NAME/SERVER_PORT/HTTP_HOST, best source first: the request
+    // URI's authority (every h2 request via :authority; also h1
+    // absolute-form, where it beats Host per RFC 9112), then the Host
+    // header (HTTP/1.1 requires it), then the accepted socket's local
+    // address. Runs after the header loop so an authority-derived
+    // HTTP_HOST wins over a literal host header a proxy forwarded.
+    if let Some(authority) = ctx.uri.authority() {
+        let local_port = ctx.local_addr.port();
+        env_strings::set_authority_env(ruby, env, authority.as_str(), || {
+            (
+                authority.host().to_string(),
+                authority.port_u16().unwrap_or(local_port),
+            )
+        })?;
+    } else {
+        match ctx.headers.get(http::header::HOST) {
+            Some(host) => {
+                let local_port = ctx.local_addr.port();
+                env_strings::set_host_env(
+                    ruby,
+                    env,
+                    host.as_bytes(),
+                    || match std::str::from_utf8(host.as_bytes()) {
+                        Ok(h) => split_host_port(h, local_port),
+                        Err(_) => (
+                            String::from_utf8_lossy(host.as_bytes()).into_owned(),
+                            local_port,
+                        ),
+                    },
+                )?;
             }
-        };
-        env.aset(key, value)?;
+            None => {
+                let ip = ctx.local_addr.ip();
+                let port = ctx.local_addr.port();
+                env_strings::set_host_env(ruby, env, format!("\0{ip}:{port}").as_bytes(), || {
+                    (ip.to_string(), port)
+                })?;
+            }
+        }
     }
 
     Ok(env)
@@ -339,8 +357,39 @@ impl Request {
 
         if chunk.len() > max_len {
             ctx.leftover = Some(chunk.split_off(max_len));
+            return Ok(Some(ruby.str_from_slice(&chunk)));
         }
-        Ok(Some(ruby.str_from_slice(&chunk)))
+
+        // Greedy drain: whatever the forwarder has already queued rides
+        // out in this same crossing, up to max_len. A body arriving as
+        // small DATA frames (HTTP/2 caps them at 16 KB unless negotiated
+        // higher) then costs one GVL round-trip and one Ruby string, not
+        // one per frame. Non-blocking: a chunk that has not arrived yet
+        // is next call's business, as are EOF and abandonment (try_recv's
+        // Disconnected included — the recv above maps them to errors).
+        let mut assembled: Option<RString> = None;
+        if let Some(body_rx) = ctx.body_rx.clone() {
+            let mut total = chunk.len();
+            while total < max_len {
+                let Ok(mut more) = body_rx.try_recv() else {
+                    break;
+                };
+                if more.len() > max_len - total {
+                    ctx.leftover = Some(more.split_off(max_len - total));
+                }
+                total += more.len();
+                let out = *assembled.get_or_insert_with(|| {
+                    let out = ruby.str_buf_new(max_len);
+                    out.cat(&chunk[..]);
+                    out
+                });
+                out.cat(&more[..]);
+            }
+        }
+        Ok(Some(match assembled {
+            Some(out) => out,
+            None => ruby.str_from_slice(&chunk),
+        }))
     }
 
     /// Start a streaming response: head goes out now, chunks follow via
@@ -510,6 +559,31 @@ mod tests {
         );
         // Empty name (":8080") falls back whole.
         assert_eq!(split_host_port(":8080", 80), (":8080".into(), 80));
+    }
+
+    #[test]
+    fn authority_host_port_derivation() {
+        // The same derivation build_env applies to a URI authority (the
+        // h2 :authority pseudo-header): http::uri does the split, the
+        // socket's local port fills a missing port.
+        let with_port: http::Uri = "https://example.com:8443/x".parse().expect("uri");
+        let authority = with_port.authority().expect("authority");
+        assert_eq!(authority.host(), "example.com");
+        assert_eq!(authority.port_u16(), Some(8443));
+        assert_eq!(authority.as_str(), "example.com:8443");
+
+        let bare: http::Uri = "https://example.com/x".parse().expect("uri");
+        let authority = bare.authority().expect("authority");
+        assert_eq!(authority.host(), "example.com");
+        assert_eq!(authority.port_u16().unwrap_or(9292), 9292);
+
+        // Bracketed IPv6: host() keeps the brackets, matching the h1
+        // split_host_port convention for SERVER_NAME.
+        let v6: http::Uri = "https://[::1]:8443/x".parse().expect("uri");
+        let authority = v6.authority().expect("authority");
+        assert_eq!(authority.host(), "[::1]");
+        assert_eq!(authority.port_u16(), Some(8443));
+        assert_eq!(authority.as_str(), "[::1]:8443");
     }
 
     #[test]

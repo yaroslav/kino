@@ -109,12 +109,62 @@ plain decrement after an `.await` would never run).
 
 ## Graceful shutdown
 
-`stop_accepting` → drain until queue + in-flight reach zero or the
-deadline passes → `close_queue` (idle workers see Disconnected and exit) →
+`stop_accepting` → every live connection switches to graceful shutdown
+(finish the in-flight request, answer with `Connection: close` on
+HTTP/1 or GOAWAY on h2, take nothing new — so drains converge instead
+of chasing chatty keep-alive clients) → drain until queue + in-flight
+reach zero or the deadline passes → `close_queue` (idle workers see
+Disconnected and exit) →
 join workers → past deadline: abort remaining clients (a 500, or a
 connection abort mid-stream), interrupt blocked workers, reap
 stragglers → tear down the tokio runtime. Idempotent;
 a second INT/TERM force-exits.
+
+## HTTP/2
+
+One connection builder serves every protocol: hyper-util's auto builder
+picks h2 by ALPN on TLS connections, by the 24-byte preface sniff on
+plaintext (prior-knowledge h2c), and HTTP/1.x otherwise; `http2 false`
+pins the HTTP/1 codec and skips the sniff entirely. Streams multiplex
+into the same bounded queue as keep-alive requests, so h2 concurrency
+is bounded by workers × threads exactly as h1's is, and the bounded
+body channels give per-stream backpressure for free: while the
+forwarder blocks, hyper withholds WINDOW_UPDATE and the client stalls.
+
+The env bridge fills SERVER_NAME/SERVER_PORT/HTTP_HOST from the request
+URI's `:authority` (h2 requests carry no Host header), through the same
+host LRU the Host-header path uses, keyed by the authority bytes;
+SERVER_PROTOCOL is the interned "HTTP/2". h2 trailer frames are dropped
+(Rack has no trailer surface), and the h2 codec itself rejects
+connection-ish headers before they can reach the env.
+
+The upload path needed one h2-shaped fix: `read_body` drains every
+already-queued chunk in a single native call (one GVL round-trip and
+one Ruby string per 64 KB read), because a body arriving as 16 KB DATA
+frames otherwise paid one crossing per frame — that alone took h2
+uploads from half of h1's throughput to parity. A knob sweep over
+hyper's h2 codec (frame size, adaptive windows, window sizes) moved
+nothing after that, so hyper's defaults stay.
+
+SETTINGS_MAX_CONCURRENT_STREAMS is derived from slot capacity
+(workers × threads, clamped to [8, 1024]) rather than hyper's flat 200:
+a smart balancer sees the server's true admission, and a hostile client
+cannot multiply one connection into hundreds of queued requests — the
+h2 analogue of h1's one-request-per-connection shape. The codec's own
+abuse bounds ship as hyper/h2 defaults and were reviewed: 16 KB header
+lists, 20 pending remote resets then GOAWAY (rapid reset), per-second
+reset-churn and empty-frame budgets.
+
+Low-cardinality header values (UA, accept-*, sec-ch-*, sec-fetch-*)
+are interned in an LRU of frozen strings — the env-side analogue of
+HPACK's wire dedup, and the practical form of it: hyper does not expose
+HPACK table indices, so the cache keys on value bytes and works for
+HTTP/1 too. Cookie and authorization are deliberately excluded
+(per-user cardinality, secret lifetime).
+
+Deferred until benchmarks justify it: slot-aware flow-control window
+grants (a memory/abuse lever, not a throughput one — the knob sweep
+showed windows don't gate upload throughput).
 
 ## Timer waits: `Kino.sleep`
 
@@ -128,7 +178,8 @@ at the interrupt tick so `Thread#kill` and shutdown stay responsive.
 
 - **tokio + hyper**: the bottleneck is the Ruby dispatch boundary, not raw
   I/O throughput; what matters is HTTP correctness, keep-alive, TLS, and
-  h2-later—hyper's territory. Cross-platform out of the box.
+  h2 (since shipped, via hyper-util's protocol-auto builder)—hyper's
+  territory. Cross-platform out of the box.
 - **monoio**: thread-per-core io_uring looks great in echo-server
   benchmarks, but hyper only works through its poll-io compat layer
   (forfeiting io_uring on the hot path), and the share-nothing advantage

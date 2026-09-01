@@ -408,6 +408,62 @@ Puma comparison note: request logging is opt-in there too (`--quiet` is
 the default, `-v/--log-requests` enables it)—Kino's default-off
 `log_requests` matches the ecosystem's standard behavior.
 
+## HTTP/2
+
+`bench/h2.sh`, Docker/Linux only (the load generator runs inside the
+container). Every lane is measured with h2load so the generator is
+identical everywhere: h2 lanes run 8 connections × 8 concurrent
+streams, h1 lanes 64 connections — the same total in-flight. Servers
+without native h2 get the standard pattern instead: nginx terminating
+h2 and proxying HTTP/1.1 upstream over keep-alive. One labeled run
+(kino ractor 8×3, falcon `--count 8`, puma `-w 8 -t 3:3`, 5 s/lane);
+re-run the whole script for close calls, per the variance section.
+
+| target (h2 unless noted) | /plaintext | /10k | /big-cookie | /upload (64 KB) |
+|---|---:|---:|---:|---:|
+| kino h2c | 191,563 | 140,628 | 169,961 | 26,484 |
+| kino h1 cleartext (same boot) | 127,843 | 106,333 | 118,509 | 26,511 |
+| kino h2 TLS | 169,469 | 109,963 | 154,316 | 21,776 |
+| kino h1 TLS (same boot) | 108,908 | 85,009 | 99,674 | 20,953 |
+| falcon TLS (native h2) | 59,371 | 37,806 | 49,666 | 18,997 |
+| nginx h2 → puma h1 | 80,498 | 66,448 | 102,633 | 1,551 |
+| nginx h2 → kino h1 | 106,371 | 59,513 | 76,135 | 1,485 |
+
+What the numbers say:
+
+- **Native h2 beats h1 on the same server by ~30–50%** on
+  response-dominated lanes: the same 64 in-flight requests ride 8
+  connections instead of 64, so frames batch into fewer, larger
+  syscalls. The `/big-cookie` lane (a ~2 KB cookie per request) shows
+  HPACK on top of that: the cookie crosses the wire once per
+  connection, not once per request.
+- **Native h2 beats proxied h2 by ~60%** with the *same backend*: the
+  nginx→kino-h1 lane is the proxy-cost control, and the extra hop,
+  re-parse, and re-serialize cost ~60k req/s on /plaintext.
+- **Uploads run at h1 parity** — but only after a fix this lane
+  caught: h2 delivers bodies as 16 KB DATA frames, and `read_body`
+  originally crossed the GVL once per chunk, halving upload
+  throughput. It now drains every queued chunk per crossing
+  (doc/architecture.md), and a knob sweep over hyper's h2 codec
+  (frame size, adaptive/bigger windows) moved nothing afterwards.
+  nginx's h2 upload collapse (~1.5k) is its default-config
+  request-body flow control; tune `http2_body_preread_size`/buffering
+  before drawing conclusions there.
+- falcon lands at roughly a third of kino-h2-TLS on fast handlers and
+  behind on uploads. Single-run caveat: the nginx lanes showed ±20%
+  swings between runs (puma's big-cookie beating its 10k here is that
+  noise, not a signal); the kino-vs-kino and kino-vs-proxy ratios were
+  stable across three runs.
+- **Header-value interning** (user-agent, accept-*, sec-ch-*: one
+  frozen string instead of a fresh allocation per request) was
+  measured with a realistic 11-header browser set on /plaintext,
+  using the within-boot header cost (bare vs with-headers) as the
+  drift-resistant metric: over h2 that cost fell from ~16% to ~12-13%
+  (~+3-5% throughput on the headers lane); h1's smaller header cost
+  stayed within noise. The effect the tiny app understates: 6-8 fewer
+  string allocations per request is GC pressure a real app feels more
+  than this one does.
+
 ## Hot-path notes
 
 For the curious, the dispatch-path work behind the numbers: a try-pop

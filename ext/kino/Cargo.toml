@@ -21,8 +21,8 @@ smallvec = "1"
 lru = "0.18"
 mimalloc = { version = "0.1", default-features = false }
 tokio = { version = "1.45", features = ["rt-multi-thread", "net", "time", "sync", "io-util", "macros"] }
-hyper = { version = "1.6", features = ["http1", "server"] }
-hyper-util = { version = "0.1", features = ["server", "tokio", "http1"] }
+hyper = { version = "1.6", features = ["http1", "http2", "server"] }
+hyper-util = { version = "0.1", features = ["server", "server-auto", "tokio", "http1", "http2"] }
 http = "1"
 http-body-util = "0.1"
 bytes = "1"
@@ -49,3 +49,8 @@ rb-sys-env = "0.2.2"
 # undefined (the host process provides them at runtime); feature
 # unification turns this on only for `cargo test`.
 rb-sys = { version = "0.9", features = ["link-ruby"] }
+# The protocol tests drive the server end of a duplex pipe with hyper's
+# own client, and pause the clock to test timeouts; feature unification
+# enables both only for `cargo test`.
+hyper = { version = "1.6", features = ["client"] }
+tokio = { version = "1.45", features = ["test-util"] }

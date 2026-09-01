@@ -50,6 +50,30 @@ RSpec.describe "HTTP basics" do
     end
   end
 
+  it "interns low-cardinality header values as frozen strings" do
+    echo = lambda do |env|
+      ua = env["HTTP_USER_AGENT"]
+      cookie = env["HTTP_COOKIE"]
+      body = "ua=#{ua}:#{ua.frozen?}|cookie_frozen=#{cookie.frozen?}"
+      [200, {"content-type" => "text/plain"}, [body]]
+    end
+
+    with_server(echo) do |host, port|
+      http = Net::HTTP.new(host, port)
+      headers = {"user-agent" => "kino-spec/1.0", "cookie" => "a=1"}
+      response = http.get("/", headers)
+
+      # A repeated UA comes from the value cache (frozen); a cookie is
+      # per-user data and stays a fresh mutable string.
+      expect(response.body).to eq("ua=kino-spec/1.0:true|cookie_frozen=false")
+
+      # An oversized value skips the cache: fresh and mutable.
+      huge = "x" * 600
+      response = http.get("/", {"user-agent" => huge, "cookie" => "a=1"})
+      expect(response.body).to eq("ua=#{huge}:false|cookie_frozen=false")
+    end
+  end
+
   it "round-trips a POST body" do
     echo_body = lambda do |env|
       [200, {"content-type" => "application/octet-stream"}, [env["rack.input"].read]]

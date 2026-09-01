@@ -20,6 +20,11 @@
 # PEM strings also work).
 # tls cert: "config/certs/server.pem", key: "config/certs/server.key"
 
+# HTTP/2 is on by default: negotiated via ALPN on TLS binds, and served
+# to prior-knowledge (h2c) clients on plaintext. Everything else keeps
+# getting HTTP/1.1. Set false to serve HTTP/1 only.
+# http2 false
+
 ## Topology
 
 # How many workers to run. Each worker handles requests independently;

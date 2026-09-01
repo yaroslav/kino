@@ -115,6 +115,9 @@ pub struct ServerInner {
     pub quarantine_replacements: AtomicU64,
     pub topology: Topology,
     pub https: bool,
+    /// HTTP/2 serving (ALPN over TLS, prior-knowledge h2c on plaintext);
+    /// false pins every connection to HTTP/1.
+    pub http2: bool,
     /// The socket file of a `unix://` bind, removed at shutdown.
     pub unix_path: Option<std::path::PathBuf>,
     /// Native access log sink (None unless log_requests is on).
@@ -354,6 +357,7 @@ pub fn test_server(lanes: bool, queue_depth: usize) -> Arc<ServerInner> {
             batch: 1,
         },
         https: false,
+        http2: true,
         unix_path: None,
         access_log: None,
         lanes,
