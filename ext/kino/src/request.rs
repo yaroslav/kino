@@ -356,8 +356,39 @@ impl Request {
 
         if chunk.len() > max_len {
             ctx.leftover = Some(chunk.split_off(max_len));
+            return Ok(Some(ruby.str_from_slice(&chunk)));
         }
-        Ok(Some(ruby.str_from_slice(&chunk)))
+
+        // Greedy drain: whatever the forwarder has already queued rides
+        // out in this same crossing, up to max_len. A body arriving as
+        // small DATA frames (HTTP/2 caps them at 16 KB unless negotiated
+        // higher) then costs one GVL round-trip and one Ruby string, not
+        // one per frame. Non-blocking: a chunk that has not arrived yet
+        // is next call's business, as are EOF and abandonment (try_recv's
+        // Disconnected included — the recv above maps them to errors).
+        let mut assembled: Option<RString> = None;
+        if let Some(body_rx) = ctx.body_rx.clone() {
+            let mut total = chunk.len();
+            while total < max_len {
+                let Ok(mut more) = body_rx.try_recv() else {
+                    break;
+                };
+                if more.len() > max_len - total {
+                    ctx.leftover = Some(more.split_off(max_len - total));
+                }
+                total += more.len();
+                let out = *assembled.get_or_insert_with(|| {
+                    let out = ruby.str_buf_new(max_len);
+                    out.cat(&chunk[..]);
+                    out
+                });
+                out.cat(&more[..]);
+            }
+        }
+        Ok(Some(match assembled {
+            Some(out) => out,
+            None => ruby.str_from_slice(&chunk),
+        }))
     }
 
     /// Start a streaming response: head goes out now, chunks follow via
