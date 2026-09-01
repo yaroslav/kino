@@ -454,6 +454,15 @@ What the numbers say:
   swings between runs (puma's big-cookie beating its 10k here is that
   noise, not a signal); the kino-vs-kino and kino-vs-proxy ratios were
   stable across three runs.
+- **Header-value interning** (user-agent, accept-*, sec-ch-*: one
+  frozen string instead of a fresh allocation per request) was
+  measured with a realistic 11-header browser set on /plaintext,
+  using the within-boot header cost (bare vs with-headers) as the
+  drift-resistant metric: over h2 that cost fell from ~16% to ~12-13%
+  (~+3-5% throughput on the headers lane); h1's smaller header cost
+  stayed within noise. The effect the tiny app understates: 6-8 fewer
+  string allocations per request is GC pressure a real app feels more
+  than this one does.
 
 ## Hot-path notes
 

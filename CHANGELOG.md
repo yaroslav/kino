@@ -1,17 +1,35 @@
 ## [Unreleased]
 
-- HTTP/2, on by default: `h2` negotiated via ALPN on TLS binds,
-  prior-knowledge h2c served on plaintext, HTTP/1.1 everywhere else on
-  the same port. The Rack env is filled from the `:authority`
-  pseudo-header (`SERVER_PROTOCOL` `"HTTP/2"`, `HTTP_HOST`,
-  `SERVER_NAME`/`SERVER_PORT`), split cookie headers are rejoined, and
-  streamed bodies keep the same backpressure as HTTP/1. Set
-  `http2 false` to pin the server to HTTP/1.
-- Request-body reads drain every already-arrived chunk in one native
-  call instead of one chunk per call. A body split into small frames
-  (HTTP/2 DATA, small h1 chunks) costs one GVL round-trip and one Ruby
-  string per 64 KB read; h2 uploads went from ~half of h1 throughput to
-  parity in the 64 KB upload lane.
+- HTTP/2 support. Kino now speaks HTTP/2 natively, on by default:
+  browsers negotiate it over TLS (ALPN), h2-preferring balancers and
+  tools get prior-knowledge h2c on plaintext, and everyone else keeps
+  getting HTTP/1.1 on the same port. `http2 false` restores an
+  HTTP/1-only server. What ships with it:
+  - A spec-complete Rack env on h2: `SERVER_PROTOCOL` is `"HTTP/2"`,
+    `HTTP_HOST`/`SERVER_NAME`/`SERVER_PORT` come from the `:authority`
+    pseudo-header, split cookie headers are rejoined, and uploads
+    stream with the same backpressure as HTTP/1.
+  - Uploads at full speed: body reads now drain every arrived chunk in
+    one native call, so h2's 16 KB data frames don't pay a GVL
+    round-trip each — h2 uploads run at HTTP/1 parity, and chunked
+    HTTP/1 uploads got faster too.
+  - `MAX_CONCURRENT_STREAMS` advertised from worker-slot capacity, so
+    an h2-aware balancer sees the server's real admission and a single
+    connection cannot multiply into hundreds of queued requests.
+  - Graceful connection drains: on shutdown, every connection finishes
+    its in-flight request and then closes (`Connection: close` on
+    HTTP/1, GOAWAY on h2) instead of being cut mid-stream at the
+    deadline.
+  - Interned header values: low-cardinality headers (user-agent,
+    accept-*, sec-ch-*) reuse one frozen string instead of allocating
+    per request — the env-side analogue of HPACK's wire dedup, worth a
+    few percent on header-heavy traffic and 6-8 fewer allocations per
+    request, on HTTP/1 too. Cookies and authorization are deliberately
+    never cached.
+
+  Measured (doc/benchmarks.md): native h2 is ~+50% over HTTP/1.1 on
+  the same server and ~+60% over nginx-terminated h2 in front of Kino;
+  ~3× falcon on fast handlers.
 - Leaner request hot path: up to 2-4% more throughput on fast handlers
   with `lanes` (measured on Linux), no change elsewhere.
 
