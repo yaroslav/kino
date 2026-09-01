@@ -17,9 +17,21 @@ the deployment most apps run today.
   9R14 (Genoa), 16 GB RAM, Amazon Linux 2023, kernel 6.18. A realistic
   app-server size, deliberately: nobody provisions a 32-core box per
   app process.
-- Toolchain built on the box via mise: Ruby 4.0.5 (**YJIT enabled**,
-  `RUBY_YJIT_ENABLE=1` for every server), Rust 1.96, Kino compiled in
+- Toolchain built on the box via mise: Ruby 4.0.6 (**YJIT enabled**,
+  `RUBY_YJIT_ENABLE=1` for every server), Rust stable, Kino compiled in
   the release profile.
+- **2026-09 full re-measurement** (a fresh c7a.2xlarge): every number in
+  this document and the README was re-run on Ruby 4.0.6 / kernel 6.18 /
+  Puma 8.0.2, adding the sharded-I/O and HTTP/2 studies. Kino's numbers
+  reproduced within 1-3% across the board—including the /io slot
+  ceiling and the arena balloon, both intact. The one real shift: Puma
+  8.0.2 is faster than 7.x (142k plaintext, 61k /cpu), narrowing
+  ractor mode's /cpu lead to +25% (was +34%). Reversed-boot-order
+  re-runs reproduced within ~1%. A methodology trap worth recording:
+  a 5-second single-endpoint warmup understates memory badly (81 MB
+  where the full battery shows 137 MB) and hides the arena balloon
+  entirely—memory is only comparable after the full endpoint battery,
+  and /io numbers are only comparable at equal slot counts.
 - Load generator: wrk 4.2 on the same host, 8-second windows, 64
   connections (`bench/run.sh 8 64`). Same-host load generation costs
   both sides CPU equally; we verified the generator was not the
@@ -249,14 +261,17 @@ visible.
 
 | config | RSS | PSS |
 |---|---:|---:|
-| Kino :ractor 8×1 (default) | 151 | **148** |
-| Kino lanes 8×1 | 137 | **135** |
-| Kino :ractor 8×3 | 171 | **169** |
+| Kino :ractor 8×1 (default) | 137 | **135** |
+| Kino lanes 8×1 | 128 | **126** |
+| Kino :ractor 8×3 | 170 | **168** |
 | Kino :threaded 8×3 (`MALLOC_ARENA_MAX=2`) | 109 | **107** |
-| Kino :threaded 8×3 (no arena cap) | 668 | **666**¹ |
-| Puma cluster 8×3 | 1,213 | **1,068** |
+| Kino :threaded 8×3 (no arena cap) | 672 | **670**¹ |
+| Puma cluster 8×3 | 1,216 | **1,072** |
 
-The tiny app is ~7× lighter than the cluster in ractor mode, ~10× in
+(2026-09 re-measure; the 2026-06 numbers reproduced within a few MB on
+every row—the arena-capped threaded row to the megabyte.)
+
+The tiny app is ~8× lighter than the cluster in ractor mode, ~10× in
 arena-capped threaded mode. RSS ≈ PSS for every Kino row (one process,
 nothing to share) and within ~12% for Puma here: a trivial app has almost
 no shared state, so Puma's footprint is ~1,051 MB of *private* per-worker
@@ -280,18 +295,19 @@ Here copy-on-write **does** matter, which is exactly why PSS is mandatory:
 
 | config | RSS | PSS |
 |---|---:|---:|
-| Kino :threaded (one process) |  97 |  **92** |
-| Puma cluster 8×3 (preload) | 794 | **389** |
+| Kino :threaded (one process) |  97 |  **95** |
+| Puma cluster 8×5 (preload) | 813 | **405** |
+| Puma cluster 8×5 (no preload) | 824 | **646** |
 
 Puma serves the same Rails framework from 8 forks that share it
-copy-on-write; RSS counts that shared framework once per worker (794 MB),
-PSS counts it once (389 MB). The fair ratio is **~4×**, not the ~8× a
+copy-on-write; RSS counts that shared framework once per worker (813 MB),
+PSS counts it once (405 MB). The fair ratio is **~4×**, not the ~8× a
 naive RSS sum reports—this is the correction that prompted the whole
-re-measure. Preload barely helps (389 vs 400 MB without): Ruby's GC
-dirties most heap pages, breaking copy-on-write, so even a preloaded
-cluster keeps a large private heap per worker. That is why "CoW should
-make a fork cluster nearly free" is only half true—it shares the code,
-not the live object heap.
+re-measure. The 2026-09 run also split out preload: it now saves a
+third (405 vs 646 MB PSS)—worth turning on—but even preloaded, Ruby's
+GC dirties heap pages and breaks copy-on-write, so each worker keeps a
+large private heap. That is why "CoW should make a fork cluster nearly
+free" is only half true—it shares the code, not the live object heap.
 
 ## Run-to-run variance (a.k.a. "is this a regression?")
 
@@ -376,27 +392,46 @@ crash semantics, stealing fairness, and drain behavior have spec
 coverage but not production mileage. (On loopback-bound macOS, lanes
 lose a few percent instead; see the secondary table below.)
 
+## Sharded I/O (`io_shards true`)
+
+`bench/studies.sh 8 64 shards`, ractor 8×3, 2026-09 reference box:
+
+| case (/plaintext) | req/s |
+|---|---:|
+| shared tokio runtime (baseline) | 193,461 |
+| io_shards, default shard count | 195,436 |
+| io_shards, `io_threads 2` | 170,509 |
+| io_shards, `io_threads 4` | 196,298 |
+| io_shards, `io_threads 8` | 199,657 |
+
+On 8 cores the shards buy +1-3%, best at `io_threads 8` (the
+half-the-cores default is close behind; 2 shards choke on accept
+handoff). The design removes work-stealing and cross-thread wakeups,
+so the win scales with scheduler contention—expect more on boxes with
+more cores and connections, and measure on your own core count.
+
 ## Logging costs
 
 Measured at full plaintext saturation (one log line per request—rates
 that no real deployment logs at; treat these as worst-case ceilings, not
 typical costs):
 
-| case (8×3, same session) | req/s |
+| case (8×3, same session, 2026-09) | req/s |
 |---|---:|
-| threaded, no logging | 219,168 |
-| threaded, `log_requests true` (native access log) | 193,998 (−11%) |
-| ractor, access log off / on | 197,596 / 181,050 (−8%) |
-| app logs 1 line/req via shared `::Logger` (file) | **62,961** |
-| app logs 1 line/req via `Kino::Logger` (file) | **149,519 (2.4×)** |
+| threaded, no logging | 213,166 |
+| threaded, `log_requests true` (native access log) | 173,501 (−19%) |
+| ractor, access log off / on | 191,152 / 163,777 (−14%) |
+| app logs 1 line/req via shared `::Logger` (file) | **90,175** |
+| app logs 1 line/req via `Kino::Logger` (file) | **154,653 (1.7×)** |
 
 The shared-`::Logger` cost is the mutex: 24 worker threads serialize
 through one lock plus a write syscall per line. `Kino::Logger` hands the
 formatted line to a lock-free channel and returns—the remaining cost vs
 not logging at all is Ruby-side formatting, which no device can remove.
-(In the Docker environment the same comparison showed 8.5×—overlay-fs
-write latency punished the synchronous logger far harder than this box's
-NVMe does. The ranking is environment-independent; the multiple is not.)
+(The multiple moves with the environment: 2.4× on the 2026-06 box,
+1.7× on the 2026-09 one, 8.5× under Docker, where overlay-fs write
+latency punished the synchronous logger hardest. The ranking is
+environment-independent; the multiple is not.)
 
 One trade-off worth knowing: the sink **never blocks** request threads,
 so at absurd rates against a slow disk it drops lines once its 8192-line
@@ -410,37 +445,40 @@ the default, `-v/--log-requests` enables it)—Kino's default-off
 
 ## HTTP/2
 
-`bench/h2.sh`, Docker/Linux only (the load generator runs inside the
-container). Every lane is measured with h2load so the generator is
-identical everywhere: h2 lanes run 8 connections × 8 concurrent
-streams, h1 lanes 64 connections — the same total in-flight. Servers
-without native h2 get the standard pattern instead: nginx terminating
-h2 and proxying HTTP/1.1 upstream over keep-alive. One labeled run
-(kino ractor 8×3, falcon `--count 8`, puma `-w 8 -t 3:3`, 5 s/lane);
-re-run the whole script for close calls, per the variance section.
+`bench/h2.sh`, Linux only (on macOS run it under Docker; the 2026-09
+numbers below are from the c7a.2xlarge reference box). Every lane is
+measured with h2load so the generator is identical everywhere: h2
+lanes run 8 connections × 8 concurrent streams, h1 lanes 64
+connections—the same total in-flight. Servers without native h2 get
+the standard pattern instead: nginx terminating h2 and proxying
+HTTP/1.1 upstream over keep-alive. One labeled run (kino ractor 8×3,
+falcon `--count 8`, puma `-w 8 -t 3:3`, 5 s/lane); re-run the whole
+script for close calls, per the variance section.
 
 | target (h2 unless noted) | /plaintext | /10k | /big-cookie | /upload (64 KB) |
 |---|---:|---:|---:|---:|
-| kino h2c | 191,563 | 140,628 | 169,961 | 26,484 |
-| kino h1 cleartext (same boot) | 127,843 | 106,333 | 118,509 | 26,511 |
-| kino h2 TLS | 169,469 | 109,963 | 154,316 | 21,776 |
-| kino h1 TLS (same boot) | 108,908 | 85,009 | 99,674 | 20,953 |
-| falcon TLS (native h2) | 59,371 | 37,806 | 49,666 | 18,997 |
-| nginx h2 → puma h1 | 80,498 | 66,448 | 102,633 | 1,551 |
-| nginx h2 → kino h1 | 106,371 | 59,513 | 76,135 | 1,485 |
+| kino h2c | 207,461 | 150,105 | 195,093 | 26,304 |
+| kino h1 cleartext (same boot) | 116,082 | 97,634 | 110,614 | 24,338 |
+| kino h2 TLS | 164,044 | 116,617 | 154,301 | 19,226 |
+| kino h1 TLS (same boot) | 80,789 | 69,942 | 76,654 | 17,210 |
+| falcon TLS (native h2) | 55,637 | 37,541 | 49,151 | 18,838 |
+| nginx h2 → puma h1 | 81,234 | 57,891 | 51,332 | 1,247 |
+| nginx h2 → kino h1 | 109,219 | 66,634 | 54,996 | 1,217 |
 
 What the numbers say:
 
-- **Native h2 beats h1 on the same server by ~30–50%** on
-  response-dominated lanes: the same 64 in-flight requests ride 8
+- **Native h2 beats h1 on the same server by +79% cleartext and +103%
+  over TLS** on /plaintext: the same 64 in-flight requests ride 8
   connections instead of 64, so frames batch into fewer, larger
-  syscalls. The `/big-cookie` lane (a ~2 KB cookie per request) shows
-  HPACK on top of that: the cookie crosses the wire once per
-  connection, not once per request.
-- **Native h2 beats proxied h2 by ~60%** with the *same backend*: the
+  syscalls—and TLS amplifies it, since h1's 64 connections each pay
+  crypto per record. The `/big-cookie` lane (a ~2 KB cookie per
+  request) shows HPACK on top: the cookie crosses the wire once per
+  connection, not once per request, and holds 94% of bare-plaintext
+  throughput where h1 loses 5%.
+- **Native h2 beats proxied h2 by +50%** with the *same backend*: the
   nginx→kino-h1 lane is the proxy-cost control, and the extra hop,
-  re-parse, and re-serialize cost ~60k req/s on /plaintext.
-- **Uploads run at h1 parity** — but only after a fix this lane
+  re-parse, and re-serialize cost ~55k req/s on /plaintext.
+- **Uploads run at h1 parity**—but only after a fix this lane
   caught: h2 delivers bodies as 16 KB DATA frames, and `read_body`
   originally crossed the GVL once per chunk, halving upload
   throughput. It now drains every queued chunk per crossing
@@ -450,10 +488,10 @@ What the numbers say:
   request-body flow control; tune `http2_body_preread_size`/buffering
   before drawing conclusions there.
 - falcon lands at roughly a third of kino-h2-TLS on fast handlers and
-  behind on uploads. Single-run caveat: the nginx lanes showed ±20%
-  swings between runs (puma's big-cookie beating its 10k here is that
-  noise, not a signal); the kino-vs-kino and kino-vs-proxy ratios were
-  stable across three runs.
+  slightly behind on uploads. Single-run caveat: the nginx lanes
+  showed ±20% swings between runs in the Docker environment; on the
+  reference box the kino-vs-kino and kino-vs-proxy ratios reproduced
+  across runs, the nginx lanes remain the noisiest.
 - **Header-value interning** (user-agent, accept-*, sec-ch-*: one
   frozen string instead of a fresh allocation per request) was
   measured with a realistic 11-header browser set on /plaintext,

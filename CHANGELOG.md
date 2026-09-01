@@ -11,7 +11,7 @@
     stream with the same backpressure as HTTP/1.
   - Uploads at full speed: body reads now drain every arrived chunk in
     one native call, so h2's 16 KB data frames don't pay a GVL
-    round-trip each — h2 uploads run at HTTP/1 parity, and chunked
+    round-trip each—h2 uploads run at HTTP/1 parity, and chunked
     HTTP/1 uploads got faster too.
   - `MAX_CONCURRENT_STREAMS` advertised from worker-slot capacity, so
     an h2-aware balancer sees the server's real admission and a single
@@ -22,16 +22,27 @@
     deadline.
   - Interned header values: low-cardinality headers (user-agent,
     accept-*, sec-ch-*) reuse one frozen string instead of allocating
-    per request — the env-side analogue of HPACK's wire dedup, worth a
+    per request—the env-side analogue of HPACK's wire dedup, worth a
     few percent on header-heavy traffic and 6-8 fewer allocations per
     request, on HTTP/1 too. Cookies and authorization are deliberately
     never cached.
 
-  Measured (doc/benchmarks.md): native h2 is ~+50% over HTTP/1.1 on
-  the same server and ~+60% over nginx-terminated h2 in front of Kino;
-  ~3× falcon on fast handlers.
+  Measured on the reference box: native h2 is +79% over HTTP/1.1
+  cleartext and 2× over TLS on the same server, +50% over
+  nginx-terminated h2 in front of Kino, ~3× falcon on fast handlers.
 - Leaner request hot path: up to 2-4% more throughput on fast handlers
   with `lanes` (measured on Linux), no change elsewhere.
+- All benchmarks re-measured from scratch on a fresh reference box
+  (c7a.2xlarge, Ruby 4.0.6, Puma 8.0.2): the 2026-06 numbers
+  reproduced within 1-3% at matched configurations, memory to the
+  megabyte. The published tables carry the new run, with two additions
+  and one honest downgrade: new studies for sharded I/O (+1-3% on 8
+  cores, best at `io_threads 8`) and HTTP/2 (above), and a narrower
+  ractor /cpu lead over the cluster (+25%, was +34%) because Puma
+  8.0.2 itself got faster. The bench harness gained the sharded-I/O
+  lanes and the Rails memory comparison, and the methodology notes now
+  record two measurement traps: memory is only comparable after the
+  full endpoint battery, and /io only at equal slot counts.
 
 ## [0.5.0] - 2026-08-29
 
