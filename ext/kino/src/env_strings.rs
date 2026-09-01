@@ -21,6 +21,7 @@ use parking_lot::{Mutex, RwLock};
 /// These maps are probed several times per request; ahash beats the
 /// DoS-resistant default since every key here is our own static data.
 type HashMap<K, V> = std::collections::HashMap<K, V, ahash::RandomState>;
+type HashSet<K> = std::collections::HashSet<K, ahash::RandomState>;
 
 pub struct EnvStrings {
     // keys
@@ -56,6 +57,13 @@ pub struct EnvStrings {
     /// recycles cache slots instead of leaking immortal strings.
     pub hosts: Mutex<lru::LruCache<Vec<u8>, HostEntry, ahash::RandomState>>,
     pub addrs: Mutex<lru::LruCache<IpAddr, CachedStr, ahash::RandomState>>,
+    /// Interned values of low-cardinality headers (see
+    /// [`INTERNABLE_VALUES`]): value bytes -> frozen RString, shared
+    /// across headers that happen to carry the same bytes. Same rooting
+    /// and locking contract as `hosts`/`addrs`.
+    pub values: Mutex<lru::LruCache<Vec<u8>, CachedStr, ahash::RandomState>>,
+    /// The names whose values go through the `values` cache.
+    pub internable: HashSet<&'static str>,
     /// Ractor-shareable defaults provided by the Ruby layer at boot:
     /// the frozen rack.errors writer and the frozen null rack.input.
     pub errors_stream: RwLock<Option<Opaque<Value>>>,
@@ -64,6 +72,41 @@ pub struct EnvStrings {
 
 const HOST_CACHE_CAP: usize = 256;
 const ADDR_CACHE_CAP: usize = 1024;
+const VALUE_CACHE_CAP: usize = 512;
+
+/// Values longer than this are never interned: past it the memcpy into
+/// a fresh Ruby string is cheap relative to the bytes themselves, and
+/// unbounded keys would let one client fill the cache with garbage.
+const VALUE_INTERN_MAX_LEN: usize = 512;
+
+/// Headers whose values are effectively enums or per-install constants
+/// (a browser resends the same UA, accept-*, and sec-ch-* on every
+/// request), so caching kills an allocation + copy per header per
+/// request — the env-side analogue of what HPACK does on the wire.
+/// Deliberately absent: `cookie` and `authorization` (per-user
+/// cardinality would churn the cache, and secrets should not outlive
+/// their request in an evict-to-free cache), `referer`/`x-request-id`
+/// and friends (unbounded cardinality).
+const INTERNABLE_VALUES: &[&str] = &[
+    "user-agent",
+    "accept",
+    "accept-encoding",
+    "accept-language",
+    "cache-control",
+    "dnt",
+    "origin",
+    "pragma",
+    "priority",
+    "sec-ch-ua",
+    "sec-ch-ua-mobile",
+    "sec-ch-ua-platform",
+    "sec-fetch-dest",
+    "sec-fetch-mode",
+    "sec-fetch-site",
+    "sec-fetch-user",
+    "upgrade-insecure-requests",
+    "x-requested-with",
+];
 
 /// One hosts-cache entry: the frozen SERVER_NAME/SERVER_PORT pair, plus
 /// the frozen full authority ("host[:port]" as sent) used as the
@@ -93,6 +136,16 @@ unsafe impl Sync for CachedStr {}
 impl CachedStr {
     fn new(ruby: &Ruby, s: &str) -> Self {
         let string = ruby.str_new(s);
+        string.freeze();
+        CachedStr(magnus::value::BoxValue::new(string))
+    }
+
+    /// Header values are bytes on the wire (not guaranteed UTF-8), so
+    /// they cache as the same binary strings `str_from_slice` builds on
+    /// the uncached path — interning must not change the encoding an
+    /// app observes.
+    fn new_from_slice(ruby: &Ruby, bytes: &[u8]) -> Self {
+        let string = ruby.str_from_slice(bytes);
         string.freeze();
         CachedStr(magnus::value::BoxValue::new(string))
     }
@@ -220,6 +273,11 @@ pub fn init(ruby: &Ruby) {
             std::num::NonZeroUsize::new(ADDR_CACHE_CAP).unwrap(),
             ahash::RandomState::new(),
         )),
+        values: Mutex::new(lru::LruCache::with_hasher(
+            std::num::NonZeroUsize::new(VALUE_CACHE_CAP).unwrap(),
+            ahash::RandomState::new(),
+        )),
+        internable: INTERNABLE_VALUES.iter().copied().collect(),
         errors_stream: RwLock::new(None),
         null_input: RwLock::new(None),
     };
@@ -328,6 +386,35 @@ pub fn set_authority_env(
     env.aset(ruby.get_inner(s.server_port), port)?;
     let host_key = *s.header_names.get("host").expect("host is a common header");
     env.aset(ruby.get_inner(host_key), host)?;
+    Ok(())
+}
+
+/// Set one header's value on `env` under `key`: through the interned
+/// value cache when the header qualifies (low-cardinality name, bounded
+/// length), else a fresh per-request string. The cached aset happens
+/// under the cache lock; see CachedStr's safety contract.
+pub fn set_value_env(
+    ruby: &Ruby,
+    env: magnus::RHash,
+    key: RString,
+    name: &str,
+    value: &[u8],
+) -> Result<(), magnus::Error> {
+    let s = get();
+    if value.len() > VALUE_INTERN_MAX_LEN || !s.internable.contains(name) {
+        return env.aset(key, ruby.str_from_slice(value));
+    }
+    let mut values = s.values.lock();
+    let cached = match values.get(value) {
+        Some(cached) => cached.get(),
+        None => {
+            let entry = CachedStr::new_from_slice(ruby, value);
+            let string = entry.get();
+            values.put(value.to_vec(), entry); // may evict + free an old value
+            string
+        }
+    };
+    env.aset(key, cached)?;
     Ok(())
 }
 

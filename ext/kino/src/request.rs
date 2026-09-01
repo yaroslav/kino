@@ -184,11 +184,24 @@ pub fn build_env(ruby: &Ruby, ctx: &RequestCtx) -> Result<RHash, Error> {
     }
 
     for name in ctx.headers.keys() {
-        // Single-value fast path (the overwhelming majority).
+        let key = if *name == http::header::CONTENT_TYPE {
+            live(s.content_type)
+        } else if *name == http::header::CONTENT_LENGTH {
+            live(s.content_length)
+        } else {
+            match s.header_names.get(name.as_str()) {
+                Some(cached) => live(*cached),
+                None => ruby.str_new(&env_strings::cgi_name(name.as_str())),
+            }
+        };
+
+        // Single-value fast path (the overwhelming majority); the value
+        // cache turns low-cardinality repeats (UA, accept-*, sec-ch-*)
+        // into a lookup of one frozen string instead of an allocation.
         let mut values = ctx.headers.get_all(name).iter();
         let first = values.next().map(|v| v.as_bytes()).unwrap_or(b"");
-        let value = match values.next() {
-            None => ruby.str_from_slice(first),
+        match values.next() {
+            None => env_strings::set_value_env(ruby, env, key, name.as_str(), first)?,
             Some(second) => {
                 let sep: &[u8] = if name == http::header::COOKIE {
                     b"; "
@@ -205,21 +218,9 @@ pub fn build_env(ruby: &Ruby, ctx: &RequestCtx) -> Result<RHash, Error> {
                     joined.extend_from_slice(sep);
                     joined.extend_from_slice(v.as_bytes());
                 }
-                ruby.str_from_slice(&joined)
+                env.aset(key, ruby.str_from_slice(&joined))?;
             }
-        };
-
-        let key = if *name == http::header::CONTENT_TYPE {
-            live(s.content_type)
-        } else if *name == http::header::CONTENT_LENGTH {
-            live(s.content_length)
-        } else {
-            match s.header_names.get(name.as_str()) {
-                Some(cached) => live(*cached),
-                None => ruby.str_new(&env_strings::cgi_name(name.as_str())),
-            }
-        };
-        env.aset(key, value)?;
+        }
     }
 
     // SERVER_NAME/SERVER_PORT/HTTP_HOST, best source first: the request
