@@ -366,21 +366,42 @@ const HEADER_READ_TIMEOUT: Duration = Duration::from_secs(15);
 /// the request head is being read, so it adds no per-response cost on
 /// the hot path. The h2 side gets a timer too so its own timed
 /// machinery (keep-alive, shutdown deadlines) can fire if ever enabled.
-fn conn_builder(http2: bool) -> auto::Builder<TokioExecutor> {
+/// SETTINGS_MAX_CONCURRENT_STREAMS, derived from worker-slot capacity
+/// (workers × threads) instead of hyper's flat 200. Two jobs: an
+/// h2-aware balancer sees the server's real admission and spreads
+/// streams across upstream connections instead of queueing blind, and a
+/// hostile client can't multiply one connection into 200 queued
+/// requests. The floor keeps tiny topologies browser-friendly (one
+/// page's fetches still parallelize; excess streams just queue), the
+/// cap bounds per-connection bookkeeping, and an unknown topology (an
+/// embedder passing zeros) keeps hyper's default.
+fn advertised_streams(workers: usize, threads: usize) -> u32 {
+    let slots = workers.saturating_mul(threads);
+    if slots == 0 {
+        return 200;
+    }
+    slots.clamp(8, 1024) as u32
+}
+
+fn conn_builder(http2: bool, max_streams: u32) -> auto::Builder<TokioExecutor> {
     let mut builder = auto::Builder::new(TokioExecutor::new());
     builder
         .http1()
         .timer(TokioTimer::new())
         .header_read_timeout(HEADER_READ_TIMEOUT)
         .auto_date_header(false);
-    // hyper's h2 defaults (16 KB frames, 1 MB windows) stay: a knob sweep
-    // (frame size 64K/256K, adaptive windows, 4/8 MB windows) moved the
-    // upload lane nowhere or slightly down once read_body coalesced its
-    // channel drain — the crossings were the cost, not the codec.
+    // Beyond the stream cap, hyper's h2 defaults (16 KB frames, 1 MB
+    // windows) stay: a knob sweep (frame size 64K/256K, adaptive
+    // windows, 4/8 MB windows) moved the upload lane nowhere or slightly
+    // down once read_body coalesced its channel drain — the crossings
+    // were the cost, not the codec. The codec's abuse bounds also ship
+    // as defaults: 16 KB header lists, 20 pending remote resets then
+    // GOAWAY (rapid reset), reset-churn and empty-frame budgets.
     builder
         .http2()
         .timer(TokioTimer::new())
-        .auto_date_header(false);
+        .auto_date_header(false)
+        .max_concurrent_streams(max_streams);
     if http2 {
         builder
     } else {
@@ -397,9 +418,10 @@ async fn serve_connection<I>(
     I: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static,
 {
     let http2 = server.http2;
+    let max_streams = advertised_streams(server.topology.workers, server.topology.threads);
     let service =
         service_fn(move |req| handle_request(server.clone(), remote_addr, local_addr, req));
-    let _ = conn_builder(http2)
+    let _ = conn_builder(http2, max_streams)
         .serve_connection(TokioIo::new(io), service)
         .await;
 }
@@ -1014,7 +1036,7 @@ mod tests {
         // reads the preface as a malformed request line.
         let (client_io, server_io) = tokio::io::duplex(64 * 1024);
         tokio::spawn(async move {
-            let _ = conn_builder(false)
+            let _ = conn_builder(false, 200)
                 .serve_connection(TokioIo::new(server_io), stub())
                 .await;
         });
@@ -1037,7 +1059,7 @@ mod tests {
         // The same pinned builder serves a plain h1 client.
         let (client_io, server_io) = tokio::io::duplex(64 * 1024);
         tokio::spawn(async move {
-            let _ = conn_builder(false)
+            let _ = conn_builder(false, 200)
                 .serve_connection(TokioIo::new(server_io), stub())
                 .await;
         });
@@ -1206,6 +1228,106 @@ mod tests {
         assert_eq!(&two[..], b"two\n");
         let order = worker.await.expect("worker assertions");
         assert_eq!(order, ["/two".to_string(), "/one".to_string()]);
+    }
+
+    #[test]
+    fn advertised_streams_tracks_slot_capacity() {
+        // Slot capacity, floored for tiny topologies and capped.
+        assert_eq!(advertised_streams(8, 3), 24);
+        assert_eq!(advertised_streams(2, 1), 8, "floor");
+        assert_eq!(advertised_streams(64, 32), 1024, "cap");
+        // Unknown topology (embedder passing zeros): hyper's default.
+        assert_eq!(advertised_streams(0, 0), 200);
+        assert_eq!(advertised_streams(8, 0), 200);
+    }
+
+    #[tokio::test]
+    async fn streams_beyond_the_advertised_cap_queue_instead_of_failing() {
+        use http_body_util::Full;
+        use hyper::service::service_fn;
+
+        // Cap of 2: six concurrent requests must all complete — the h2
+        // client holds excess streams locally until the server frees a
+        // slot; nothing is refused or reset.
+        let (client_io, server_io) = tokio::io::duplex(64 * 1024);
+        tokio::spawn(async move {
+            let stub = service_fn(|_req: hyper::Request<hyper::body::Incoming>| async {
+                Ok::<_, std::convert::Infallible>(plain_response(200, "capped\n"))
+            });
+            let _ = conn_builder(true, 2)
+                .serve_connection(TokioIo::new(server_io), stub)
+                .await;
+        });
+        let (mut sender, conn) = hyper::client::conn::http2::handshake(
+            hyper_util::rt::TokioExecutor::new(),
+            TokioIo::new(client_io),
+        )
+        .await
+        .expect("h2 handshake");
+        tokio::spawn(conn);
+        let mut requests = Vec::new();
+        for i in 0..6 {
+            let request = hyper::Request::builder()
+                .uri(format!("http://kino.test/{i}"))
+                .body(Full::new(bytes::Bytes::new()))
+                .expect("request");
+            requests.push(sender.send_request(request));
+        }
+        for request in requests {
+            let response = request.await.expect("queued stream served");
+            assert_eq!(response.status(), 200);
+        }
+    }
+
+    #[tokio::test]
+    async fn rapid_stream_resets_do_not_wedge_the_pipeline() {
+        use http_body_util::{BodyExt, Full};
+
+        let server = test_server(false, 64);
+        let client_io = spawn_conn(server.clone());
+
+        // A worker that answers everything it sees until told to stop;
+        // answers to already-reset streams just vanish, as in production.
+        let worker = tokio::spawn(async move {
+            loop {
+                let Ok(ctx) = server.req_rx.recv_async().await else {
+                    break;
+                };
+                let done = ctx.uri.path() == "/done";
+                ctx.responder.send_response(plain_response(200, "ok\n"));
+                if done {
+                    break;
+                }
+            }
+        });
+
+        let (mut sender, conn) = hyper::client::conn::http2::handshake(
+            hyper_util::rt::TokioExecutor::new(),
+            TokioIo::new(client_io),
+        )
+        .await
+        .expect("h2 handshake");
+        tokio::spawn(conn);
+
+        // Fire-and-cancel: dropping the response future resets the
+        // stream. The codec bounds reset churn; the server must keep
+        // serving afterwards.
+        for i in 0..40 {
+            let request = hyper::Request::builder()
+                .uri(format!("http://kino.test/cancel/{i}"))
+                .body(Full::new(bytes::Bytes::new()))
+                .expect("request");
+            drop(sender.send_request(request));
+        }
+        let request = hyper::Request::builder()
+            .uri("http://kino.test/done")
+            .body(Full::new(bytes::Bytes::new()))
+            .expect("request");
+        let response = sender.send_request(request).await.expect("still served");
+        assert_eq!(response.status(), 200);
+        let body = response.into_body().collect().await.expect("body");
+        assert_eq!(&body.to_bytes()[..], b"ok\n");
+        worker.await.expect("worker loop");
     }
 
     #[tokio::test(start_paused = true)]
