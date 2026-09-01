@@ -1,4 +1,4 @@
-## [Unreleased]
+## [0.6.0] - 2026-09-01
 
 - HTTP/2 support. Kino now speaks HTTP/2 natively, on by default:
   browsers negotiate it over TLS (ALPN), h2-preferring balancers and

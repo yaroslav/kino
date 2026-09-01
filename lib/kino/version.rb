@@ -2,5 +2,5 @@
 
 module Kino
   # The gem version (single source of truth; ext/kino/Cargo.toml syncs).
-  VERSION = "0.5.0"
+  VERSION = "0.6.0"
 end
