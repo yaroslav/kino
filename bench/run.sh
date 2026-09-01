@@ -83,7 +83,7 @@ run_target() {
   stop_target "$pid"
 }
 
-for variant in ractor ractor-lanes threaded; do
+for variant in ractor ractor-lanes ractor-shards threaded; do
   run_target "kino-$variant" bundle exec ruby bench/kino_server.rb "$variant" "$PORT" "$CORES" 3
 done
 run_target "puma" bundle exec puma -q -w "$CORES" -t 3:3 -p "$PORT" bench/config.ru

@@ -3,7 +3,7 @@
 # right after bench/run.sh: CPU recipe, topology sweep, /io worker scaling,
 # logging costs, and memory footprint.
 # Usage: bench/studies.sh [duration_seconds] [concurrency] [section]
-#   section: all (default) | cpu | topology | io | logging | memory
+#   section: all (default) | cpu | topology | io | shards | logging | memory
 set -u
 cd "$(dirname "$0")/.."
 
@@ -180,12 +180,24 @@ section_memory() {
   mem_case "puma-cluster" -- bundle exec puma -q -w "$CORES" -t 3:3 -p "$PORT" bench/config.ru
 }
 
+section_shards() {
+  echo "=== Sharded I/O (io_shards true, ractor mode) ==="
+  run_case "kino-ractor-8x3" /plaintext -- bundle exec ruby bench/kino_server.rb ractor "$PORT" "$CORES" 3
+  run_case "kino-shards-default" /plaintext -- bundle exec ruby bench/kino_server.rb ractor-shards "$PORT" "$CORES" 3
+  run_case "kino-shards-default-10k" /10k -- bundle exec ruby bench/kino_server.rb ractor-shards "$PORT" "$CORES" 3
+  # io_threads sweep ("-" skips the tokio_threads positional).
+  run_case "kino-shards-io2" /plaintext -- bundle exec ruby bench/kino_server.rb ractor-shards "$PORT" "$CORES" 3 - 2
+  run_case "kino-shards-io4" /plaintext -- bundle exec ruby bench/kino_server.rb ractor-shards "$PORT" "$CORES" 3 - 4
+  run_case "kino-shards-io8" /plaintext -- bundle exec ruby bench/kino_server.rb ractor-shards "$PORT" "$CORES" 3 - 8
+}
+
 case "$ONLY" in
-  all)      section_cpu; section_topology; section_io; section_logging; section_memory ;;
+  all)      section_cpu; section_topology; section_io; section_shards; section_logging; section_memory ;;
   cpu)      section_cpu ;;
   topology) section_topology ;;
   io)       section_io ;;
+  shards)   section_shards ;;
   logging)  section_logging ;;
   memory)   section_memory ;;
-  *) echo "unknown section: $ONLY (want: all|cpu|topology|io|logging|memory)" >&2; exit 1 ;;
+  *) echo "unknown section: $ONLY (want: all|cpu|topology|io|shards|logging|memory)" >&2; exit 1 ;;
 esac

@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # HTTP/2 head-to-head: kino's native h2 against falcon (the other
 # h2-native Ruby server) and against the classic pattern for servers
-# without h2 — nginx terminating h2 and proxying HTTP/1.1 upstream
+# without h2: nginx terminating h2 and proxying HTTP/1.1 upstream
 # (puma; plus kino-h1 behind the same nginx as the proxy-cost control).
 # The h2-enabled kino boot also serves the --h1 lanes, so the h2-vs-h1
 # codec delta comes from one process, not two boots.
