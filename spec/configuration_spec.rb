@@ -61,6 +61,7 @@ RSpec.describe Kino::Configuration do
       io_threads 6
       tokio_threads 4
       tls cert: "cert.pem", key: "key.pem"
+      http2 false
     CONFIG
 
     config = described_class.new.load_file(path)
@@ -77,6 +78,11 @@ RSpec.describe Kino::Configuration do
     expect(config[:io_threads]).to eq(6)
     expect(config[:tokio_threads]).to eq(4)
     expect(config[:tls]).to eq(cert: "cert.pem", key: "key.pem")
+    expect(config[:http2]).to eq(false)
+  end
+
+  it "defaults http2 to on" do
+    expect(described_class.new.to_h[:http2]).to eq(true)
   end
 
   it "validates native I/O thread count" do
