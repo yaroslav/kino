@@ -9,7 +9,8 @@ use std::time::Duration;
 
 use http_body_util::BodyExt;
 use hyper::service::service_fn;
-use hyper_util::rt::TokioIo;
+use hyper_util::rt::{TokioExecutor, TokioIo, TokioTimer};
+use hyper_util::server::conn::auto;
 use magnus::{Error, Ruby};
 use parking_lot::{Mutex, RwLock};
 
@@ -62,6 +63,8 @@ pub fn server_start(ruby: &Ruby, config: magnus::RHash) -> Result<(u64, u16, Opt
     let tls_cert: Option<String> = cfg_opt(ruby, config, "tls_cert")?;
     let tls_key: Option<String> = cfg_opt(ruby, config, "tls_key")?;
     let lanes: bool = cfg_opt(ruby, config, "lanes")?.unwrap_or(false);
+    // Default true guards embedders calling the native layer directly.
+    let http2: bool = cfg_opt(ruby, config, "http2")?.unwrap_or(true);
     let log_requests: bool = cfg_opt(ruby, config, "log_requests")?.unwrap_or(false);
     let mode: String = cfg_opt(ruby, config, "mode")?.unwrap_or_else(|| "threaded".to_string());
     let workers: usize = cfg_opt(ruby, config, "workers")?.unwrap_or(0);
@@ -69,7 +72,7 @@ pub fn server_start(ruby: &Ruby, config: magnus::RHash) -> Result<(u64, u16, Opt
     let batch: usize = cfg_opt(ruby, config, "batch")?.unwrap_or(1);
     let acceptor = match (&tls_cert, &tls_key) {
         (Some(cert), Some(key)) => Some(
-            crate::tls::build_acceptor(cert, key)
+            crate::tls::build_acceptor(cert, key, http2)
                 .map_err(|e| Error::new(ruby.exception_runtime_error(), format!("TLS: {e}")))?,
         ),
         (None, None) => None,
@@ -134,6 +137,7 @@ pub fn server_start(ruby: &Ruby, config: magnus::RHash) -> Result<(u64, u16, Opt
             batch,
         },
         https: acceptor.is_some(),
+        http2,
         unix_path,
         access_log: log_requests.then(|| crate::logsink::Sink::new(std::io::stdout())),
         lanes,
@@ -340,8 +344,49 @@ pub(crate) async fn serve_conn(
 /// headers within this window. Long enough never to trip a real client (even
 /// on a slow mobile link), short enough to reap a stalled one. Deliberately a
 /// constant, not a config knob: fine-tuning intake limits is the fronting
-/// proxy's job; the actual hazard was having no default at all.
+/// proxy's job; the actual hazard was having no default at all. Guards the
+/// HTTP/1 side only: h2 intake is bounded by the TLS-handshake timeout and
+/// the h2 codec's own SETTINGS handling.
 const HEADER_READ_TIMEOUT: Duration = Duration::from_secs(15);
+
+/// The connection builder every data-plane connection is served with,
+/// in both accept topologies. `http2: true` is the protocol-auto shape:
+/// ALPN-negotiated h2 over TLS, prior-knowledge h2c on plaintext (the
+/// builder sniffs the 24-byte preface once per connection), HTTP/1.x
+/// for everything else. `http2: false` pins the HTTP/1 codec: no sniff,
+/// same wire behavior as a server built without h2.
+///
+/// No auto Date header on either protocol: it costs a clock read per
+/// response (together with timer reads, ~7% of tokio-side cycles in the
+/// profile); it's a SHOULD not a MUST, and apps that need it can set it
+/// themselves.
+///
+/// The http1 timer is installed so header_read_timeout actually fires:
+/// hyper's slow-header guard is inert without one. It arms only while
+/// the request head is being read, so it adds no per-response cost on
+/// the hot path. The h2 side gets a timer too so its own timed
+/// machinery (keep-alive, shutdown deadlines) can fire if ever enabled.
+fn conn_builder(http2: bool) -> auto::Builder<TokioExecutor> {
+    let mut builder = auto::Builder::new(TokioExecutor::new());
+    builder
+        .http1()
+        .timer(TokioTimer::new())
+        .header_read_timeout(HEADER_READ_TIMEOUT)
+        .auto_date_header(false);
+    // hyper's h2 defaults (16 KB frames, 1 MB windows) stay: a knob sweep
+    // (frame size 64K/256K, adaptive windows, 4/8 MB windows) moved the
+    // upload lane nowhere or slightly down once read_body coalesced its
+    // channel drain — the crossings were the cost, not the codec.
+    builder
+        .http2()
+        .timer(TokioTimer::new())
+        .auto_date_header(false);
+    if http2 {
+        builder
+    } else {
+        builder.http1_only()
+    }
+}
 
 async fn serve_connection<I>(
     io: I,
@@ -351,19 +396,10 @@ async fn serve_connection<I>(
 ) where
     I: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static,
 {
+    let http2 = server.http2;
     let service =
         service_fn(move |req| handle_request(server.clone(), remote_addr, local_addr, req));
-    // No auto Date header: it costs a clock read per response (together
-    // with timer reads, ~7% of tokio-side cycles in the profile); it's a
-    // SHOULD not a MUST, and apps that need it can set it themselves.
-    //
-    // The timer is installed so header_read_timeout actually fires: hyper's
-    // slow-header guard is inert without one. It arms only while the request
-    // head is being read, so it adds no per-response cost on the hot path.
-    let _ = hyper::server::conn::http1::Builder::new()
-        .timer(hyper_util::rt::TokioTimer::new())
-        .header_read_timeout(HEADER_READ_TIMEOUT)
-        .auto_date_header(false)
+    let _ = conn_builder(http2)
         .serve_connection(TokioIo::new(io), service)
         .await;
 }
@@ -465,6 +501,9 @@ async fn handle_request(
                         break;
                     }
                 };
+                // Non-data frames (h2 trailers) are dropped by design:
+                // Rack has no trailer surface. DATA frames around them
+                // still forward, and hyper reports EOF right after.
                 if let Ok(data) = frame.into_data() {
                     total += data.len() as u64;
                     if max_body > 0 && total > max_body as u64 {
@@ -852,6 +891,350 @@ mod tests {
     use super::*;
     use crate::registry::{test_server, LANE_DEPTH};
     use crate::request::test_ctx;
+
+    /// Serve one real connection through the production `serve_connection`
+    /// over an in-memory pipe, against a queue the test consumes itself (a
+    /// stand-in for the Ruby worker). Returns the client end.
+    fn spawn_conn(server: Arc<ServerInner>) -> tokio::io::DuplexStream {
+        let (client_io, server_io) = tokio::io::duplex(64 * 1024);
+        tokio::spawn(serve_connection(
+            server_io,
+            server,
+            "127.0.0.1:40000".parse().expect("static addr"),
+            "127.0.0.1:9292".parse().expect("static addr"),
+        ));
+        client_io
+    }
+
+    async fn take_ctx(server: &Arc<ServerInner>) -> BoxedCtx {
+        server.req_rx.recv_async().await.expect("a queued request")
+    }
+
+    /// Read the request body the way a worker does: leftover first, then
+    /// the forwarder channel until the sender drops (EOF).
+    async fn drain_body(ctx: &mut RequestCtx) -> Vec<u8> {
+        let mut out = Vec::new();
+        if let Some(leftover) = ctx.leftover.take() {
+            out.extend_from_slice(&leftover);
+        }
+        if let Some(rx) = &ctx.body_rx {
+            while let Ok(chunk) = rx.recv_async().await {
+                out.extend_from_slice(&chunk);
+            }
+        }
+        out
+    }
+
+    #[tokio::test]
+    async fn h2c_prior_knowledge_reaches_the_queue_as_http2() {
+        use http_body_util::{BodyExt, Full};
+
+        let server = test_server(false, 4);
+        let client_io = spawn_conn(server.clone());
+
+        let worker = tokio::spawn(async move {
+            let ctx = take_ctx(&server).await;
+            assert_eq!(ctx.version, http::Version::HTTP_2);
+            // The :authority pseudo-header arrives in the URI, where
+            // build_env picks it up; no Host header exists on h2.
+            assert_eq!(
+                ctx.uri.authority().map(|a| a.as_str()),
+                Some("kino.test:8443")
+            );
+            assert!(ctx.headers.get(http::header::HOST).is_none());
+            assert!(ctx.responder.send_response(plain_response(200, "ok\n")));
+        });
+
+        let (mut sender, conn) = hyper::client::conn::http2::handshake(
+            hyper_util::rt::TokioExecutor::new(),
+            TokioIo::new(client_io),
+        )
+        .await
+        .expect("h2c prior-knowledge handshake");
+        tokio::spawn(conn);
+        let request = hyper::Request::builder()
+            .uri("http://kino.test:8443/")
+            .body(Full::new(bytes::Bytes::new()))
+            .expect("request");
+        let response = sender.send_request(request).await.expect("h2 response");
+        assert_eq!(response.status(), 200);
+        assert_eq!(
+            response.headers().get("server").expect("branded"),
+            "Kino",
+            "responses stay branded over h2"
+        );
+        let body = response.into_body().collect().await.expect("body");
+        assert_eq!(&body.to_bytes()[..], b"ok\n");
+        worker.await.expect("worker assertions");
+    }
+
+    #[tokio::test]
+    async fn h1_is_still_served_by_the_auto_builder() {
+        use http_body_util::{BodyExt, Full};
+
+        let server = test_server(false, 4);
+        let client_io = spawn_conn(server.clone());
+
+        let worker = tokio::spawn(async move {
+            let ctx = take_ctx(&server).await;
+            assert_eq!(ctx.version, http::Version::HTTP_11);
+            assert!(ctx.responder.send_response(plain_response(200, "h1\n")));
+        });
+
+        let (mut sender, conn) = hyper::client::conn::http1::handshake(TokioIo::new(client_io))
+            .await
+            .expect("h1 handshake");
+        tokio::spawn(conn);
+        let request = hyper::Request::builder()
+            .uri("/")
+            .header("host", "kino.test")
+            .body(Full::new(bytes::Bytes::new()))
+            .expect("request");
+        let response = sender.send_request(request).await.expect("h1 response");
+        assert_eq!(response.status(), 200);
+        let body = response.into_body().collect().await.expect("body");
+        assert_eq!(&body.to_bytes()[..], b"h1\n");
+        worker.await.expect("worker assertions");
+    }
+
+    #[tokio::test]
+    async fn http2_off_refuses_the_preface_but_serves_h1() {
+        use http_body_util::{BodyExt, Full};
+        use hyper::service::service_fn;
+
+        // Driven at the builder seam: conn_builder(false) is what a
+        // ServerInner with http2 off serves every connection with.
+        let stub = || {
+            service_fn(|_req: hyper::Request<hyper::body::Incoming>| async {
+                Ok::<_, std::convert::Infallible>(plain_response(200, "pinned\n"))
+            })
+        };
+
+        // An h2 prior-knowledge client must fail: the pinned h1 codec
+        // reads the preface as a malformed request line.
+        let (client_io, server_io) = tokio::io::duplex(64 * 1024);
+        tokio::spawn(async move {
+            let _ = conn_builder(false)
+                .serve_connection(TokioIo::new(server_io), stub())
+                .await;
+        });
+        let refused = async {
+            let (mut sender, conn) = hyper::client::conn::http2::handshake(
+                hyper_util::rt::TokioExecutor::new(),
+                TokioIo::new(client_io),
+            )
+            .await?;
+            tokio::spawn(conn);
+            let request = hyper::Request::builder()
+                .uri("http://kino.test/")
+                .body(Full::new(bytes::Bytes::new()))?;
+            sender.send_request(request).await?;
+            Ok::<_, Box<dyn std::error::Error>>(())
+        }
+        .await;
+        assert!(refused.is_err(), "h2 must not be served when pinned to h1");
+
+        // The same pinned builder serves a plain h1 client.
+        let (client_io, server_io) = tokio::io::duplex(64 * 1024);
+        tokio::spawn(async move {
+            let _ = conn_builder(false)
+                .serve_connection(TokioIo::new(server_io), stub())
+                .await;
+        });
+        let (mut sender, conn) = hyper::client::conn::http1::handshake(TokioIo::new(client_io))
+            .await
+            .expect("h1 handshake");
+        tokio::spawn(conn);
+        let request = hyper::Request::builder()
+            .uri("/")
+            .header("host", "kino.test")
+            .body(Full::new(bytes::Bytes::new()))
+            .expect("request");
+        let response = sender.send_request(request).await.expect("h1 response");
+        assert_eq!(response.status(), 200);
+        let body = response.into_body().collect().await.expect("body");
+        assert_eq!(&body.to_bytes()[..], b"pinned\n");
+    }
+
+    #[tokio::test]
+    async fn h2_upload_forwards_data_and_drops_trailers() {
+        use http_body_util::{BodyExt, StreamBody};
+        use hyper::body::Frame;
+
+        let server = test_server(false, 4);
+        let client_io = spawn_conn(server.clone());
+
+        let worker = tokio::spawn(async move {
+            let mut ctx = take_ctx(&server).await;
+            assert_eq!(ctx.version, http::Version::HTTP_2);
+            let body = drain_body(&mut ctx).await;
+            assert_eq!(&body[..], b"hello world");
+            assert!(
+                ctx.responder.body_abandoned().is_none(),
+                "a trailer frame must not abort the body read"
+            );
+            let response = hyper::Response::builder()
+                .status(200)
+                .body(crate::response::full_body(bytes::Bytes::from(
+                    body.len().to_string(),
+                )))
+                .expect("response");
+            assert!(ctx.responder.send_response(response));
+        });
+
+        let (frames_tx, frames_rx) =
+            flume::bounded::<Result<Frame<bytes::Bytes>, std::io::Error>>(4);
+        frames_tx
+            .send(Ok(Frame::data(bytes::Bytes::from_static(b"hello "))))
+            .expect("frame");
+        frames_tx
+            .send(Ok(Frame::data(bytes::Bytes::from_static(b"world"))))
+            .expect("frame");
+        let mut trailers = http::HeaderMap::new();
+        trailers.insert("x-checksum", "ignored".parse().expect("value"));
+        frames_tx
+            .send(Ok(Frame::trailers(trailers)))
+            .expect("frame");
+        drop(frames_tx); // EOS
+
+        let (mut sender, conn) = hyper::client::conn::http2::handshake(
+            hyper_util::rt::TokioExecutor::new(),
+            TokioIo::new(client_io),
+        )
+        .await
+        .expect("h2 handshake");
+        tokio::spawn(conn);
+        let request = hyper::Request::builder()
+            .method("POST")
+            .uri("http://kino.test/upload")
+            .body(StreamBody::new(frames_rx.into_stream()))
+            .expect("request");
+        let response = sender.send_request(request).await.expect("h2 response");
+        assert_eq!(response.status(), 200);
+        let body = response.into_body().collect().await.expect("body");
+        assert_eq!(&body.to_bytes()[..], b"11");
+        worker.await.expect("worker assertions");
+    }
+
+    #[tokio::test]
+    async fn h2_streaming_response_arrives_chunked() {
+        use http_body_util::{BodyExt, Full};
+
+        let server = test_server(false, 4);
+        let client_io = spawn_conn(server.clone());
+
+        let worker = tokio::spawn(async move {
+            let ctx = take_ctx(&server).await;
+            let started = ctx
+                .responder
+                .send_stream_head(hyper::Response::builder().status(200))
+                .expect("valid head");
+            assert!(started);
+            let frames = ctx.responder.body_sender().expect("open stream");
+            for chunk in [&b"alpha "[..], &b"beta "[..], &b"gamma"[..]] {
+                frames
+                    .send_async(Ok(hyper::body::Frame::data(bytes::Bytes::from_static(
+                        chunk,
+                    ))))
+                    .await
+                    .expect("chunk accepted");
+            }
+            ctx.responder.finish_stream();
+        });
+
+        let (mut sender, conn) = hyper::client::conn::http2::handshake(
+            hyper_util::rt::TokioExecutor::new(),
+            TokioIo::new(client_io),
+        )
+        .await
+        .expect("h2 handshake");
+        tokio::spawn(conn);
+        let request = hyper::Request::builder()
+            .uri("http://kino.test/stream")
+            .body(Full::new(bytes::Bytes::new()))
+            .expect("request");
+        let response = sender.send_request(request).await.expect("h2 response");
+        assert_eq!(response.status(), 200);
+        let body = response.into_body().collect().await.expect("body");
+        assert_eq!(&body.to_bytes()[..], b"alpha beta gamma");
+        worker.await.expect("worker assertions");
+    }
+
+    #[tokio::test]
+    async fn h2_multiplexes_concurrent_streams_into_the_queue() {
+        use http_body_util::{BodyExt, Full};
+
+        let server = test_server(false, 4);
+        let client_io = spawn_conn(server.clone());
+
+        // Both streams must be queued before either is answered — that is
+        // multiplexing observable at the worker boundary — and answering
+        // them in reverse order proves stream completion is not FIFO.
+        let worker = tokio::spawn(async move {
+            let first = take_ctx(&server).await;
+            let second = take_ctx(&server).await;
+            let order = [second.uri.path().to_string(), first.uri.path().to_string()];
+            assert!(second.responder.send_response(plain_response(200, "two\n")));
+            assert!(first.responder.send_response(plain_response(200, "one\n")));
+            order
+        });
+
+        let (mut sender, conn) = hyper::client::conn::http2::handshake(
+            hyper_util::rt::TokioExecutor::new(),
+            TokioIo::new(client_io),
+        )
+        .await
+        .expect("h2 handshake");
+        tokio::spawn(conn);
+        let req = |path: &str| {
+            hyper::Request::builder()
+                .uri(format!("http://kino.test{path}"))
+                .body(Full::new(bytes::Bytes::new()))
+                .expect("request")
+        };
+        let (one, two) = tokio::join!(
+            sender.send_request(req("/one")),
+            sender.send_request(req("/two"))
+        );
+        let one = one.expect("first stream");
+        let two = two.expect("second stream");
+        assert_eq!(one.status(), 200);
+        assert_eq!(two.status(), 200);
+        let one = one.into_body().collect().await.expect("body").to_bytes();
+        let two = two.into_body().collect().await.expect("body").to_bytes();
+        assert_eq!(&one[..], b"one\n");
+        assert_eq!(&two[..], b"two\n");
+        let order = worker.await.expect("worker assertions");
+        assert_eq!(order, ["/two".to_string(), "/one".to_string()]);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn header_read_timeout_still_fires_through_the_auto_builder() {
+        use hyper::service::service_fn;
+        use tokio::io::AsyncWriteExt;
+
+        let (mut client_io, server_io) = tokio::io::duplex(64 * 1024);
+        let conn = tokio::spawn(async move {
+            let _ = conn_builder(true)
+                .serve_connection(
+                    TokioIo::new(server_io),
+                    service_fn(|_req: hyper::Request<hyper::body::Incoming>| async {
+                        Ok::<_, std::convert::Infallible>(plain_response(200, "never\n"))
+                    }),
+                )
+                .await;
+        });
+        // A partial h1 request line, then silence: the slow-header guard
+        // must reap the connection (paused clock auto-advances past 15s).
+        client_io
+            .write_all(b"GET / HT")
+            .await
+            .expect("partial write");
+        tokio::time::timeout(Duration::from_secs(60), conn)
+            .await
+            .expect("connection reaped by header_read_timeout")
+            .expect("serve task join");
+    }
 
     #[test]
     fn dispatch_with_no_slots_reports_full() {

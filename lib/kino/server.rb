@@ -109,6 +109,7 @@ module Kino
       if @tls && unix?
         raise ArgumentError, "TLS is not supported on a unix socket bind; terminate TLS at the proxy in front"
       end
+      @http2 = settings.fetch(:http2, true) ? true : false
       @pidfile = settings[:pidfile]
       @control_bind = settings[:control_bind]&.to_s
       @control_token = settings[:control_token]&.to_s
@@ -155,6 +156,7 @@ module Kino
           io_threads: @io_threads,
           tokio_threads: @tokio_threads,
           tls_cert: @tls&.fetch(:cert), tls_key: @tls&.fetch(:key),
+          http2: @http2,
           lanes: @lanes, log_requests: @log_requests,
           mode: @mode.to_s, workers: @workers, threads: @threads, batch: @batch,
           control_bind: @control_bind, control_token: @control_token

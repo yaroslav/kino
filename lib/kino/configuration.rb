@@ -30,6 +30,7 @@ module Kino
       io_threads: nil,
       tokio_threads: nil,
       tls: nil,
+      http2: true,
       environment: nil,
       pidfile: nil,
       control_bind: nil,
@@ -244,6 +245,11 @@ module Kino
 
       # TLS termination; file paths or inline PEM strings.
       def tls(cert:, key:) = @config.set(:tls, {cert: cert, key: key})
+
+      # HTTP/2: negotiated via ALPN on TLS binds, served to
+      # prior-knowledge clients on plaintext. On by default; set false
+      # to serve HTTP/1 only.
+      def http2(enabled = true) = @config.set(:http2, !!enabled)
 
       # Sets RACK_ENV (unless already set) before the CLI loads the app.
       def environment(env) = @config.set(:environment, env.to_s)
