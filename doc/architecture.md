@@ -111,7 +111,7 @@ plain decrement after an `.await` would never run).
 
 `stop_accepting` → every live connection switches to graceful shutdown
 (finish the in-flight request, answer with `Connection: close` on
-HTTP/1 or GOAWAY on h2, take nothing new — so drains converge instead
+HTTP/1 or GOAWAY on h2, take nothing new—so drains converge instead
 of chasing chatty keep-alive clients) → drain until queue + in-flight
 reach zero or the deadline passes → `close_queue` (idle workers see
 Disconnected and exit) →
@@ -141,7 +141,7 @@ connection-ish headers before they can reach the env.
 The upload path needed one h2-shaped fix: `read_body` drains every
 already-queued chunk in a single native call (one GVL round-trip and
 one Ruby string per 64 KB read), because a body arriving as 16 KB DATA
-frames otherwise paid one crossing per frame — that alone took h2
+frames otherwise paid one crossing per frame—that alone took h2
 uploads from half of h1's throughput to parity. A knob sweep over
 hyper's h2 codec (frame size, adaptive windows, window sizes) moved
 nothing after that, so hyper's defaults stay.
@@ -149,21 +149,21 @@ nothing after that, so hyper's defaults stay.
 SETTINGS_MAX_CONCURRENT_STREAMS is derived from slot capacity
 (workers × threads, clamped to [8, 1024]) rather than hyper's flat 200:
 a smart balancer sees the server's true admission, and a hostile client
-cannot multiply one connection into hundreds of queued requests — the
+cannot multiply one connection into hundreds of queued requests—the
 h2 analogue of h1's one-request-per-connection shape. The codec's own
 abuse bounds ship as hyper/h2 defaults and were reviewed: 16 KB header
 lists, 20 pending remote resets then GOAWAY (rapid reset), per-second
 reset-churn and empty-frame budgets.
 
 Low-cardinality header values (UA, accept-*, sec-ch-*, sec-fetch-*)
-are interned in an LRU of frozen strings — the env-side analogue of
+are interned in an LRU of frozen strings—the env-side analogue of
 HPACK's wire dedup, and the practical form of it: hyper does not expose
 HPACK table indices, so the cache keys on value bytes and works for
 HTTP/1 too. Cookie and authorization are deliberately excluded
 (per-user cardinality, secret lifetime).
 
 Deferred until benchmarks justify it: slot-aware flow-control window
-grants (a memory/abuse lever, not a throughput one — the knob sweep
+grants (a memory/abuse lever, not a throughput one—the knob sweep
 showed windows don't gate upload throughput).
 
 ## Timer waits: `Kino.sleep`

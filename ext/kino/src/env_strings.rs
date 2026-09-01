@@ -82,7 +82,7 @@ const VALUE_INTERN_MAX_LEN: usize = 512;
 /// Headers whose values are effectively enums or per-install constants
 /// (a browser resends the same UA, accept-*, and sec-ch-* on every
 /// request), so caching kills an allocation + copy per header per
-/// request — the env-side analogue of what HPACK does on the wire.
+/// request: the env-side analogue of what HPACK does on the wire.
 /// Deliberately absent: `cookie` and `authorization` (per-user
 /// cardinality would churn the cache, and secrets should not outlive
 /// their request in an evict-to-free cache), `referer`/`x-request-id`
@@ -142,7 +142,7 @@ impl CachedStr {
 
     /// Header values are bytes on the wire (not guaranteed UTF-8), so
     /// they cache as the same binary strings `str_from_slice` builds on
-    /// the uncached path — interning must not change the encoding an
+    /// the uncached path; interning must not change the encoding an
     /// app observes.
     fn new_from_slice(ruby: &Ruby, bytes: &[u8]) -> Self {
         let string = ruby.str_from_slice(bytes);

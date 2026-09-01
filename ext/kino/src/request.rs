@@ -366,7 +366,7 @@ impl Request {
         // higher) then costs one GVL round-trip and one Ruby string, not
         // one per frame. Non-blocking: a chunk that has not arrived yet
         // is next call's business, as are EOF and abandonment (try_recv's
-        // Disconnected included — the recv above maps them to errors).
+        // Disconnected included; the recv above maps them to errors).
         let mut assembled: Option<RString> = None;
         if let Some(body_rx) = ctx.body_rx.clone() {
             let mut total = chunk.len();

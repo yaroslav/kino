@@ -393,7 +393,7 @@ fn conn_builder(http2: bool, max_streams: u32) -> auto::Builder<TokioExecutor> {
     // Beyond the stream cap, hyper's h2 defaults (16 KB frames, 1 MB
     // windows) stay: a knob sweep (frame size 64K/256K, adaptive
     // windows, 4/8 MB windows) moved the upload lane nowhere or slightly
-    // down once read_body coalesced its channel drain — the crossings
+    // down once read_body coalesced its channel drain: the crossings
     // were the cost, not the codec. The codec's abuse bounds also ship
     // as defaults: 16 KB header lists, 20 pending remote resets then
     // GOAWAY (rapid reset), reset-churn and empty-frame budgets.
@@ -427,8 +427,8 @@ async fn serve_connection<I>(
     let mut conn = std::pin::pin!(conn);
     // Serve until done, or switch to graceful shutdown when the drain
     // signal fires (stop_accepting): the in-flight request finishes and
-    // the connection then closes — `Connection: close` on HTTP/1,
-    // GOAWAY on h2 — so a balancer moves on instead of feeding a
+    // the connection then closes (`Connection: close` on HTTP/1,
+    // GOAWAY on h2), so a balancer moves on instead of feeding a
     // draining server, and teardown never cuts a response mid-stream.
     // A connection that outlives the drain deadline is still cut by the
     // runtime teardown, as before.
@@ -1214,8 +1214,8 @@ mod tests {
         let server = test_server(false, 4);
         let client_io = spawn_conn(server.clone());
 
-        // Both streams must be queued before either is answered — that is
-        // multiplexing observable at the worker boundary — and answering
+        // Both streams must be queued before either is answered: that is
+        // multiplexing observable at the worker boundary; and answering
         // them in reverse order proves stream completion is not FIFO.
         let worker = tokio::spawn(async move {
             let first = take_ctx(&server).await;
@@ -1315,7 +1315,7 @@ mod tests {
             .expect("h1 handshake");
         tokio::spawn(conn);
 
-        // h1's SendRequest is not Clone: one task drives both requests —
+        // h1's SendRequest is not Clone: one task drives both requests;
         // the in-flight one, then (once it completed, so the drain has
         // been seen) the keep-alive follow-up that must be refused.
         let req = |path: &str| {
@@ -1360,7 +1360,7 @@ mod tests {
         use http_body_util::Full;
         use hyper::service::service_fn;
 
-        // Cap of 2: six concurrent requests must all complete — the h2
+        // Cap of 2: six concurrent requests must all complete; the h2
         // client holds excess streams locally until the server frees a
         // slot; nothing is refused or reset.
         let (client_io, server_io) = tokio::io::duplex(64 * 1024);
