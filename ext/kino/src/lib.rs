@@ -106,6 +106,7 @@ fn init(ruby: &Ruby) -> Result<(), Error> {
     // two worker ractors is the failure mode we must rule out.
     let _ = <Request as magnus::TypedData>::class(ruby);
     let _ = <queue::Worker as magnus::TypedData>::class(ruby);
+    let _ = <pin::PinKeeper as magnus::TypedData>::class(ruby);
 
     // Frozen env key/value cache: built once here (main ractor, GVL held),
     // shared by every worker ractor afterwards.
@@ -116,6 +117,7 @@ fn init(ruby: &Ruby) -> Result<(), Error> {
     native.define_singleton_method("_test_take", function!(test_support::take, 1))?;
     native.define_singleton_method("_test_close", function!(test_support::close, 1))?;
     native.define_singleton_method("_test_panic", function!(test_support::panic_in_release, 0))?;
+    native.define_singleton_method("_test_env_probe", function!(test_support::env_probe, 4))?;
 
     Ok(())
 }

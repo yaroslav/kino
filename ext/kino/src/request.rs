@@ -492,7 +492,7 @@ fn coerce_str(value: Value) -> Result<RString, Error> {
     }
 }
 
-fn split_host_port(host: &str, default_port: u16) -> (String, u16) {
+pub(crate) fn split_host_port(host: &str, default_port: u16) -> (String, u16) {
     match host.rsplit_once(':') {
         Some((name, port)) if !name.is_empty() => match port.parse() {
             Ok(p) => (name.to_string(), p),

@@ -22,6 +22,10 @@
 //! GVL held), release is a single atomic store from whatever tokio
 //! thread drops the buffer, and the mark hook only loads atomics, so
 //! no path takes a lock. A full slab degrades to the copy path.
+//!
+//! The slab is also how env_strings.rs roots its cached env strings (a
+//! second slab, marked through its own keeper), for the same reason: no
+//! GC registration API may be called from parallel ractors.
 
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::Arc;
@@ -50,8 +54,9 @@ extern "C" {
     fn rb_str_tmp_frozen_acquire(orig: rb_sys::VALUE) -> rb_sys::VALUE;
 }
 
-/// GC roots for in-flight response buffers. Slot value 0 = empty (a
-/// VALUE of 0 is Qfalse, which can never be a pinned string).
+/// A fixed slab of atomic VALUE slots, each a pinning GC root while it
+/// is non-zero. Slot value 0 = empty (a VALUE of 0 is Qfalse, which can
+/// never be a rooted string).
 pub struct PinSlab {
     slots: Box<[AtomicU64]>,
     /// Rotating claim cursor: keeps the free-slot scan O(1) amortized.
@@ -59,15 +64,21 @@ pub struct PinSlab {
 }
 
 impl PinSlab {
+    /// A slab for one server's in-flight response buffers.
     pub fn new() -> Self {
+        Self::with_capacity(SLAB_CAPACITY)
+    }
+
+    pub fn with_capacity(capacity: usize) -> Self {
         PinSlab {
-            slots: (0..SLAB_CAPACITY).map(|_| AtomicU64::new(0)).collect(),
+            slots: (0..capacity).map(|_| AtomicU64::new(0)).collect(),
             cursor: AtomicUsize::new(0),
         }
     }
 
-    /// Root `value`; None when the slab is full (caller copies instead).
-    fn insert(&self, value: rb_sys::VALUE) -> Option<usize> {
+    /// Root `value`; None when the slab is full (the caller falls back to
+    /// a copy, or to an uncached string).
+    pub(crate) fn insert(&self, value: rb_sys::VALUE) -> Option<usize> {
         let start = self.cursor.fetch_add(1, Ordering::Relaxed);
         for offset in 0..self.slots.len() {
             let index = (start + offset) % self.slots.len();
@@ -83,7 +94,7 @@ impl PinSlab {
 
     /// Drop the root. Called from tokio threads: a plain atomic store,
     /// no Ruby API. The string stays alive until the next GC sweep.
-    fn release(&self, index: usize) {
+    pub(crate) fn release(&self, index: usize) {
         self.slots[index].store(0, Ordering::SeqCst);
     }
 
@@ -113,9 +124,10 @@ impl PinSlab {
     }
 }
 
-/// The GC-visible face of a server's PinSlab: `Kino::Server` holds one
-/// for its lifetime (surviving worker-ractor crashes), and Ruby's GC
-/// marks every pinned string through it.
+/// The GC-visible face of a PinSlab: Ruby's GC marks every rooted string
+/// through it. `Kino::Server` holds one for its response-buffer slab for
+/// the server's lifetime (surviving worker-ractor crashes); env_strings
+/// registers one for its cache slab as an immortal root at init.
 #[derive(magnus::TypedData)]
 #[magnus(class = "Kino::Native::PinKeeper", free_immediately, mark)]
 pub struct PinKeeper(pub Arc<PinSlab>);

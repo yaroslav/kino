@@ -234,7 +234,7 @@ module Kino
     end
 
     def write_sample(path)
-      require "kino"
+      require "kino" # audition:disable runtime-require
       Configuration.write_sample(path)
       puts "Kino: wrote sample config to #{path}"
       0
@@ -245,8 +245,8 @@ module Kino
 
     # Resolve the full configuration once: file + CLI flag overrides.
     def resolve_config(options)
-      require "kino"
-      require "rack"
+      require "kino" # audition:disable runtime-require
+      require "rack" # audition:disable runtime-require
 
       config_file = options[:config_file] || Configuration.default_path
 
