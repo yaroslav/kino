@@ -379,18 +379,24 @@ pub fn get() -> &'static EnvStrings {
     ENV_STRINGS.get().expect("env_strings::init not called")
 }
 
-/// Called once from lib/kino.rb (main ractor) with the frozen,
-/// Ractor-shareable singletons the Ruby layer owns.
+/// Called once from lib/kino.rb (main ractor) with the Ractor-shareable
+/// singletons the Ruby layer owns. Shareability is the real requirement
+/// (every worker ractor reads them out of its envs), and it is stricter
+/// than frozen: a frozen object whose state is not itself shareable
+/// fails it. `Ractor.shareable?` is `rb_ractor_shareable_p`, which rb-sys
+/// does not bind (it is a static inline).
 pub fn register_defaults(
     ruby: &Ruby,
     errors: Value,
     null_input: Value,
 ) -> Result<(), magnus::Error> {
+    let ractor: Value = ruby.class_object().const_get("Ractor")?;
     for value in [errors, null_input] {
-        if !value.is_frozen() {
+        let shareable: bool = ractor.funcall("shareable?", (value,))?;
+        if !shareable {
             return Err(magnus::Error::new(
                 ruby.exception_arg_error(),
-                "register_defaults expects frozen objects",
+                "register_defaults expects Ractor-shareable objects",
             ));
         }
     }
