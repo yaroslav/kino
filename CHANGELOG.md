@@ -1,3 +1,13 @@
+## [Unreleased]
+
+- Ractor-readiness fixes, so external Ractor audits of Kino pass: the
+  env string caches root their strings through the lock-free pin slab
+  instead of per-value GC registration (unsynchronized across ractors
+  in Ruby 4.0, a crash) and no longer call into Ruby while locked (a
+  GC-barrier deadlock); the shared rack.errors and rack.input
+  singletons must be Ractor-shareable, not just frozen; the Rack
+  handler's option table is shareable. Throughput is unchanged.
+
 ## [0.6.0] - 2026-09-01
 
 - HTTP/2 support. Kino now speaks HTTP/2 natively, on by default:

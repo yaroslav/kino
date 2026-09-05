@@ -8,20 +8,40 @@
 //! request headers.
 //!
 //! `Opaque<RString>` is magnus's sanctioned way to keep Ruby values in
-//! statics (it is Send + Sync); GC registration makes them immortal. Built
-//! once, with the GVL held, on the main ractor; read-only afterwards.
+//! statics (it is Send + Sync); GC registration makes the static ones
+//! immortal. Built once, with the GVL held, on the main ractor; read-only
+//! afterwards.
+//!
+//! The LRU caches (hosts, peer addresses, interned header values) are the
+//! exception: they insert and evict from every worker ractor in parallel.
+//! That rules out per-value GC registration, because in Ruby 4.0
+//! `rb_gc_register_address` and its unregister walk a VM-wide linked list
+//! with no lock. Their strings are rooted through a [`PinSlab`] instead:
+//! one atomic VALUE slot per cached string, marked from a keeper object
+//! registered once at init. The same parallelism forbids any Ruby call
+//! while a cache lock is held: a Ruby allocation can start a GC, a GC
+//! with several ractors stops at a barrier every other ractor must
+//! reach, and a ractor parked on the cache mutex never would. So the
+//! caches allocate their strings first, then lock only to look up, root,
+//! insert, or evict.
 
+use std::borrow::Borrow;
+use std::hash::Hash;
 use std::net::IpAddr;
-use std::sync::OnceLock;
+use std::sync::{Arc, OnceLock};
 
+use magnus::rb_sys::AsRawValue;
 use magnus::value::Opaque;
 use magnus::{gc, prelude::*, RString, Ruby, Value};
 use parking_lot::{Mutex, RwLock};
+
+use crate::pin::{PinKeeper, PinSlab};
 
 /// These maps are probed several times per request; ahash beats the
 /// DoS-resistant default since every key here is our own static data.
 type HashMap<K, V> = std::collections::HashMap<K, V, ahash::RandomState>;
 type HashSet<K> = std::collections::HashSet<K, ahash::RandomState>;
+type LruCache<K, V> = lru::LruCache<K, V, ahash::RandomState>;
 
 pub struct EnvStrings {
     // keys
@@ -49,19 +69,22 @@ pub struct EnvStrings {
     pub methods: HashMap<&'static str, Opaque<RString>>,
     /// lowercase header name -> frozen "HTTP_<UPPER>" key
     pub header_names: HashMap<&'static str, Opaque<RString>>,
+    /// GC roots for every string the LRU caches below hold (see the
+    /// module docs); a cache entry owns its slots and clears them when
+    /// it is evicted.
+    pub slab: Arc<PinSlab>,
     /// Host-header or :authority bytes -> frozen host values, and peer
     /// IP -> frozen REMOTE_ADDR value. Real traffic has low cardinality
     /// on both, so these kill 3 string allocations per request.
-    /// LRU-bounded: entries are BoxValue-rooted (registered with the GC on
-    /// insert, UNregistered on eviction-drop), so a rotating-host attack
-    /// recycles cache slots instead of leaking immortal strings.
-    pub hosts: Mutex<lru::LruCache<Vec<u8>, HostEntry, ahash::RandomState>>,
-    pub addrs: Mutex<lru::LruCache<IpAddr, CachedStr, ahash::RandomState>>,
+    /// LRU-bounded, so a rotating-host attack recycles cache slots
+    /// instead of accumulating immortal strings.
+    pub hosts: Mutex<LruCache<Vec<u8>, HostEntry>>,
+    pub addrs: Mutex<LruCache<IpAddr, CachedStr>>,
     /// Interned values of low-cardinality headers (see
     /// [`INTERNABLE_VALUES`]): value bytes -> frozen RString, shared
     /// across headers that happen to carry the same bytes. Same rooting
     /// and locking contract as `hosts`/`addrs`.
-    pub values: Mutex<lru::LruCache<Vec<u8>, CachedStr, ahash::RandomState>>,
+    pub values: Mutex<LruCache<Vec<u8>, CachedStr>>,
     /// The names whose values go through the `values` cache.
     pub internable: HashSet<&'static str>,
     /// Ractor-shareable defaults provided by the Ruby layer at boot:
@@ -73,6 +96,14 @@ pub struct EnvStrings {
 const HOST_CACHE_CAP: usize = 256;
 const ADDR_CACHE_CAP: usize = 1024;
 const VALUE_CACHE_CAP: usize = 512;
+
+/// Slab slots for every string the three caches can hold at once: up to
+/// three per host entry, one per address and per interned value, plus
+/// one entry per cache for the insert that precedes an eviction. A full
+/// slab (which this bound rules out) degrades to an uncached string,
+/// never to an unrooted one.
+const CACHE_SLAB_CAPACITY: usize =
+    (HOST_CACHE_CAP + 1) * 3 + (ADDR_CACHE_CAP + 1) + (VALUE_CACHE_CAP + 1);
 
 /// Values longer than this are never interned: past it the memcpy into
 /// a fresh Ruby string is cheap relative to the bytes themselves, and
@@ -120,38 +151,75 @@ pub struct HostEntry {
     host: Option<CachedStr>,
 }
 
-/// A frozen RString rooted via BoxValue (GC-registered address; unregisters
-/// on Drop, so LRU eviction actually frees the string).
+impl HostEntry {
+    /// Root a fresh entry; None (with nothing left rooted) when the slab
+    /// is full.
+    fn root(
+        slab: &Arc<PinSlab>,
+        name: RString,
+        port: RString,
+        host: Option<RString>,
+    ) -> Option<Self> {
+        let name = CachedStr::root(slab, name)?;
+        let port = CachedStr::root(slab, port)?;
+        let host = match host {
+            Some(host) => Some(CachedStr::root(slab, host)?),
+            None => None,
+        };
+        Some(HostEntry { name, port, host })
+    }
+
+    fn name_port(&self, ruby: &Ruby) -> (RString, RString) {
+        (self.name.get(ruby), self.port.get(ruby))
+    }
+
+    /// The entry's full-authority string, adopting `host` (rooted, slab
+    /// permitting) when it has none yet.
+    fn fill_host(&mut self, ruby: &Ruby, slab: &Arc<PinSlab>, host: RString) -> RString {
+        if self.host.is_none() {
+            self.host = CachedStr::root(slab, host);
+        }
+        self.host.as_ref().map_or(host, |cached| cached.get(ruby))
+    }
+}
+
+/// A frozen RString kept alive by one slab slot for as long as its cache
+/// entry exists. Drop (LRU eviction, or an insert that lost a race)
+/// clears the slot; the string then dies at the next sweep unless an
+/// env still references it.
 ///
-/// SAFETY of Send + Sync: the contents are frozen Ruby strings (therefore
-/// Ractor-shareable), and creation, reads, and drops all happen while the
-/// calling thread holds its GVL (native method context) AND the owning
-/// cache Mutex; readers root the value into a live env Hash before
-/// releasing the lock, so an eviction on another ractor can never free a
-/// string that a reader still holds unrooted.
-pub struct CachedStr(magnus::value::BoxValue<RString>);
-unsafe impl Send for CachedStr {}
-unsafe impl Sync for CachedStr {}
+/// Readers copy the VALUE out under the cache lock and set it on their
+/// env only afterwards (the aset is a Ruby call, so it may not run under
+/// the lock; see the module docs). That is sound even when another
+/// ractor evicts the entry in between: a VALUE held in a native frame is
+/// a conservative GC root, since Ruby scans every thread's machine stack
+/// and saved registers on every ractor, so the string outlives the
+/// window until the env roots it for good.
+pub struct CachedStr {
+    value: Opaque<RString>,
+    slab: Arc<PinSlab>,
+    slot: usize,
+}
 
 impl CachedStr {
-    fn new(ruby: &Ruby, s: &str) -> Self {
-        let string = ruby.str_new(s);
-        string.freeze();
-        CachedStr(magnus::value::BoxValue::new(string))
+    /// Root `string` in the slab; None when the slab is full.
+    fn root(slab: &Arc<PinSlab>, string: RString) -> Option<Self> {
+        let slot = slab.insert(string.as_raw())?;
+        Some(CachedStr {
+            value: Opaque::from(string),
+            slab: slab.clone(),
+            slot,
+        })
     }
 
-    /// Header values are bytes on the wire (not guaranteed UTF-8), so
-    /// they cache as the same binary strings `str_from_slice` builds on
-    /// the uncached path; interning must not change the encoding an
-    /// app observes.
-    fn new_from_slice(ruby: &Ruby, bytes: &[u8]) -> Self {
-        let string = ruby.str_from_slice(bytes);
-        string.freeze();
-        CachedStr(magnus::value::BoxValue::new(string))
+    fn get(&self, ruby: &Ruby) -> RString {
+        ruby.get_inner(self.value)
     }
+}
 
-    fn get(&self) -> RString {
-        *self.0
+impl Drop for CachedStr {
+    fn drop(&mut self) {
+        self.slab.release(self.slot);
     }
 }
 
@@ -224,11 +292,37 @@ pub fn cgi_name(lower: &str) -> String {
     key
 }
 
+/// A frozen string rooted for the life of the process. Init only: the
+/// registration takes the VM lock, and nothing else must exist yet.
 fn frozen(ruby: &Ruby, s: &str) -> Opaque<RString> {
-    let string = ruby.str_new(s);
-    string.freeze();
+    let string = frozen_str(ruby, s);
     gc::register_mark_object(string);
     Opaque::from(string)
+}
+
+/// A fresh frozen string, rooted only by the caller's stack until a
+/// cache slot or an env takes it.
+fn frozen_str(ruby: &Ruby, s: &str) -> RString {
+    let string = ruby.str_new(s);
+    string.freeze();
+    string
+}
+
+/// Header values are bytes on the wire (not guaranteed UTF-8), so they
+/// cache as the same binary strings `str_from_slice` builds on the
+/// uncached path; interning must not change the encoding an app
+/// observes.
+fn frozen_slice(ruby: &Ruby, bytes: &[u8]) -> RString {
+    let string = ruby.str_from_slice(bytes);
+    string.freeze();
+    string
+}
+
+fn lru<K: Hash + Eq, V>(capacity: usize) -> Mutex<LruCache<K, V>> {
+    Mutex::new(LruCache::with_hasher(
+        std::num::NonZeroUsize::new(capacity).expect("cache capacity is non-zero"),
+        ahash::RandomState::new(),
+    ))
 }
 
 /// Build the cache. Main ractor, GVL held, before any worker exists.
@@ -241,6 +335,11 @@ pub fn init(ruby: &Ruby) {
         .iter()
         .map(|h| (*h, frozen(ruby, &cgi_name(h))))
         .collect::<HashMap<_, _>>();
+
+    // The slab's GC-visible face lives for the process: registered here
+    // on the main ractor, before any worker ractor can exist.
+    let slab = Arc::new(PinSlab::with_capacity(CACHE_SLAB_CAPACITY));
+    gc::register_mark_object(ruby.obj_wrap(PinKeeper(slab.clone())));
 
     let strings = EnvStrings {
         request_method: frozen(ruby, "REQUEST_METHOD"),
@@ -265,18 +364,10 @@ pub fn init(ruby: &Ruby) {
         http2: frozen(ruby, "HTTP/2"),
         methods,
         header_names,
-        hosts: Mutex::new(lru::LruCache::with_hasher(
-            std::num::NonZeroUsize::new(HOST_CACHE_CAP).unwrap(),
-            ahash::RandomState::new(),
-        )),
-        addrs: Mutex::new(lru::LruCache::with_hasher(
-            std::num::NonZeroUsize::new(ADDR_CACHE_CAP).unwrap(),
-            ahash::RandomState::new(),
-        )),
-        values: Mutex::new(lru::LruCache::with_hasher(
-            std::num::NonZeroUsize::new(VALUE_CACHE_CAP).unwrap(),
-            ahash::RandomState::new(),
-        )),
+        slab,
+        hosts: lru(HOST_CACHE_CAP),
+        addrs: lru(ADDR_CACHE_CAP),
+        values: lru(VALUE_CACHE_CAP),
         internable: INTERNABLE_VALUES.iter().copied().collect(),
         errors_stream: RwLock::new(None),
         null_input: RwLock::new(None),
@@ -311,9 +402,41 @@ pub fn register_defaults(
     Ok(())
 }
 
+/// The cached value for `key`, or a freshly built one, inserted for the
+/// next caller. `build` runs with the lock released (it allocates Ruby
+/// strings; see the module docs); `read` copies a cached entry's value
+/// out; `root` turns a fresh value into an entry, or None when the slab
+/// is full, in which case the value is used uncached. An entry a racing
+/// ractor inserted meanwhile wins over ours, whose string is then plain
+/// garbage.
+fn get_or_insert<K, Q, V, T>(
+    cache: &Mutex<LruCache<K, V>>,
+    key: &Q,
+    read: impl Fn(&V) -> T,
+    build: impl FnOnce() -> T,
+    root: impl FnOnce(&T) -> Option<V>,
+    own_key: impl FnOnce() -> K,
+) -> T
+where
+    K: Hash + Eq + Borrow<Q>,
+    Q: Hash + Eq + ?Sized,
+{
+    if let Some(found) = cache.lock().get(key) {
+        return read(found);
+    }
+    let fresh = build();
+    let mut cache = cache.lock();
+    if let Some(found) = cache.get(key) {
+        return read(found);
+    }
+    if let Some(entry) = root(&fresh) {
+        cache.put(own_key(), entry); // may evict: the entry's Drop clears its slots
+    }
+    fresh
+}
+
 /// Set SERVER_NAME/SERVER_PORT on `env` from the LRU host cache, building
-/// (and caching) frozen values on miss. The aset happens UNDER the cache
-/// lock; see CachedStr's safety contract.
+/// (and caching) frozen values on miss.
 pub fn set_host_env(
     ruby: &Ruby,
     env: magnus::RHash,
@@ -321,21 +444,17 @@ pub fn set_host_env(
     make: impl FnOnce() -> (String, u16),
 ) -> Result<(), magnus::Error> {
     let s = get();
-    let mut hosts = s.hosts.lock();
-    let (name, port) = match hosts.get(host) {
-        Some(entry) => (entry.name.get(), entry.port.get()),
-        None => {
-            let (name_s, port_n) = make();
-            let entry = HostEntry {
-                name: CachedStr::new(ruby, &name_s),
-                port: CachedStr::new(ruby, &port_n.to_string()),
-                host: None,
-            };
-            let values = (entry.name.get(), entry.port.get());
-            hosts.put(host.to_vec(), entry); // may evict + free an old entry
-            values
-        }
-    };
+    let (name, port) = get_or_insert(
+        &s.hosts,
+        host,
+        |entry| entry.name_port(ruby),
+        || {
+            let (name, port) = make();
+            (frozen_str(ruby, &name), frozen_str(ruby, &port.to_string()))
+        },
+        |&(name, port)| HostEntry::root(&s.slab, name, port, None),
+        || host.to_vec(),
+    );
     env.aset(ruby.get_inner(s.server_name), name)?;
     env.aset(ruby.get_inner(s.server_port), port)?;
     Ok(())
@@ -354,32 +473,44 @@ pub fn set_authority_env(
     make: impl FnOnce() -> (String, u16),
 ) -> Result<(), magnus::Error> {
     let s = get();
-    let mut hosts = s.hosts.lock();
-    let (name, port, host) = match hosts.get_mut(authority.as_bytes()) {
-        Some(entry) => {
-            if entry.host.is_none() {
-                entry.host = Some(CachedStr::new(ruby, authority));
+    let key = authority.as_bytes();
+    let read = |entry: &HostEntry| {
+        let (name, port) = entry.name_port(ruby);
+        (name, port, entry.host.as_ref().map(|host| host.get(ruby)))
+    };
+    // Bound to a local so the lock guard (a temporary of this statement)
+    // is gone before the arms below take the lock again.
+    let hit = s.hosts.lock().get(key).map(read);
+    let (name, port, host) = match hit {
+        Some((name, port, Some(host))) => (name, port, host),
+        Some((name, port, None)) => {
+            let host = frozen_str(ruby, authority);
+            let mut hosts = s.hosts.lock();
+            match hosts.get_mut(key) {
+                Some(entry) => (name, port, entry.fill_host(ruby, &s.slab, host)),
+                // Evicted meanwhile; the strings in hand are still valid.
+                None => (name, port, host),
             }
-            (
-                entry.name.get(),
-                entry.port.get(),
-                entry.host.as_ref().expect("just filled").get(),
-            )
         }
         None => {
-            let (name_s, port_n) = make();
-            let entry = HostEntry {
-                name: CachedStr::new(ruby, &name_s),
-                port: CachedStr::new(ruby, &port_n.to_string()),
-                host: Some(CachedStr::new(ruby, authority)),
-            };
-            let values = (
-                entry.name.get(),
-                entry.port.get(),
-                entry.host.as_ref().expect("just built").get(),
-            );
-            hosts.put(authority.as_bytes().to_vec(), entry);
-            values
+            let (name, port) = make();
+            let name = frozen_str(ruby, &name);
+            let port = frozen_str(ruby, &port.to_string());
+            let host = frozen_str(ruby, authority);
+            let mut hosts = s.hosts.lock();
+            match hosts.get_mut(key) {
+                // A racing ractor got there first; share its entry.
+                Some(entry) => {
+                    let (name, port) = entry.name_port(ruby);
+                    (name, port, entry.fill_host(ruby, &s.slab, host))
+                }
+                None => {
+                    if let Some(entry) = HostEntry::root(&s.slab, name, port, Some(host)) {
+                        hosts.put(key.to_vec(), entry);
+                    }
+                    (name, port, host)
+                }
+            }
         }
     };
     env.aset(ruby.get_inner(s.server_name), name)?;
@@ -391,8 +522,7 @@ pub fn set_authority_env(
 
 /// Set one header's value on `env` under `key`: through the interned
 /// value cache when the header qualifies (low-cardinality name, bounded
-/// length), else a fresh per-request string. The cached aset happens
-/// under the cache lock; see CachedStr's safety contract.
+/// length), else a fresh per-request string.
 pub fn set_value_env(
     ruby: &Ruby,
     env: magnus::RHash,
@@ -404,36 +534,29 @@ pub fn set_value_env(
     if value.len() > VALUE_INTERN_MAX_LEN || !s.internable.contains(name) {
         return env.aset(key, ruby.str_from_slice(value));
     }
-    let mut values = s.values.lock();
-    let cached = match values.get(value) {
-        Some(cached) => cached.get(),
-        None => {
-            let entry = CachedStr::new_from_slice(ruby, value);
-            let string = entry.get();
-            values.put(value.to_vec(), entry); // may evict + free an old value
-            string
-        }
-    };
-    env.aset(key, cached)?;
-    Ok(())
+    let cached = get_or_insert(
+        &s.values,
+        value,
+        |cached| cached.get(ruby),
+        || frozen_slice(ruby, value),
+        |&fresh| CachedStr::root(&s.slab, fresh),
+        || value.to_vec(),
+    );
+    env.aset(key, cached)
 }
 
-/// Set REMOTE_ADDR on `env` from the LRU peer-IP cache; same locking
-/// contract as set_host_env.
+/// Set REMOTE_ADDR on `env` from the LRU peer-IP cache.
 pub fn set_addr_env(ruby: &Ruby, env: magnus::RHash, ip: IpAddr) -> Result<(), magnus::Error> {
     let s = get();
-    let mut addrs = s.addrs.lock();
-    let value = match addrs.get(&ip) {
-        Some(cached) => cached.get(),
-        None => {
-            let entry = CachedStr::new(ruby, &ip.to_string());
-            let value = entry.get();
-            addrs.put(ip, entry);
-            value
-        }
-    };
-    env.aset(ruby.get_inner(s.remote_addr), value)?;
-    Ok(())
+    let value = get_or_insert(
+        &s.addrs,
+        &ip,
+        |cached| cached.get(ruby),
+        || frozen_str(ruby, &ip.to_string()),
+        |&fresh| CachedStr::root(&s.slab, fresh),
+        || ip,
+    );
+    env.aset(ruby.get_inner(s.remote_addr), value)
 }
 
 #[cfg(test)]
