@@ -92,3 +92,47 @@ pub fn close(ruby: &magnus::Ruby, id: u64) -> Result<(), magnus::Error> {
     chan.tx.lock().take();
     Ok(())
 }
+
+/// Build the cache-backed slice of a Rack env directly, the way `build_env`
+/// does for a real request: REMOTE_ADDR from `ip`, SERVER_NAME/SERVER_PORT
+/// from `host` (the Host-header path) or, when `authority` is given, from
+/// it (the :authority path, which also sets HTTP_HOST), plus one interned
+/// header value. The rooting stress spec calls this from several ractors
+/// at once with more distinct inputs than the LRU caches hold.
+pub fn env_probe(
+    ruby: &magnus::Ruby,
+    host: String,
+    authority: Option<String>,
+    ip: String,
+    user_agent: String,
+) -> Result<magnus::RHash, magnus::Error> {
+    use crate::env_strings;
+    use crate::request::split_host_port;
+
+    let ip: std::net::IpAddr = ip.parse().map_err(|e| {
+        magnus::Error::new(ruby.exception_arg_error(), format!("bad ip {ip:?}: {e}"))
+    })?;
+    let env = ruby.hash_new();
+    env_strings::set_addr_env(ruby, env, ip)?;
+    match &authority {
+        Some(authority) => {
+            env_strings::set_authority_env(ruby, env, authority, || split_host_port(authority, 80))?
+        }
+        None => {
+            env_strings::set_host_env(ruby, env, host.as_bytes(), || split_host_port(&host, 80))?
+        }
+    }
+    let strings = env_strings::get();
+    let key = strings
+        .header_names
+        .get("user-agent")
+        .expect("user-agent is a common header");
+    env_strings::set_value_env(
+        ruby,
+        env,
+        ruby.get_inner(*key),
+        "user-agent",
+        user_agent.as_bytes(),
+    )?;
+    Ok(env)
+}
