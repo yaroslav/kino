@@ -44,7 +44,7 @@ module Kino
     SETTINGS = DEFAULTS.keys.freeze
 
     # Source template for {.sample}.
-    SAMPLE_TEMPLATE = File.expand_path("templates/kino.rb.tt", __dir__)
+    SAMPLE_TEMPLATE = File.expand_path("templates/kino.rb.tt", __dir__).freeze
 
     # Where the `kino` CLI and the Rack handler look for a config file when
     # none is named: the project root first, then the Rails-style config/.

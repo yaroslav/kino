@@ -9,13 +9,13 @@ module Rackup
     module Kino
       # Host option name => Kino setting plus the coercion it needs: rackup
       # hands `-O NAME=VALUE` values (and its own -p) over as strings.
-      OPTION_MAP = {
+      OPTION_MAP = Ractor.make_shareable({
         Host: [:bind, ->(value) { value.to_s }],
         Port: [:port, ->(value) { Integer(value) }],
         Workers: [:workers, ->(value) { Integer(value) }],
         Threads: [:threads, ->(value) { Integer(value) }],
         Mode: [:mode, ->(value) { value.to_sym }]
-      }.freeze
+      })
       private_constant :OPTION_MAP
 
       # Boot a server for `app` and block until it shuts down, the way the
@@ -27,7 +27,7 @@ module Rackup
       #   want a handle on it
       # @return [::Kino::Server] the stopped server, after shutdown
       def self.run(app, **options)
-        require "kino"
+        require "kino" # audition:disable runtime-require
         server = ::Kino::Server.new(app, **server_options(options))
         yield server if block_given?
         server.run
@@ -58,7 +58,7 @@ module Rackup
       # @param options [Hash{Symbol => Object}]
       # @return [Hash{Symbol => Object}]
       def self.server_options(options)
-        require "kino"
+        require "kino" # audition:disable runtime-require
         options = options.dup
         host_defaults = {}
         if (typed = options.delete(:user_supplied_options))
