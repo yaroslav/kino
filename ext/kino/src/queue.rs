@@ -25,6 +25,21 @@ pub const TICK: Duration = Duration::from_millis(50);
 /// the difference and doesn't need to.
 type Taken = Option<BoxedCtx>;
 
+/// What a take does when its bounded wait times out: keep waiting (None),
+/// or end the loop because the pool scaler retired this slot. A retired
+/// lane worker first empties its own lane, one item per timeout: the
+/// dispatcher stopped feeding it when the flag went up (see
+/// registry::ServerInner::retire_slot for the ordering), so whatever is
+/// still there is the last of it, and nothing already assigned is
+/// orphaned. Only reached with the queue momentarily empty, so the fast
+/// path pays nothing for it.
+fn after_timeout(slot: &WorkerSlot) -> Option<Taken> {
+    if !slot.retired.load(Ordering::SeqCst) {
+        return None;
+    }
+    Some(slot.lane_rx.as_ref().and_then(|rx| rx.try_recv().ok()))
+}
+
 /// Block until one request arrives (GVL released, interruptible).
 /// No busy-poll before parking, deliberately: the wake-per-request futex
 /// cost is real (~20% of cycles at saturation, per perf), but a measured
@@ -46,7 +61,7 @@ fn block_take(server: &ServerInner, slot: &Arc<WorkerSlot>) -> Result<Taken, Err
             let taken =
                 gvl::interruptible(&slot.interrupted, || match req_rx.recv_timeout(TICK) {
                     Ok(ctx) => Some(Some(ctx)),
-                    Err(flume::RecvTimeoutError::Timeout) => None,
+                    Err(flume::RecvTimeoutError::Timeout) => after_timeout(slot),
                     Err(flume::RecvTimeoutError::Disconnected) => Some(None),
                 })?;
             Ok(taken.flatten())
@@ -93,8 +108,10 @@ fn lane_take(server: &ServerInner, slot: &Arc<WorkerSlot>) -> Result<Taken, Erro
         match lane_rx.recv_timeout(TICK) {
             Ok(ctx) => Some(Some(ctx)),
             // Periodic steal so a backlog behind a slow sibling can't
-            // outlive a tick.
-            Err(flume::RecvTimeoutError::Timeout) => steal().map(Some),
+            // outlive a tick; a retired worker leaves instead.
+            Err(flume::RecvTimeoutError::Timeout) => {
+                after_timeout(slot).or_else(|| steal().map(Some))
+            }
             Err(flume::RecvTimeoutError::Disconnected) => Some(None),
         }
     });
@@ -234,4 +251,49 @@ pub fn respond_and_take(
 ) -> Result<Option<RArray>, Error> {
     crate::request::respond_simple(ruby, request, status, headers, body)?;
     Worker::take_batch(ruby, &worker, max)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::registry::test_server;
+    use crate::request::test_ctx;
+
+    #[test]
+    fn a_take_keeps_waiting_after_a_timeout_unless_the_slot_is_retired() {
+        let server = test_server(false, 4);
+        server.register_worker();
+        let slot = server.slots.read()[0].clone();
+
+        assert!(after_timeout(&slot).is_none());
+    }
+
+    #[test]
+    fn a_retired_shared_queue_worker_ends_its_loop_at_the_next_timeout() {
+        let server = test_server(false, 4);
+        server.register_worker();
+        server.retire_slot(0);
+        let slot = server.slots.read()[0].clone();
+
+        assert!(matches!(after_timeout(&slot), Some(None)));
+    }
+
+    #[test]
+    fn a_retired_lane_worker_drains_its_own_lane_before_leaving() {
+        let server = test_server(true, 4);
+        server.register_worker();
+        let slot = server.slots.read()[0].clone();
+        slot.lane_tx
+            .lock()
+            .as_ref()
+            .expect("lane open")
+            .send(test_ctx())
+            .expect("lane has room");
+        server.retire_slot(0);
+
+        // One item still assigned to this lane: serve it, not orphan it.
+        assert!(matches!(after_timeout(&slot), Some(Some(_))));
+        // Lane empty now: leave.
+        assert!(matches!(after_timeout(&slot), Some(None)));
+    }
 }

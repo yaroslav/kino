@@ -49,6 +49,15 @@ fn init(ruby: &Ruby) -> Result<(), Error> {
     native.define_singleton_method("worker_stats", function!(server::worker_stats, 1))?;
     native.define_singleton_method("queue_time", function!(server::queue_time, 1))?;
     native.define_singleton_method("quarantine_slot", function!(server::quarantine_slot, 2))?;
+    native.define_singleton_method("retire_slot", function!(server::retire_slot, 2))?;
+    native.define_singleton_method("reset_slot", function!(server::reset_slot, 2))?;
+    native.define_singleton_method(
+        "set_active_workers",
+        function!(server::set_active_workers, 2),
+    )?;
+    native.define_singleton_method("record_scale_up", function!(server::record_scale_up, 1))?;
+    native.define_singleton_method("record_scale_down", function!(server::record_scale_down, 1))?;
+    native.define_singleton_method("pool_stats", function!(server::pool_stats, 1))?;
     native.define_singleton_method(
         "record_quarantine_replacement",
         function!(server::record_quarantine_replacement, 1),
