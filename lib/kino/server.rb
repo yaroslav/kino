@@ -68,6 +68,16 @@ module Kino
       @bind = settings[:bind]
       @requested_port = settings[:port]
       @workers = Integer(settings[:workers])
+      # The pool ceiling; equal to the floor for a fixed pool.
+      @max_workers = settings[:max_workers].nil? ? @workers : Integer(settings[:max_workers])
+      if @max_workers < @workers
+        raise ArgumentError, "max_workers (#{@max_workers}) must be at least workers (#{@workers})"
+      end
+      @scale_down_after = settings[:scale_down_after].nil? ? 30.0 : Float(settings[:scale_down_after])
+      raise ArgumentError, "scale_down_after must be positive" unless @scale_down_after.positive?
+      if !settings[:scale_down_after].nil? && !elastic?
+        Log.warn("scale_down_after has no effect unless max_workers is above workers")
+      end
       @on_error = validate_hook(settings[:on_error], :on_error)
       @after_worker_boot = validate_hook(settings[:after_worker_boot], :after_worker_boot)
       @after_request_complete = validate_hook(settings[:after_request_complete], :after_request_complete)
@@ -81,8 +91,9 @@ module Kino
         # The access log's GC and allocation figures come from the VM's
         # process-wide counters, so they are measured only where one
         # request at a time can own them: the GVL serializes :threaded
-        # mode, and a single ractor has nothing to race.
-        access_timing: !!settings[:log_requests] && (@mode == :threaded || @workers == 1)
+        # mode, and a single ractor (a pool that can never grow past one)
+        # has nothing to race.
+        access_timing: !!settings[:log_requests] && (@mode == :threaded || @max_workers == 1)
       )
       # Default threads per mode: 1 in :ractor (threads inside a ractor
       # share its lock; a measured +17% on fast handlers; raise `workers`
@@ -126,10 +137,10 @@ module Kino
         else
           @workers * @threads
         end
-      @worker_threads = []
-      @worker_threads_lock = Mutex.new
       @supervisor = nil
+      @threaded_pool = nil
       @quarantine_monitor = nil
+      @pool_scaler = nil
       @started = false
     end
 
@@ -158,7 +169,8 @@ module Kino
           tls_cert: @tls&.fetch(:cert), tls_key: @tls&.fetch(:key),
           http2: @http2,
           lanes: @lanes, log_requests: @log_requests,
-          mode: @mode.to_s, workers: @workers, threads: @threads, batch: @batch,
+          mode: @mode.to_s, workers: @workers, max_workers: @max_workers,
+          threads: @threads, batch: @batch,
           control_bind: @control_bind, control_token: @control_token
         )
         booted = true
@@ -169,12 +181,15 @@ module Kino
       # lifetime so in-flight buffers survive even a worker ractor crash.
       @pin_keeper = Native.pin_keeper(@id)
       if @mode == :ractor
+        warn_scheduler_cap
         @supervisor = RactorSupervisor.new(@id, @app, workers: @workers, threads: @threads,
           batch: @batch, hooks: @worker_hooks, on_worker_exit: @on_worker_exit).start
       else
-        @worker_threads = (@workers * @threads).times.map { spawn_worker_thread }
+        @threaded_pool = ThreadedPool.new(@id, @app, threads: @threads, batch: @batch,
+          hooks: @worker_hooks, on_worker_exit: @on_worker_exit).start(@workers)
       end
       start_quarantine_monitor if @quarantine_timeout_ms
+      start_pool_scaler if elastic?
       Native.control_ready(@id)
       HookFire.fire(@after_boot, "after_boot")
       @started = true
@@ -192,6 +207,7 @@ module Kino
     def shutdown(timeout: nil)
       return unless @started
 
+      @pool_scaler&.stop
       @quarantine_monitor&.stop
       deadline = monotonic_now + (timeout || @shutdown_timeout)
       Native.stop_accepting(@id)
@@ -224,7 +240,6 @@ module Kino
       # The runtime is gone, so hyper has dropped every pinned buffer;
       # the keeper (and the strings it marked) may now be collected.
       @pin_keeper = nil
-      @worker_threads.clear
       @started = false
       remove_pidfile if @pidfile
       nil
@@ -233,7 +248,7 @@ module Kino
     # Block until every worker has exited (i.e. until shutdown).
     # @return [void]
     def wait
-      @supervisor ? @supervisor.join : @worker_threads.each(&:join)
+      pool.join
     end
 
     # Production entry point: build the server and {#run} it. The `kino`
@@ -298,19 +313,22 @@ module Kino
     #   lanes mode) once started
     def stats
       base = {
-        mode: @mode, lanes: @lanes, workers: @workers, threads: @threads,
-        batch: @batch, respawns: 0
+        mode: @mode, lanes: @lanes, workers: @workers, max_workers: @max_workers,
+        threads: @threads, batch: @batch, respawns: 0,
+        active_workers: @workers, scale_ups: 0, scale_downs: 0
       }
       return base unless @started
 
       queued, in_flight, served, rejected, timeouts, respawns, lane_depths = Native.server_stats(@id)
       base.merge!(queued:, in_flight:, served:, rejected:, timeouts:, respawns:)
       base[:lane_depths] = lane_depths if lane_depths
+      active_workers, _max_workers, scale_ups, scale_downs = Native.pool_stats(@id)
+      base.merge!(active_workers:, scale_ups:, scale_downs:)
       rows = Native.worker_stats(@id)
-      base[:worker_status] = rows.map do |index, served, in_flight, busy_ms, quarantined|
-        {index:, served:, in_flight:, busy_ms:, quarantined:}
+      base[:worker_status] = rows.map do |index, served, in_flight, busy_ms, quarantined, retired|
+        {index:, served:, in_flight:, busy_ms:, quarantined:, retired:}
       end
-      base[:quarantined] = rows.count { |_index, _served, _in_flight, _busy_ms, quarantined| quarantined }
+      base[:quarantined] = rows.count { |row| row[4] }
       count, sum_seconds = Native.queue_time(@id)
       base[:queue_time] = {count:, sum_seconds:}
       base
@@ -318,63 +336,38 @@ module Kino
 
     private
 
-    # Register a fresh dispatch slot and run a worker thread on it; returns
-    # the thread. Used at boot and by the quarantine replacer.
-    def spawn_worker_thread
-      worker_id = Native.register_worker(@id)
-      Thread.new do
-        # Named so log lines from inside say which worker spoke.
-        Thread.current.name = "worker-#{worker_id}"
-        error = nil
-        begin
-          Worker.run(@id, worker_id, @app, @batch, @worker_hooks)
-        rescue Exception => e # rubocop:disable Lint/RescueException -- a hard crash in a threaded worker thread
-          error = e
-          raise
-        ensure
-          HookFire.fire(@on_worker_exit, "on_worker_exit", worker_id, error)
-        end
-      end
+    # The worker pool this mode runs: the ractor supervisor, or the
+    # threaded pool. Both spawn, retire, replace and join workers behind
+    # the same methods.
+    def pool
+      @supervisor || @threaded_pool
     end
 
-    # Track a replacement thread spawned outside the initial pool assignment
-    # (the quarantine replacer) so shutdown's join/done?/kill sweeps see it.
-    def track_replacement_thread(thread)
-      @worker_threads_lock.synchronize { @worker_threads << thread }
-    end
-
-    # @private
-    # The :threaded-mode quarantine replacer: spawns a replacement worker
-    # thread, quarantines the wedged slot, then tracks the new thread so
-    # shutdown's join/done?/kill sweeps see it. Built from bound Method
-    # objects instead of a server reference, so it drives the server
-    # through those methods without send or instance_variable_get.
-    class ThreadedReplacer
-      def initialize(server_id:, spawner:, tracker:)
-        @server_id = server_id
-        @spawner = spawner
-        @tracker = tracker
-      end
-
-      def replace(worker_id)
-        thread = @spawner.call # spawn FIRST (may raise ThreadError)
-        Native.quarantine_slot(@server_id, worker_id) # quarantine after success
-        @tracker.call(thread)
-        true
-      end
-    end
-    private_constant :ThreadedReplacer
-
-    # A replacer.replace(worker_id) spawns a replacement worker, then
-    # quarantines the wedged slot, mode-appropriately. In :ractor the
-    # supervisor is the replacer; in :threaded a small object over
-    # spawn_worker_thread.
+    # Both pools are quarantine replacers: replace(worker_id) spawns a
+    # replacement worker, then quarantines the wedged slot.
     def start_quarantine_monitor
-      replacer = @supervisor || ThreadedReplacer.new(server_id: @id, spawner: method(:spawn_worker_thread),
-        tracker: method(:track_replacement_thread))
       @quarantine_monitor = QuarantineMonitor.new(
         server_id: @id, timeout_ms: @quarantine_timeout_ms,
-        max: @quarantine_max, replacer: replacer
+        max: @quarantine_max, replacer: pool
+      ).start
+    end
+
+    # Ruby's M:N scheduler runs non-main ractors' Ruby code on at most
+    # RUBY_MAX_CPU native threads (default 8). Workers past that cap share
+    # timeslices instead of adding parallelism, and a fresh ractor can wait
+    # seconds for its first one while the others are CPU-bound.
+    def warn_scheduler_cap
+      cap = Integer(ENV.fetch("RUBY_MAX_CPU", "8"), exception: false) || 8
+      return if @max_workers <= cap
+
+      Log.warn("#{@max_workers} ractor workers exceed RUBY_MAX_CPU=#{cap}: only #{cap} can run " \
+        "Ruby code at once; set RUBY_MAX_CPU=#{@max_workers} for CPU-bound apps")
+    end
+
+    def start_pool_scaler
+      @pool_scaler = PoolScaler.new(
+        server_id: @id, pool: pool, floor: @workers, ceiling: @max_workers,
+        scale_down_after: @scale_down_after
       ).start
     end
 
@@ -398,6 +391,11 @@ module Kino
 
     def monotonic_now
       Process.clock_gettime(Process::CLOCK_MONOTONIC)
+    end
+
+    # A pool that can grow: the ceiling is above the floor.
+    def elastic?
+      @max_workers > @workers
     end
 
     # Default connection cap: most of the process open-file limit. A
@@ -474,23 +472,11 @@ module Kino
     end
 
     def join_workers(deadline)
-      if @supervisor
-        @supervisor.shutdown([deadline - monotonic_now, 0].max)
-      else
-        threads = @worker_threads_lock.synchronize { @worker_threads.dup }
-        threads.each do |thread|
-          thread.join([deadline - monotonic_now, 0.01].max)
-        end
-      end
+      pool.shutdown([deadline - monotonic_now, 0].max)
     end
 
     def workers_done?
-      if @supervisor
-        @supervisor.done?
-      else
-        threads = @worker_threads_lock.synchronize { @worker_threads.dup }
-        threads.none?(&:alive?)
-      end
+      pool.done?
     end
 
     def kill_stragglers
@@ -499,8 +485,7 @@ module Kino
         # by abort_all_inflight. The stuck ractor leaks until process exit.
         Log.error("shutdown deadline passed with stuck ractor workers") unless @supervisor.done?
       else
-        threads = @worker_threads_lock.synchronize { @worker_threads.dup }
-        threads.each { |thread| thread.kill if thread.alive? }
+        @threaded_pool.kill_stragglers
       end
     end
 

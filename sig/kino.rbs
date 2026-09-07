@@ -110,6 +110,8 @@ module Kino
       def bind: (String host) -> untyped
       def port: (int port) -> untyped
       def workers: (int count) -> untyped
+      def max_workers: (int count) -> untyped
+      def scale_down_after: (Numeric seconds) -> untyped
       def threads: (int count) -> untyped
       def mode: (Symbol | String mode) -> untyped
       def queue_depth: (int depth) -> untyped

@@ -19,6 +19,17 @@ RSpec.describe "startup info" do
     end
   end
 
+  it "prints the pool range when the pool is elastic" do
+    app = "run ->(_env) { [200, {}, []] }\n"
+
+    Dir.mktmpdir("kino-startup") do |dir|
+      config = "workers 1\nmax_workers 3\nthreads 1\nmode :threaded\n"
+      with_cli_server(dir, config, app) do |_port, out|
+        expect(File.read(out)).to include("- mode:      threaded, 1-3 workers × 1 thread")
+      end
+    end
+  end
+
   it "names the control plane when one is bound" do
     app = "run ->(_env) { [200, {}, []] }\n"
 
