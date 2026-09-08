@@ -1,4 +1,4 @@
-## [Unreleased]
+## [0.7.0] - 2026-09-08
 
 - Experimental elastic worker pool. Set `max_workers` above `workers`
   and the pool grows under load, one worker at a time, then shrinks
