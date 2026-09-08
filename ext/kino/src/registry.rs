@@ -170,8 +170,8 @@ pub struct WorkerSlot {
     pub quarantined: std::sync::atomic::AtomicBool,
     /// Set by the pool scaler to send this slot's worker home: the lane
     /// dispatcher skips it, and the take loop ends at its next idle tick
-    /// (a request already taken finishes first). Cleared by `reset_slot`
-    /// when the slot is handed to a new worker.
+    /// (a request already taken finishes first). Cleared by `reset` when
+    /// the slot is handed to a new worker.
     pub retired: std::sync::atomic::AtomicBool,
 }
 
@@ -269,6 +269,32 @@ impl WorkerSlot {
             retired: std::sync::atomic::AtomicBool::new(false),
         }
     }
+
+    /// Send this slot's worker home once it is idle. The flag is raised
+    /// under the lane lock, the same lock the lane dispatcher holds while
+    /// it checks the flag and sends: any dispatch that saw "not retired"
+    /// has landed in the lane before the worker can see the flag and
+    /// drain, so no request is orphaned.
+    pub fn retire(&self) {
+        let _lane = self.lane_tx.lock();
+        self.retired.store(true, Ordering::SeqCst);
+    }
+
+    /// Return a retired slot to its fresh state so a new worker can take
+    /// it over (slots are never removed; recycling keeps the registry
+    /// from growing with every scale-up). The lane channel stays, the new
+    /// occupant simply starts taking from it; the quarantine mark stays
+    /// too, a quarantined slot is never handed out.
+    pub fn reset(&self) {
+        let _lane = self.lane_tx.lock();
+        self.current.lock().clear();
+        self.retired.store(false, Ordering::SeqCst);
+        self.parked.store(false, Ordering::SeqCst);
+        self.interrupted.store(false, Ordering::SeqCst);
+        self.served.store(0, Ordering::Relaxed);
+        self.in_flight.store(0, Ordering::Relaxed);
+        self.last_started_ms.store(0, Ordering::Relaxed);
+    }
 }
 
 static REGISTRY: OnceLock<RwLock<HashMap<u64, Arc<ServerInner>>>> = OnceLock::new();
@@ -326,35 +352,6 @@ impl ServerInner {
         let mut slots = self.slots.write();
         slots.push(Arc::new(WorkerSlot::new(self.lanes)));
         slots.len() - 1
-    }
-
-    /// Send a slot's worker home once it is idle. The flag is raised under
-    /// the slot's lane lock, the same lock the lane dispatcher holds while
-    /// it checks the flag and sends: any dispatch that saw "not retired"
-    /// has landed in the lane before the worker can see the flag and
-    /// drain, so no request is orphaned. Unknown ids are ignored.
-    pub fn retire_slot(&self, worker_id: usize) {
-        if let Some(slot) = self.slots.read().get(worker_id) {
-            let _lane = slot.lane_tx.lock();
-            slot.retired.store(true, Ordering::SeqCst);
-        }
-    }
-
-    /// Return a retired slot to its fresh state so a new worker can take
-    /// it over (slots are never removed; recycling keeps the registry
-    /// from growing with every scale-up). The lane channel stays: the new
-    /// occupant simply starts taking from it. Unknown ids are ignored.
-    pub fn reset_slot(&self, worker_id: usize) {
-        if let Some(slot) = self.slots.read().get(worker_id) {
-            let _lane = slot.lane_tx.lock();
-            slot.current.lock().clear();
-            slot.retired.store(false, Ordering::SeqCst);
-            slot.parked.store(false, Ordering::SeqCst);
-            slot.interrupted.store(false, Ordering::SeqCst);
-            slot.served.store(0, Ordering::Relaxed);
-            slot.in_flight.store(0, Ordering::Relaxed);
-            slot.last_started_ms.store(0, Ordering::Relaxed);
-        }
     }
 
     pub fn slot(
@@ -590,10 +587,10 @@ mod tests {
         slot.last_started_ms.store(9, Ordering::Relaxed);
         slot.current.lock().push(std::sync::Weak::new());
 
-        server.retire_slot(0);
+        slot.retire();
         assert!(slot.retired.load(Ordering::Relaxed));
 
-        server.reset_slot(0);
+        slot.reset();
         assert!(!slot.retired.load(Ordering::Relaxed));
         assert!(!slot.parked.load(Ordering::Relaxed));
         assert!(!slot.interrupted.load(Ordering::Relaxed));
@@ -603,6 +600,54 @@ mod tests {
         assert!(slot.current.lock().is_empty());
         // The lane survives reuse: the next occupant takes from it.
         assert!(slot.lane_tx.lock().is_some());
+    }
+
+    #[test]
+    fn reset_keeps_a_quarantine_mark() {
+        let server = test_server(false, 4);
+        server.register_worker();
+        let slot = server.slots.read()[0].clone();
+        slot.quarantined.store(true, Ordering::Relaxed);
+
+        slot.retire();
+        slot.reset();
+
+        // A wedged slot stays flagged even if it ever came back around.
+        assert!(slot.quarantined.load(Ordering::Relaxed));
+    }
+
+    #[test]
+    fn retire_releases_the_lane_lock() {
+        let server = test_server(true, 4);
+        server.register_worker();
+        let slot = server.slots.read()[0].clone();
+
+        slot.retire();
+
+        assert!(slot.lane_tx.try_lock().is_some());
+    }
+
+    #[test]
+    fn retire_waits_for_a_dispatcher_holding_the_lane_lock() {
+        let server = test_server(true, 4);
+        server.register_worker();
+        let slot = server.slots.read()[0].clone();
+
+        // A dispatcher that has already read "not retired" and is sending.
+        let sending = slot.lane_tx.lock();
+        let retiring = std::thread::spawn({
+            let slot = slot.clone();
+            move || slot.retire()
+        });
+        std::thread::sleep(Duration::from_millis(30));
+        assert!(
+            !slot.retired.load(Ordering::SeqCst),
+            "the flag must not go up under a dispatcher's lock"
+        );
+
+        drop(sending);
+        retiring.join().expect("retire thread");
+        assert!(slot.retired.load(Ordering::SeqCst));
     }
 
     #[test]

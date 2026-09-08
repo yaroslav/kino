@@ -26,12 +26,12 @@ module Kino
       @worker_slots = {}
       @slot_to_worker = {}
       @replaced = {}
-      # Worker index => true while its ractor runs; => true once the
-      # scaler asked it to leave; and the slot ids retired workers gave
-      # back, for the next worker to take over.
+      # Worker index => true while its ractor runs, and => true once the
+      # scaler asked it to leave. Retired workers hand their slots back to
+      # the bank for the next worker to take over.
       @live = {}
       @retiring = {}
-      @free_slots = []
+      @bank = SlotBank.new(server_id)
       # The first replacement's index; `replace` increments before using it,
       # so this starts one below the first free index (@workers).
       @next_worker_index = @workers - 1
@@ -62,6 +62,12 @@ module Kino
     # without flipping the draining flag.
     def join
       @lock.synchronize { @supervisor_threads.dup }.each(&:join)
+    end
+
+    # Ractors cannot be force-killed; their clients were already freed by
+    # abort_all_inflight. A stuck ractor leaks until process exit.
+    def kill_stragglers
+      Log.error("shutdown deadline passed with stuck ractor workers") unless done?
     end
 
     # Workers alive and serving: the live ones minus those the quarantine
@@ -187,11 +193,10 @@ module Kino
       end
     end
 
-    # Fresh ractor on fresh or recycled slots. Slots are never reused
-    # across crash respawns: stale interrupt kicks and dead weak refs go
-    # down with the old slot. They are reused after a clean retirement.
+    # Fresh ractor on slots from the bank: fresh ones, or ones a retired
+    # worker handed back.
     def spawn_worker(worker_index)
-      worker_ids = Array.new(@threads) { claim_slot }
+      worker_ids = Array.new(@threads) { @bank.claim }
       @lock.synchronize do
         @worker_slots[worker_index] = worker_ids
         worker_ids.each { |id| @slot_to_worker[id] = worker_index }
@@ -213,26 +218,17 @@ module Kino
       [ractor, worker_ids]
     end
 
-    # A slot a retired worker gave back, reset for its new occupant, or a
-    # fresh one.
-    def claim_slot
-      id = @lock.synchronize { @free_slots.pop }
-      return Native.register_worker(@server_id) unless id
-
-      Native.reset_slot(@server_id, id)
-      id
-    end
-
     # Bookkeeping for a supervisor thread that is done: the worker is no
-    # longer live, a retired worker's slots go back to the free list, and
-    # the thread leaves the join set so a long-lived elastic pool does not
+    # longer live, a retired worker's slots go back to the bank, and the
+    # thread leaves the join set so a long-lived elastic pool does not
     # accumulate dead threads.
     def exited(index, worker_ids)
-      @lock.synchronize do
+      retired = @lock.synchronize do
         @live.delete(index)
-        @free_slots.concat(worker_ids) if @retiring.delete(index) && worker_ids
         @supervisor_threads.delete(Thread.current)
+        @retiring.delete(index)
       end
+      @bank.release(worker_ids) if retired && worker_ids
       report_active
     end
 

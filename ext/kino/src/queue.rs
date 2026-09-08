@@ -29,7 +29,7 @@ type Taken = Option<BoxedCtx>;
 /// or end the loop because the pool scaler retired this slot. A retired
 /// lane worker first empties its own lane, one item per timeout: the
 /// dispatcher stopped feeding it when the flag went up (see
-/// registry::ServerInner::retire_slot for the ordering), so whatever is
+/// registry::WorkerSlot::retire for the ordering), so whatever is
 /// still there is the last of it, and nothing already assigned is
 /// orphaned. Only reached with the queue momentarily empty, so the fast
 /// path pays nothing for it.
@@ -272,7 +272,7 @@ mod tests {
     fn a_retired_shared_queue_worker_ends_its_loop_at_the_next_timeout() {
         let server = test_server(false, 4);
         server.register_worker();
-        server.retire_slot(0);
+        server.slots.read()[0].retire();
         let slot = server.slots.read()[0].clone();
 
         assert!(matches!(after_timeout(&slot), Some(None)));
@@ -289,11 +289,45 @@ mod tests {
             .expect("lane open")
             .send(test_ctx())
             .expect("lane has room");
-        server.retire_slot(0);
+        server.slots.read()[0].retire();
 
         // One item still assigned to this lane: serve it, not orphan it.
         assert!(matches!(after_timeout(&slot), Some(Some(_))));
         // Lane empty now: leave.
         assert!(matches!(after_timeout(&slot), Some(None)));
+    }
+
+    #[test]
+    fn a_retired_lane_worker_drains_every_item_one_per_timeout() {
+        let server = test_server(true, 4);
+        server.register_worker();
+        let slot = server.slots.read()[0].clone();
+        for _ in 0..3 {
+            slot.lane_tx
+                .lock()
+                .as_ref()
+                .expect("lane open")
+                .send(test_ctx())
+                .expect("lane has room");
+        }
+        server.slots.read()[0].retire();
+
+        for _ in 0..3 {
+            assert!(matches!(after_timeout(&slot), Some(Some(_))));
+        }
+        assert!(matches!(after_timeout(&slot), Some(None)));
+    }
+
+    #[test]
+    fn a_reset_slot_keeps_waiting_again() {
+        let server = test_server(false, 4);
+        server.register_worker();
+        let slot = server.slots.read()[0].clone();
+        slot.retire();
+        assert!(matches!(after_timeout(&slot), Some(None)));
+
+        slot.reset();
+
+        assert!(after_timeout(&slot).is_none());
     }
 }

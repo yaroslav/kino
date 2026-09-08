@@ -480,13 +480,7 @@ module Kino
     end
 
     def kill_stragglers
-      if @supervisor
-        # Ractors cannot be force-killed; their clients were already freed
-        # by abort_all_inflight. The stuck ractor leaks until process exit.
-        Log.error("shutdown deadline passed with stuck ractor workers") unless @supervisor.done?
-      else
-        @threaded_pool.kill_stragglers
-      end
+      pool.kill_stragglers
     end
 
     # Policy (mode resolution): when is an app safe for ractor

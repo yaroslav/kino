@@ -752,6 +752,36 @@ mod tests {
     }
 
     #[test]
+    fn worker_status_reports_retired_slots() {
+        let server = crate::registry::test_server(false, 4);
+        server.register_worker();
+        server.register_worker();
+        server.slots.read()[1].retire();
+
+        let status = collect_worker_status(&server);
+
+        assert_eq!(
+            status.iter().map(|w| w.retired).collect::<Vec<_>>(),
+            vec![false, true]
+        );
+        assert!(status.iter().all(|w| w.busy_ms == 0));
+    }
+
+    #[test]
+    fn snapshot_reads_the_pool_counters() {
+        let server = crate::registry::test_server(false, 4);
+        server.active_workers.store(3, Ordering::Relaxed);
+        server.scale_ups.fetch_add(2, Ordering::Relaxed);
+        server.scale_downs.fetch_add(1, Ordering::Relaxed);
+
+        let s = StatsSnapshot::take(&server);
+
+        assert_eq!(s.active_workers, 3);
+        assert_eq!(s.max_workers, server.topology.max_workers);
+        assert_eq!((s.scale_ups, s.scale_downs), (2, 1));
+    }
+
+    #[test]
     fn metrics_text_includes_lane_depth_samples_when_lanes_are_on() {
         let mut s = snapshot(crate::registry::STATE_READY);
         s.lane_depths = Some(vec![2, 0]);

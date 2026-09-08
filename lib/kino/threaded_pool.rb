@@ -17,14 +17,15 @@ module Kino
       @hooks = hooks
       @on_worker_exit = on_worker_exit
       @lock = Mutex.new
-      # index => {slots:, threads:}; the groups asked to leave; the slot
-      # ids retired groups gave back; quarantine replacements (one thread
-      # each, standing in for a wedged slot: neither counted nor retired,
-      # so the wedged group keeps counting as the capacity it still is).
+      # index => {slots:, threads:}; the groups asked to leave; quarantine
+      # replacements (one thread each, standing in for a wedged slot:
+      # neither counted nor retired, so the wedged group keeps counting as
+      # the capacity it still is). Retired groups hand their slots back to
+      # the bank.
       @groups = {}
       @slot_to_group = {}
       @retiring = {}
-      @free_slots = []
+      @bank = SlotBank.new(server_id)
       @replacements = {}
       @wedged = {}
       @next_index = -1
@@ -127,7 +128,7 @@ module Kino
         @next_index
       end
       slots.times do
-        id = claim_slot
+        id = @bank.claim
         @lock.synchronize do
           group[:slots] << id
           @slot_to_group[id] = index
@@ -154,31 +155,23 @@ module Kino
       end
     end
 
-    # A slot a retired group gave back, reset for its new occupant, or a
-    # fresh one.
-    def claim_slot
-      id = @lock.synchronize { @free_slots.pop }
-      return Native.register_worker(@server_id) unless id
-
-      Native.reset_slot(@server_id, id)
-      id
-    end
-
     # Retiring groups whose threads have all exited give their slots back
     # and leave the table. Runs before every pool decision, so the count
     # the control plane sees never lags by more than a scaler tick.
     def reap
       freed = @lock.synchronize do
         done = @retiring.keys.select { |index| @groups[index][:threads].none?(&:alive?) }
-        done.each do |index|
+        done.flat_map do |index|
           group = @groups.delete(index)
           @retiring.delete(index)
           group[:slots].each { |id| @slot_to_group.delete(id) }
-          @free_slots.concat(group[:slots])
+          group[:slots]
         end
-        done.any?
       end
-      report_active if freed
+      return if freed.empty?
+
+      @bank.release(freed)
+      report_active
     end
 
     def report_active

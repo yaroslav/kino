@@ -726,8 +726,8 @@ fn try_dispatch(server: &ServerInner, mut ctx: BoxedCtx) -> Dispatch {
             let guard = slot.lane_tx.lock();
             let Some(tx) = guard.as_ref() else { continue };
             any_open = true;
-            // Checked under the lane lock, which retire_slot also takes:
-            // see registry::ServerInner::retire_slot for the ordering.
+            // Checked under the lane lock, which WorkerSlot::retire also
+            // takes: see there for the ordering.
             if slot.retired.load(Ordering::SeqCst) {
                 continue;
             }
@@ -952,11 +952,10 @@ pub fn quarantine_slot(ruby: &Ruby, server_id: u64, worker_id: usize) -> Result<
 }
 
 /// Send a slot's worker home once idle (pool scale-down); see
-/// registry::ServerInner::retire_slot.
+/// registry::WorkerSlot::retire. An unknown id is a caller bug: raise.
 pub fn retire_slot(ruby: &Ruby, server_id: u64, worker_id: usize) -> Result<(), Error> {
     if let Some(server) = registry::try_get(server_id) {
-        server.slot(ruby, worker_id)?; // unknown id is a caller bug: raise
-        server.retire_slot(worker_id);
+        server.slot(ruby, worker_id)?.retire();
     }
     Ok(())
 }
@@ -964,8 +963,7 @@ pub fn retire_slot(ruby: &Ruby, server_id: u64, worker_id: usize) -> Result<(), 
 /// Hand a retired slot to a new worker (pool scale-up reusing a slot).
 pub fn reset_slot(ruby: &Ruby, server_id: u64, worker_id: usize) -> Result<(), Error> {
     if let Some(server) = registry::try_get(server_id) {
-        server.slot(ruby, worker_id)?;
-        server.reset_slot(worker_id);
+        server.slot(ruby, worker_id)?.reset();
     }
     Ok(())
 }
@@ -1454,6 +1452,18 @@ mod tests {
         assert_eq!(stream_capacity(&topology), 24);
     }
 
+    #[test]
+    fn stream_capacity_of_a_fixed_pool_is_its_slot_count() {
+        let topology = registry::Topology {
+            mode: "threaded".to_string(),
+            workers: 4,
+            max_workers: 4,
+            threads: 3,
+            batch: 1,
+        };
+        assert_eq!(stream_capacity(&topology), 12);
+    }
+
     #[tokio::test]
     async fn streams_beyond_the_advertised_cap_queue_instead_of_failing() {
         use http_body_util::Full;
@@ -1671,7 +1681,7 @@ mod tests {
         let server = test_server(true, 4);
         server.register_worker();
         server.register_worker();
-        server.retire_slot(0);
+        server.slots.read()[0].retire();
 
         // A retiring worker gets nothing new: both land on slot 1.
         assert!(matches!(try_dispatch(&server, test_ctx()), Dispatch::Sent));
@@ -1683,7 +1693,7 @@ mod tests {
     fn dispatch_retries_rather_than_closing_when_only_retired_lanes_remain() {
         let server = test_server(true, 4);
         server.register_worker();
-        server.retire_slot(0);
+        server.slots.read()[0].retire();
 
         // Retired is not draining: the caller keeps retrying until the
         // queue timeout, so a replacement worker can still pick this up.
@@ -1691,5 +1701,84 @@ mod tests {
             try_dispatch(&server, test_ctx()),
             Dispatch::Full(_)
         ));
+    }
+
+    #[test]
+    fn dispatch_skips_a_retired_lane_even_when_it_is_the_only_awake_one() {
+        let server = test_server(true, 4);
+        server.register_worker();
+        server.register_worker();
+        server.slots.read()[0].retire();
+        server.slots.read()[1].parked.store(true, Ordering::Relaxed);
+
+        // The second pass (parked lanes allowed) still skips the retired one.
+        assert!(matches!(try_dispatch(&server, test_ctx()), Dispatch::Sent));
+        assert_eq!(server.lane_depths(), Some(vec![0, 1]));
+    }
+
+    #[test]
+    fn dispatch_keeps_retrying_when_the_other_lanes_are_closed() {
+        let server = test_server(true, 4);
+        server.register_worker();
+        server.register_worker();
+        server.slots.read()[0].lane_tx.lock().take(); // a crashed worker's lane
+        server.slots.read()[1].retire();
+
+        assert!(matches!(
+            try_dispatch(&server, test_ctx()),
+            Dispatch::Full(_)
+        ));
+    }
+
+    #[test]
+    fn a_reset_lane_receives_dispatches_again() {
+        let server = test_server(true, 4);
+        server.register_worker();
+        server.register_worker();
+        server.slots.read()[0].retire();
+        assert!(matches!(try_dispatch(&server, test_ctx()), Dispatch::Sent));
+        assert_eq!(server.lane_depths(), Some(vec![0, 1]));
+
+        server.slots.read()[0].reset();
+        for _ in 0..2 {
+            assert!(matches!(try_dispatch(&server, test_ctx()), Dispatch::Sent));
+        }
+        // Back in the round-robin.
+        assert_eq!(server.lane_depths(), Some(vec![1, 2]));
+    }
+
+    #[test]
+    fn nothing_lands_in_a_lane_after_its_retirement_and_final_drain() {
+        let server = test_server(true, 4);
+        server.register_worker();
+        server.register_worker();
+        let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let dispatcher = std::thread::spawn({
+            let server = server.clone();
+            let stop = stop.clone();
+            move || {
+                while !stop.load(Ordering::Relaxed) {
+                    let _ = try_dispatch(&server, test_ctx());
+                    // Lane 1 keeps draining, so dispatch never stalls on Full.
+                    let slots = server.slots.read();
+                    if let Some(rx) = slots[1].lane_rx.as_ref() {
+                        while rx.try_recv().is_ok() {}
+                    }
+                }
+            }
+        });
+        std::thread::sleep(Duration::from_millis(20));
+
+        // The scaler retires slot 0; its worker then drains what it holds.
+        let slot = server.slots.read()[0].clone();
+        slot.retire();
+        if let Some(rx) = slot.lane_rx.as_ref() {
+            while rx.try_recv().is_ok() {}
+        }
+
+        std::thread::sleep(Duration::from_millis(50));
+        stop.store(true, Ordering::Relaxed);
+        dispatcher.join().expect("dispatcher thread");
+        assert_eq!(server.lane_depths(), Some(vec![0, 0]));
     }
 }
