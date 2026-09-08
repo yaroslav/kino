@@ -18,6 +18,8 @@ pub struct WorkerStat {
     pub in_flight: usize,
     pub busy_ms: u64,
     pub quarantined: bool,
+    /// Sent home by the pool scaler; leaves at its next idle tick.
+    pub retired: bool,
 }
 
 /// Read every slot's per-worker sensors in one pass under the slots read
@@ -46,6 +48,7 @@ pub fn collect_worker_status(server: &ServerInner) -> Vec<WorkerStat> {
                     now.saturating_sub(started)
                 },
                 quarantined,
+                retired: slot.retired.load(Ordering::Relaxed),
             }
         })
         .collect()
@@ -70,6 +73,10 @@ pub struct StatsSnapshot {
     pub worker_status: Vec<WorkerStat>,
     pub quarantined_count: usize,
     pub quarantine_replacements: u64,
+    pub max_workers: usize,
+    pub active_workers: usize,
+    pub scale_ups: u64,
+    pub scale_downs: u64,
     pub queue_histogram: crate::registry::QueueHistogramSnapshot,
 }
 
@@ -94,6 +101,10 @@ impl StatsSnapshot {
             worker_status,
             quarantined_count,
             quarantine_replacements: server.quarantine_replacements.load(Ordering::Relaxed),
+            max_workers: server.topology.max_workers,
+            active_workers: server.active_workers.load(Ordering::Relaxed),
+            scale_ups: server.scale_ups.load(Ordering::Relaxed),
+            scale_downs: server.scale_downs.load(Ordering::Relaxed),
             queue_histogram: server.queue_histogram.snapshot(),
         }
     }
@@ -114,9 +125,10 @@ pub fn stats_json(s: &StatsSnapshot) -> String {
     let mut out = String::with_capacity(256);
     write!(
         out,
-        r#"{{"mode":"{}","lanes":{},"workers":{},"threads":{},"batch":{},"respawns":{},"queued":{},"in_flight":{},"served":{},"rejected":{},"timeouts":{}"#,
+        r#"{{"mode":"{}","lanes":{},"workers":{},"threads":{},"batch":{},"respawns":{},"queued":{},"in_flight":{},"served":{},"rejected":{},"timeouts":{},"max_workers":{},"active_workers":{},"scale_ups":{},"scale_downs":{}"#,
         s.mode, s.lanes, s.workers, s.threads, s.batch, s.respawns,
-        s.queued, s.in_flight, s.served, s.rejected, s.timeouts
+        s.queued, s.in_flight, s.served, s.rejected, s.timeouts,
+        s.max_workers, s.active_workers, s.scale_ups, s.scale_downs
     )
     .expect("writing to a String cannot fail");
     if let Some(depths) = &s.lane_depths {
@@ -134,8 +146,8 @@ pub fn stats_json(s: &StatsSnapshot) -> String {
         }
         write!(
             out,
-            r#"{{"index":{},"served":{},"in_flight":{},"busy_ms":{},"quarantined":{}}}"#,
-            w.index, w.served, w.in_flight, w.busy_ms, w.quarantined
+            r#"{{"index":{},"served":{},"in_flight":{},"busy_ms":{},"quarantined":{},"retired":{}}}"#,
+            w.index, w.served, w.in_flight, w.busy_ms, w.quarantined, w.retired
         )
         .expect("writing to a String cannot fail");
     }
@@ -246,6 +258,34 @@ pub fn metrics_text(s: &StatsSnapshot) -> String {
         "gauge",
         "Configured threads per worker.",
         s.threads,
+    );
+    metric(
+        &mut out,
+        "kino_max_workers",
+        "gauge",
+        "Worker pool ceiling (equals kino_workers for a fixed pool).",
+        s.max_workers,
+    );
+    metric(
+        &mut out,
+        "kino_active_workers",
+        "gauge",
+        "Workers currently alive and serving.",
+        s.active_workers,
+    );
+    metric(
+        &mut out,
+        "kino_scale_ups_total",
+        "counter",
+        "Workers added by the pool scaler.",
+        s.scale_ups,
+    );
+    metric(
+        &mut out,
+        "kino_scale_downs_total",
+        "counter",
+        "Idle workers retired by the pool scaler.",
+        s.scale_downs,
     );
     metric(
         &mut out,
@@ -641,6 +681,10 @@ mod tests {
             worker_status: vec![],
             quarantined_count: 0,
             quarantine_replacements: 0,
+            max_workers: 32,
+            active_workers: 12,
+            scale_ups: 3,
+            scale_downs: 1,
             queue_histogram: crate::registry::QueueHistogramSnapshot {
                 buckets: [0; crate::registry::QUEUE_BOUNDS_US.len()],
                 overflow: 0,
@@ -665,6 +709,10 @@ mod tests {
             r#""served":100"#,
             r#""rejected":5"#,
             r#""timeouts":6"#,
+            r#""max_workers":32"#,
+            r#""active_workers":12"#,
+            r#""scale_ups":3"#,
+            r#""scale_downs":1"#,
             r#""state":"ready""#,
             r#""version":""#,
         ] {
@@ -688,6 +736,49 @@ mod tests {
         assert!(text.contains("kino_ready 1"));
         let draining = metrics_text(&snapshot(crate::registry::STATE_DRAINING));
         assert!(draining.contains("kino_ready 0"));
+    }
+
+    #[test]
+    fn metrics_text_reports_the_elastic_pool() {
+        let text = metrics_text(&snapshot(crate::registry::STATE_READY));
+        assert!(text.contains("# TYPE kino_max_workers gauge"));
+        assert!(text.contains("kino_max_workers 32"));
+        assert!(text.contains("# TYPE kino_active_workers gauge"));
+        assert!(text.contains("kino_active_workers 12"));
+        assert!(text.contains("# TYPE kino_scale_ups_total counter"));
+        assert!(text.contains("kino_scale_ups_total 3"));
+        assert!(text.contains("# TYPE kino_scale_downs_total counter"));
+        assert!(text.contains("kino_scale_downs_total 1"));
+    }
+
+    #[test]
+    fn worker_status_reports_retired_slots() {
+        let server = crate::registry::test_server(false, 4);
+        server.register_worker();
+        server.register_worker();
+        server.slots.read()[1].retire();
+
+        let status = collect_worker_status(&server);
+
+        assert_eq!(
+            status.iter().map(|w| w.retired).collect::<Vec<_>>(),
+            vec![false, true]
+        );
+        assert!(status.iter().all(|w| w.busy_ms == 0));
+    }
+
+    #[test]
+    fn snapshot_reads_the_pool_counters() {
+        let server = crate::registry::test_server(false, 4);
+        server.active_workers.store(3, Ordering::Relaxed);
+        server.scale_ups.fetch_add(2, Ordering::Relaxed);
+        server.scale_downs.fetch_add(1, Ordering::Relaxed);
+
+        let s = StatsSnapshot::take(&server);
+
+        assert_eq!(s.active_workers, 3);
+        assert_eq!(s.max_workers, server.topology.max_workers);
+        assert_eq!((s.scale_ups, s.scale_downs), (2, 1));
     }
 
     #[test]
@@ -757,6 +848,7 @@ mod tests {
                 in_flight: 1,
                 busy_ms: 4,
                 quarantined: false,
+                retired: false,
             },
             WorkerStat {
                 index: 1,
@@ -764,10 +856,11 @@ mod tests {
                 in_flight: 0,
                 busy_ms: 0,
                 quarantined: false,
+                retired: true,
             },
         ];
         let json = stats_json(&s);
-        assert!(json.contains(r#""worker_status":[{"index":0,"served":10,"in_flight":1,"busy_ms":4,"quarantined":false},{"index":1,"served":7,"in_flight":0,"busy_ms":0,"quarantined":false}]"#), "got {json}");
+        assert!(json.contains(r#""worker_status":[{"index":0,"served":10,"in_flight":1,"busy_ms":4,"quarantined":false,"retired":false},{"index":1,"served":7,"in_flight":0,"busy_ms":0,"quarantined":false,"retired":true}]"#), "got {json}");
     }
 
     #[test]
@@ -786,6 +879,7 @@ mod tests {
                 in_flight: 1,
                 busy_ms: 4,
                 quarantined: false,
+                retired: false,
             },
             WorkerStat {
                 index: 1,
@@ -793,6 +887,7 @@ mod tests {
                 in_flight: 0,
                 busy_ms: 0,
                 quarantined: false,
+                retired: true,
             },
         ];
         let text = metrics_text(&s);
@@ -835,6 +930,7 @@ mod tests {
                 in_flight: 1,
                 busy_ms: 0,
                 quarantined: true,
+                retired: false,
             },
             WorkerStat {
                 index: 1,
@@ -842,6 +938,7 @@ mod tests {
                 in_flight: 1,
                 busy_ms: 5,
                 quarantined: false,
+                retired: false,
             },
         ];
         let json = stats_json(&s);
@@ -850,7 +947,7 @@ mod tests {
             "top-level count: {json}"
         );
         assert!(
-            json.contains(r#"{"index":0,"served":3,"in_flight":1,"busy_ms":0,"quarantined":true}"#),
+            json.contains(r#"{"index":0,"served":3,"in_flight":1,"busy_ms":0,"quarantined":true,"retired":false}"#),
             "{json}"
         );
         assert!(json.contains(r#""quarantined":false"#));

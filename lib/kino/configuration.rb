@@ -10,6 +10,8 @@ module Kino
       bind: "127.0.0.1",
       port: 0,
       workers: nil, # resolved to Kino.available_parallelism in #to_h
+      max_workers: nil, # nil = fixed pool; above workers = elastic pool
+      scale_down_after: nil, # resolved to 30 seconds in Server
       threads: nil, # resolved per mode in Server: 1 in :ractor, 3 in :threaded
       mode: :auto,
       queue_depth: 1024,
@@ -146,6 +148,8 @@ module Kino
     #   bind "0.0.0.0"
     #   port 9292
     #   workers 8           # ractors (or thread groups in :threaded mode)
+    #   max_workers 32      # elastic pool ceiling; unset = fixed pool
+    #   scale_down_after 30 # seconds idle before an extra worker retires
     #   threads 3           # threads per worker
     #   mode :ractor        # :auto | :ractor | :threaded
     #   queue_depth 2048
@@ -172,8 +176,18 @@ module Kino
       # Port to listen on; 0 picks an ephemeral port.
       def port(port) = @config.set(:port, Integer(port))
 
-      # Worker count (ractors in :ractor mode); defaults to CPU cores.
+      # Worker count (ractors in :ractor mode); defaults to CPU cores. The
+      # pool floor when max_workers is set.
       def workers(count) = @config.set(:workers, Integer(count))
+
+      # Pool ceiling: under sustained queue pressure the pool grows past
+      # `workers`, one worker at a time, up to this many. Unset (the
+      # default) keeps the pool fixed at `workers`.
+      def max_workers(count) = @config.set(:max_workers, Integer(count))
+
+      # Seconds a worker above the floor must sit idle before it is
+      # retired (default 30). Only meaningful with max_workers.
+      def scale_down_after(seconds) = @config.set(:scale_down_after, seconds)
 
       # Threads per worker (I/O concurrency inside one ractor); default is
       # mode-dependent: 1 in :ractor mode, 3 in :threaded.

@@ -1,5 +1,16 @@
 ## [Unreleased]
 
+- Experimental elastic worker pool. Set `max_workers` above `workers`
+  and the pool grows under load, one worker at a time, then shrinks
+  back to `workers` once the extra workers have sat idle for
+  `scale_down_after` seconds (default 30). Works in both modes; a
+  retiring worker finishes its request first. `stats`, `/stats` and
+  `/metrics` gain `max_workers`, `active_workers`, `scale_ups` and
+  `scale_downs`, and each `worker_status` row gains `retired`. Leave
+  `max_workers` unset and the pool is fixed, as before.
+- Ractor mode warns at boot when `max_workers` (or `workers`) exceeds
+  `RUBY_MAX_CPU` (default 8), Ruby's cap on how many ractors run Ruby
+  code at once. Set the variable to your worker count to lift it.
 - Ractor-readiness fixes, so external Ractor audits of Kino pass: the
   env string caches root their strings through the lock-free pin slab
   instead of per-value GC registration (unsynchronized across ractors

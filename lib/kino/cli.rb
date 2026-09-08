@@ -127,7 +127,7 @@ module Kino
       stats = server.stats
       puts dim("- ruby:      #{RUBY_DESCRIPTION}")
       puts dim("- env:       #{ENV["RAILS_ENV"] || ENV["RACK_ENV"] || "development"}")
-      puts dim("- mode:      #{server.mode}, #{count(stats[:workers], "worker")} × #{count(stats[:threads], "thread")}")
+      puts dim("- mode:      #{server.mode}, #{workers_label(stats)} × #{count(stats[:threads], "thread")}")
       puts dim("- pid:       #{Process.pid}")
       puts dim("- listening: #{server.url}")
       puts dim("- control:   #{server.control_url}") if server.control_url
@@ -138,6 +138,14 @@ module Kino
     # "1 worker", "8 workers".
     def count(number, noun)
       "#{number} #{noun}#{"s" unless number == 1}"
+    end
+
+    # The pool as configured: "8 workers", or "8-32 workers" when it can
+    # grow.
+    def workers_label(stats)
+      return count(stats[:workers], "worker") if stats[:max_workers] == stats[:workers]
+
+      "#{stats[:workers]}-#{stats[:max_workers]} workers"
     end
 
     # Roll credits when the process ends: normal exit or crash (at_exit

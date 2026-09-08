@@ -31,6 +31,16 @@ Puma-style two-level: `workers × threads`.
 - Identical machinery either way: the flume queue is MPMC, a "worker slot"
   is per-thread, and the worker loop (`lib/kino/worker.rb`) is shared
   verbatim.
+- Elastic pool (`max_workers`): a scaler thread on the main ractor
+  samples queue depth and the per-slot sensors every 100 ms, adds one
+  worker per sample while requests wait, and retires the longest-idle
+  worker above the floor after `scale_down_after`. Retirement is a
+  per-slot flag raised under the slot's lane lock: the lane dispatcher
+  skips the slot, the take loop honors the flag at its next idle tick (a
+  request already taken finishes first, a lane worker drains its own
+  lane), and the slot is reset and reused by the next worker, so the
+  slot table never grows with churn. Both pools (the ractor supervisor
+  and the threaded pool) expose the same grow/retire/groups seam.
 - Experimental `lanes true` replaces the one shared queue with a small
   private queue per worker slot (awake-preferring dispatch, work
   stealing); see [benchmarks](benchmarks.md#lane-dispatch-experimental-lanes-true).

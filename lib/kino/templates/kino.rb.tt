@@ -40,6 +40,21 @@
 # `workers` instead.
 # threads 1
 
+## Elastic pool (experimental)
+#
+# Let the pool grow past `workers` under load and shrink back when
+# idle: one worker is added every 100 ms while requests wait in the
+# queue, and a worker above `workers` retires after `scale_down_after`
+# seconds idle. Helps apps that wait on databases or other services;
+# pure CPU work gains nothing past the core count. Unset (the default)
+# keeps the pool fixed. In :ractor mode, Ruby runs at most RUBY_MAX_CPU
+# (default 8) ractors' Ruby code at once; set that variable to match
+# `max_workers` on bigger boxes.
+# max_workers 32
+
+# Seconds an extra worker must sit idle before it is retired.
+# scale_down_after 30
+
 ## Dispatch mode
 #
 # :auto     - picks :ractor when your app supports it, else :threaded.

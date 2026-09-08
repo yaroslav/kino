@@ -259,6 +259,8 @@ server = Kino::Server.new(app,
   bind: "127.0.0.1",          # or "unix:///run/kino.sock" behind a proxy
   port: 9292,                 # 0 = ephemeral; read back via server.port
   workers: Kino.available_parallelism, # ractors (parallelism); the default
+  max_workers: nil,           # experimental: grow past workers under load (see Elastic pool)
+  scale_down_after: 30,       # seconds idle before an extra worker retires
   threads: 1,                 # per worker; ractor default 1, threaded default 3
   mode: :auto,                # :auto | :ractor | :threaded
   queue_depth: 1024,          # bounded queue; overflow → 503
@@ -417,6 +419,56 @@ Kino fires four lifecycle hooks alongside `on_error`, split by firing context.
 `after_worker_boot`'s argument is the worker's slot id, while in `:ractor` mode `on_worker_exit`'s argument identifies the exited ractor (`0`..`workers - 1`)—a different number space—so don't correlate boot and exit by that number in `:ractor` mode.
 
 A raising hook is logged and never kills a worker.
+
+## Elastic pool (experimental)
+
+Size the pool for the quiet hours and let it grow for the busy ones:
+
+```ruby
+# kino.rb
+workers 4            # always running
+max_workers 16       # reached only under load
+scale_down_after 30  # seconds idle before an extra worker retires
+```
+
+Or `Kino::Server.new(app, workers: 4, max_workers: 16)`. Leave
+`max_workers` unset and the pool is fixed at `workers`, as before.
+
+While requests wait in the queue, Kino adds a worker every 100 ms until
+the queue clears or the pool hits `max_workers`. When the load passes,
+workers above `workers` retire one at a time after `scale_down_after`
+seconds idle, each finishing its current request first. Same behavior
+in `:ractor` and `:threaded` mode.
+
+**Use it when your app waits**: on databases, upstream services, slow
+clients. With `workers` at your core count, all workers can be blocked
+on I/O while cores sit idle; a higher ceiling puts those cores to work,
+and a ractor starts in microseconds, so the pool follows load closely.
+Pure CPU work gains nothing past the core count. In `:ractor` mode Ruby
+itself runs at most `RUBY_MAX_CPU` ractors' Ruby code at once (default
+8), and Kino warns at boot when the pool can exceed it. On a bigger box:
+
+```sh
+RUBY_MAX_CPU=16 kino
+```
+
+**Watch it breathe** in `server.stats`, `GET /stats` and `GET /metrics`:
+
+```sh
+$ curl -s localhost:9293/stats | jq '{workers, max_workers, active_workers, scale_ups, scale_downs}'
+{
+  "workers": 4,
+  "max_workers": 16,
+  "active_workers": 9,
+  "scale_ups": 12,
+  "scale_downs": 7
+}
+```
+
+Prometheus gets `kino_max_workers`, `kino_active_workers`,
+`kino_scale_ups_total` and `kino_scale_downs_total`. `after_worker_boot`
+fires for every worker the pool adds, `on_worker_exit` (with a nil
+cause) for every one it retires.
 
 ## Stuck-worker quarantine
 

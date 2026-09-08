@@ -68,6 +68,10 @@ pub fn server_start(ruby: &Ruby, config: magnus::RHash) -> Result<(u64, u16, Opt
     let log_requests: bool = cfg_opt(ruby, config, "log_requests")?.unwrap_or(false);
     let mode: String = cfg_opt(ruby, config, "mode")?.unwrap_or_else(|| "threaded".to_string());
     let workers: usize = cfg_opt(ruby, config, "workers")?.unwrap_or(0);
+    // Absent or below the floor means a fixed pool.
+    let max_workers: usize = cfg_opt::<usize>(ruby, config, "max_workers")?
+        .unwrap_or(workers)
+        .max(workers);
     let threads: usize = cfg_opt(ruby, config, "threads")?.unwrap_or(0);
     let batch: usize = cfg_opt(ruby, config, "batch")?.unwrap_or(1);
     let acceptor = match (&tls_cert, &tls_key) {
@@ -130,9 +134,13 @@ pub fn server_start(ruby: &Ruby, config: magnus::RHash) -> Result<(u64, u16, Opt
         state: std::sync::atomic::AtomicU8::new(registry::STATE_BOOTING),
         respawns: std::sync::atomic::AtomicU64::new(0),
         quarantine_replacements: std::sync::atomic::AtomicU64::new(0),
+        active_workers: std::sync::atomic::AtomicUsize::new(workers),
+        scale_ups: std::sync::atomic::AtomicU64::new(0),
+        scale_downs: std::sync::atomic::AtomicU64::new(0),
         topology: registry::Topology {
             mode,
             workers,
+            max_workers,
             threads,
             batch,
         },
@@ -383,6 +391,12 @@ fn advertised_streams(workers: usize, threads: usize) -> u32 {
     slots.clamp(8, 1024) as u32
 }
 
+/// The pool can grow to its ceiling to meet what an h2 balancer sends, so
+/// the ceiling is the admission to advertise (the floor for a fixed pool).
+fn stream_capacity(topology: &registry::Topology) -> u32 {
+    advertised_streams(topology.max_workers, topology.threads)
+}
+
 fn conn_builder(http2: bool, max_streams: u32) -> auto::Builder<TokioExecutor> {
     let mut builder = auto::Builder::new(TokioExecutor::new());
     builder
@@ -418,7 +432,7 @@ async fn serve_connection<I>(
     I: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static,
 {
     let http2 = server.http2;
-    let max_streams = advertised_streams(server.topology.workers, server.topology.threads);
+    let max_streams = stream_capacity(&server.topology);
     let mut drain = server.shutdown_tx.subscribe();
     let service =
         service_fn(move |req| handle_request(server.clone(), remote_addr, local_addr, req));
@@ -712,6 +726,11 @@ fn try_dispatch(server: &ServerInner, mut ctx: BoxedCtx) -> Dispatch {
             let guard = slot.lane_tx.lock();
             let Some(tx) = guard.as_ref() else { continue };
             any_open = true;
+            // Checked under the lane lock, which WorkerSlot::retire also
+            // takes: see there for the ordering.
+            if slot.retired.load(Ordering::SeqCst) {
+                continue;
+            }
             match tx.try_send(ctx) {
                 Ok(()) => return Dispatch::Sent,
                 Err(flume::TrySendError::Full(c)) | Err(flume::TrySendError::Disconnected(c)) => {
@@ -900,7 +919,7 @@ pub fn queue_time(_ruby: &Ruby, server_id: u64) -> Result<(u64, f64), Error> {
 }
 
 /// One worker slot's [index, served, in_flight, busy_ms, quarantined] row.
-pub type WorkerStatRow = (usize, u64, usize, u64, bool);
+pub type WorkerStatRow = (usize, u64, usize, u64, bool, bool);
 
 /// Per-slot rows for Server#stats parity: [index, served, in_flight,
 /// busy_ms, quarantined] each. Empty when the server is gone.
@@ -910,7 +929,16 @@ pub fn worker_stats(_ruby: &Ruby, server_id: u64) -> Result<Vec<WorkerStatRow>, 
     };
     Ok(crate::control::collect_worker_status(&server)
         .into_iter()
-        .map(|w| (w.index, w.served, w.in_flight, w.busy_ms, w.quarantined))
+        .map(|w| {
+            (
+                w.index,
+                w.served,
+                w.in_flight,
+                w.busy_ms,
+                w.quarantined,
+                w.retired,
+            )
+        })
         .collect())
 }
 
@@ -921,6 +949,61 @@ pub fn quarantine_slot(ruby: &Ruby, server_id: u64, worker_id: usize) -> Result<
         slot.quarantined.store(true, Ordering::Relaxed);
     }
     Ok(())
+}
+
+/// Send a slot's worker home once idle (pool scale-down); see
+/// registry::WorkerSlot::retire. An unknown id is a caller bug: raise.
+pub fn retire_slot(ruby: &Ruby, server_id: u64, worker_id: usize) -> Result<(), Error> {
+    if let Some(server) = registry::try_get(server_id) {
+        server.slot(ruby, worker_id)?.retire();
+    }
+    Ok(())
+}
+
+/// Hand a retired slot to a new worker (pool scale-up reusing a slot).
+pub fn reset_slot(ruby: &Ruby, server_id: u64, worker_id: usize) -> Result<(), Error> {
+    if let Some(server) = registry::try_get(server_id) {
+        server.slot(ruby, worker_id)?.reset();
+    }
+    Ok(())
+}
+
+/// The Ruby pool reports how many workers are alive and serving.
+pub fn set_active_workers(_ruby: &Ruby, server_id: u64, count: usize) -> Result<(), Error> {
+    if let Some(server) = registry::try_get(server_id) {
+        server.active_workers.store(count, Ordering::Relaxed);
+    }
+    Ok(())
+}
+
+/// One worker added by the pool scaler.
+pub fn record_scale_up(_ruby: &Ruby, server_id: u64) -> Result<(), Error> {
+    if let Some(server) = registry::try_get(server_id) {
+        server.scale_ups.fetch_add(1, Ordering::Relaxed);
+    }
+    Ok(())
+}
+
+/// One worker retired by the pool scaler.
+pub fn record_scale_down(_ruby: &Ruby, server_id: u64) -> Result<(), Error> {
+    if let Some(server) = registry::try_get(server_id) {
+        server.scale_downs.fetch_add(1, Ordering::Relaxed);
+    }
+    Ok(())
+}
+
+/// [active_workers, max_workers, scale_ups, scale_downs] for Server#stats.
+/// Zeros when the server is gone.
+pub fn pool_stats(_ruby: &Ruby, server_id: u64) -> Result<(usize, usize, u64, u64), Error> {
+    let Some(server) = registry::try_get(server_id) else {
+        return Ok((0, 0, 0, 0));
+    };
+    Ok((
+        server.active_workers.load(Ordering::Relaxed),
+        server.topology.max_workers,
+        server.scale_ups.load(Ordering::Relaxed),
+        server.scale_downs.load(Ordering::Relaxed),
+    ))
 }
 
 /// One replacement spawned by the quarantine monitor.
@@ -1355,6 +1438,32 @@ mod tests {
         assert_eq!(advertised_streams(8, 0), 200);
     }
 
+    #[test]
+    fn stream_capacity_is_advertised_from_the_pool_ceiling() {
+        // An elastic pool grows to meet load an h2 balancer sends, so the
+        // ceiling, not the floor, is the admission to advertise.
+        let topology = registry::Topology {
+            mode: "ractor".to_string(),
+            workers: 2,
+            max_workers: 8,
+            threads: 3,
+            batch: 1,
+        };
+        assert_eq!(stream_capacity(&topology), 24);
+    }
+
+    #[test]
+    fn stream_capacity_of_a_fixed_pool_is_its_slot_count() {
+        let topology = registry::Topology {
+            mode: "threaded".to_string(),
+            workers: 4,
+            max_workers: 4,
+            threads: 3,
+            batch: 1,
+        };
+        assert_eq!(stream_capacity(&topology), 12);
+    }
+
     #[tokio::test]
     async fn streams_beyond_the_advertised_cap_queue_instead_of_failing() {
         use http_body_util::Full;
@@ -1565,5 +1674,111 @@ mod tests {
         assert!(matches!(try_dispatch(&server, test_ctx()), Dispatch::Sent));
         assert!(matches!(try_dispatch(&server, test_ctx()), Dispatch::Sent));
         assert_eq!(server.lane_depths(), Some(vec![0, 2]));
+    }
+
+    #[test]
+    fn dispatch_skips_retired_lanes() {
+        let server = test_server(true, 4);
+        server.register_worker();
+        server.register_worker();
+        server.slots.read()[0].retire();
+
+        // A retiring worker gets nothing new: both land on slot 1.
+        assert!(matches!(try_dispatch(&server, test_ctx()), Dispatch::Sent));
+        assert!(matches!(try_dispatch(&server, test_ctx()), Dispatch::Sent));
+        assert_eq!(server.lane_depths(), Some(vec![0, 2]));
+    }
+
+    #[test]
+    fn dispatch_retries_rather_than_closing_when_only_retired_lanes_remain() {
+        let server = test_server(true, 4);
+        server.register_worker();
+        server.slots.read()[0].retire();
+
+        // Retired is not draining: the caller keeps retrying until the
+        // queue timeout, so a replacement worker can still pick this up.
+        assert!(matches!(
+            try_dispatch(&server, test_ctx()),
+            Dispatch::Full(_)
+        ));
+    }
+
+    #[test]
+    fn dispatch_skips_a_retired_lane_even_when_it_is_the_only_awake_one() {
+        let server = test_server(true, 4);
+        server.register_worker();
+        server.register_worker();
+        server.slots.read()[0].retire();
+        server.slots.read()[1].parked.store(true, Ordering::Relaxed);
+
+        // The second pass (parked lanes allowed) still skips the retired one.
+        assert!(matches!(try_dispatch(&server, test_ctx()), Dispatch::Sent));
+        assert_eq!(server.lane_depths(), Some(vec![0, 1]));
+    }
+
+    #[test]
+    fn dispatch_keeps_retrying_when_the_other_lanes_are_closed() {
+        let server = test_server(true, 4);
+        server.register_worker();
+        server.register_worker();
+        server.slots.read()[0].lane_tx.lock().take(); // a crashed worker's lane
+        server.slots.read()[1].retire();
+
+        assert!(matches!(
+            try_dispatch(&server, test_ctx()),
+            Dispatch::Full(_)
+        ));
+    }
+
+    #[test]
+    fn a_reset_lane_receives_dispatches_again() {
+        let server = test_server(true, 4);
+        server.register_worker();
+        server.register_worker();
+        server.slots.read()[0].retire();
+        assert!(matches!(try_dispatch(&server, test_ctx()), Dispatch::Sent));
+        assert_eq!(server.lane_depths(), Some(vec![0, 1]));
+
+        server.slots.read()[0].reset();
+        for _ in 0..2 {
+            assert!(matches!(try_dispatch(&server, test_ctx()), Dispatch::Sent));
+        }
+        // Back in the round-robin.
+        assert_eq!(server.lane_depths(), Some(vec![1, 2]));
+    }
+
+    #[test]
+    fn nothing_lands_in_a_lane_after_its_retirement_and_final_drain() {
+        let server = test_server(true, 4);
+        server.register_worker();
+        server.register_worker();
+        let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let dispatcher = std::thread::spawn({
+            let server = server.clone();
+            let stop = stop.clone();
+            move || {
+                while !stop.load(Ordering::Relaxed) {
+                    let _ = try_dispatch(&server, test_ctx());
+                    // Lane 1 keeps draining, so dispatch never stalls on Full.
+                    let slots = server.slots.read();
+                    if let Some(rx) = slots[1].lane_rx.as_ref() {
+                        while rx.try_recv().is_ok() {}
+                    }
+                }
+            }
+        });
+        std::thread::sleep(Duration::from_millis(20));
+
+        // The scaler retires slot 0; its worker then drains what it holds.
+        let slot = server.slots.read()[0].clone();
+        slot.retire();
+        if let Some(rx) = slot.lane_rx.as_ref() {
+            while rx.try_recv().is_ok() {}
+        }
+
+        std::thread::sleep(Duration::from_millis(50));
+        stop.store(true, Ordering::Relaxed);
+        dispatcher.join().expect("dispatcher thread");
+        assert_eq!(server.lane_depths(), Some(vec![0, 0]));
     }
 }
