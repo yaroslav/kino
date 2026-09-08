@@ -117,8 +117,9 @@ pub struct ServerInner {
     pub respawns: AtomicU64,
     /// Replacements spawned by the quarantine monitor (Relaxed, advisory).
     pub quarantine_replacements: AtomicU64,
-    /// Workers currently alive and serving, reported by the Ruby pool as
-    /// it grows and shrinks (starts at the floor). Relaxed, advisory.
+    /// Workers staying in the pool (a worker told to retire no longer
+    /// counts), reported by the Ruby pool as it grows and shrinks; starts
+    /// at the floor. Relaxed, advisory.
     pub active_workers: AtomicUsize,
     /// Pool scaler events (Relaxed, advisory).
     pub scale_ups: AtomicU64,

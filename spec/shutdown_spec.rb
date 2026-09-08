@@ -14,17 +14,21 @@ RSpec.describe "graceful shutdown" do
     server = Kino::Server.new(sleeper_app(0.4), workers: 1, threads: 1, mode: :threaded).start
     port = server.port
 
+    # Measured from the request's start, not from after the sleep: on a
+    # loaded box the sleep can overshoot by more than the handler's
+    # remaining time, and the point is only that shutdown outlasts the
+    # request.
+    started = Process.clock_gettime(Process::CLOCK_MONOTONIC)
     client = Thread.new { Net::HTTP.get_response("127.0.0.1", "/", port) }
     sleep 0.1 # request is now in flight
 
-    started = Process.clock_gettime(Process::CLOCK_MONOTONIC)
     server.shutdown(timeout: 5)
     elapsed = Process.clock_gettime(Process::CLOCK_MONOTONIC) - started
 
     response = client.value
     expect(response.code).to eq("200")
     expect(response.body).to eq("finished")
-    expect(elapsed).to be >= 0.2, "shutdown should have waited for the in-flight request"
+    expect(elapsed).to be >= 0.4, "shutdown should have waited for the in-flight request"
   end
 
   it "refuses new connections while draining" do

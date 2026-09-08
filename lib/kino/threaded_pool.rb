@@ -37,9 +37,14 @@ module Kino
       self
     end
 
-    # Groups alive and serving, quarantine replacements aside.
+    # Groups that are staying: quarantine replacements aside, and minus
+    # those already told to leave. A retiring group leaves the count at
+    # once, not when its last thread exits, so the scaler never sees a
+    # stale surplus and retires past its floor.
     def active_count
-      @lock.synchronize { @groups.count { |index, _| !@replacements.key?(index) } }
+      @lock.synchronize do
+        @groups.count { |index, _| !@replacements.key?(index) && !@retiring.key?(index) }
+      end
     end
 
     # Group index => slot ids for every group the scaler may retire: not

@@ -70,10 +70,15 @@ module Kino
       Log.error("shutdown deadline passed with stuck ractor workers") unless done?
     end
 
-    # Workers alive and serving: the live ones minus those the quarantine
-    # monitor abandoned as wedged (their replacements count instead).
+    # Workers that are staying: the live ones minus those the quarantine
+    # monitor abandoned as wedged (their replacements count instead) and
+    # minus those already told to leave. A retiring worker leaves the
+    # count at once, not when its ractor finally exits, so the scaler
+    # never sees a stale surplus and retires past its floor.
     def active_count
-      @lock.synchronize { @live.count { |index, _| !@replaced.key?(index) } }
+      @lock.synchronize do
+        @live.count { |index, _| !@replaced.key?(index) && !@retiring.key?(index) }
+      end
     end
 
     # Worker index => slot ids for every worker the scaler may retire:
