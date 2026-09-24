@@ -1,4 +1,4 @@
-## [Unreleased]
+## [0.7.1] - 2026-09-25
 
 - Updated Magnus to 0.9 and other dependencies.
 - Kino is now tested against Ruby HEAD (the unreleased next version)
