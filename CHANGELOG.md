@@ -1,3 +1,7 @@
+## [Unreleased]
+
+- Updated Magnus to 0.9 and other dependencies.
+
 ## [0.7.0] - 2026-09-08
 
 - Experimental elastic worker pool. Set `max_workers` above `workers`

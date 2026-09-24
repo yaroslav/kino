@@ -32,7 +32,7 @@ use std::sync::{Arc, OnceLock};
 
 use magnus::rb_sys::AsRawValue;
 use magnus::value::Opaque;
-use magnus::{gc, prelude::*, RString, Ruby, Value};
+use magnus::{prelude::*, RString, Ruby, Value};
 use parking_lot::{Mutex, RwLock};
 
 use crate::pin::{PinKeeper, PinSlab};
@@ -296,7 +296,7 @@ pub fn cgi_name(lower: &str) -> String {
 /// registration takes the VM lock, and nothing else must exist yet.
 fn frozen(ruby: &Ruby, s: &str) -> Opaque<RString> {
     let string = frozen_str(ruby, s);
-    gc::register_mark_object(string);
+    ruby.gc_register_mark_object(string);
     Opaque::from(string)
 }
 
@@ -339,7 +339,7 @@ pub fn init(ruby: &Ruby) {
     // The slab's GC-visible face lives for the process: registered here
     // on the main ractor, before any worker ractor can exist.
     let slab = Arc::new(PinSlab::with_capacity(CACHE_SLAB_CAPACITY));
-    gc::register_mark_object(ruby.obj_wrap(PinKeeper(slab.clone())));
+    ruby.gc_register_mark_object(ruby.obj_wrap(PinKeeper(slab.clone())));
 
     let strings = EnvStrings {
         request_method: frozen(ruby, "REQUEST_METHOD"),
@@ -400,8 +400,8 @@ pub fn register_defaults(
             ));
         }
     }
-    gc::register_mark_object(errors);
-    gc::register_mark_object(null_input);
+    ruby.gc_register_mark_object(errors);
+    ruby.gc_register_mark_object(null_input);
     let s = get();
     *s.errors_stream.write() = Some(Opaque::from(errors));
     *s.null_input.write() = Some(Opaque::from(null_input));
