@@ -409,7 +409,7 @@ pub fn test_server(lanes: bool, queue_depth: usize) -> Arc<ServerInner> {
         access_log: None,
         lanes,
         lane_cursor: AtomicUsize::new(0),
-        pin_slab: Arc::new(crate::pin::PinSlab::new()),
+        pin_slab: Arc::new(crate::pin::PinSlab::for_responses(false)),
         queue_histogram: QueueHistogram::new(),
     })
 }

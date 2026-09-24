@@ -26,6 +26,18 @@
 //! The slab is also how env_strings.rs roots its cached env strings (a
 //! second slab, marked through its own keeper), for the same reason: no
 //! GC registration API may be called from parallel ractors.
+//!
+//! Per-ractor GC (Ruby 4.1): each ractor collects its own heap, and a
+//! local collection marks only that ractor's roots. A keeper on the main
+//! ractor is invisible to a worker ractor's local GC, so a string the
+//! worker allocated and rooted only here would be swept while hyper
+//! still reads its bytes. Shareable objects are exempt: only a global
+//! GC, which marks every root including the keeper, may free them. A
+//! slab serving worker ractors on such a Ruby therefore pins only
+//! strings already flagged shareable (typically an app's frozen
+//! constants) and copies the rest; making each per-request body
+//! shareable instead would push it into the population only a
+//! stop-the-world collection reclaims.
 
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::Arc;
@@ -47,6 +59,10 @@ pub const ZERO_COPY_MIN: usize = 4096;
 /// throughput heuristic, not a limit on concurrency.
 const SLAB_CAPACITY: usize = 4096;
 
+/// Whether this Ruby collects each ractor's heap separately (see the
+/// module docs). Ruby 4.0 has one heap for every ractor.
+const PER_RACTOR_GC: bool = cfg!(ruby_gte_4_1);
+
 extern "C" {
     // Exported by libruby but absent from the public headers: io.c's
     // buffer-stabilizing primitive (see module docs). Signature per
@@ -61,18 +77,28 @@ pub struct PinSlab {
     slots: Box<[AtomicU64]>,
     /// Rotating claim cursor: keeps the free-slot scan O(1) amortized.
     cursor: AtomicUsize,
+    /// Pin only strings flagged shareable (pinned_bytes): set for a
+    /// slab that worker ractors fill on a per-ractor-GC Ruby.
+    shareable_only: bool,
 }
 
 impl PinSlab {
-    /// A slab for one server's in-flight response buffers.
-    pub fn new() -> Self {
-        Self::with_capacity(SLAB_CAPACITY)
+    /// A slab for one server's in-flight response buffers, filled by
+    /// worker ractors when `ractor_mode` (else by main-ractor threads).
+    pub fn for_responses(ractor_mode: bool) -> Self {
+        PinSlab {
+            shareable_only: ractor_mode && PER_RACTOR_GC,
+            ..Self::with_capacity(SLAB_CAPACITY)
+        }
     }
 
+    /// A slab for callers that root only shareable values themselves
+    /// (env_strings), or for tests.
     pub fn with_capacity(capacity: usize) -> Self {
         PinSlab {
             slots: (0..capacity).map(|_| AtomicU64::new(0)).collect(),
             cursor: AtomicUsize::new(0),
+            shareable_only: false,
         }
     }
 
@@ -169,9 +195,10 @@ impl Drop for PinnedBuf {
 }
 
 /// Bytes borrowing `body`'s buffer, with the string rooted until hyper
-/// drops it; None when the body is below ZERO_COPY_MIN or the slab is
-/// full (caller copies). Requires the calling worker's GVL; safe from
-/// any ractor.
+/// drops it; None when the body is below ZERO_COPY_MIN, the slab is
+/// full, or the slab takes only shareable strings and this one is not
+/// (caller copies). Requires the calling worker's GVL; safe from any
+/// ractor.
 pub fn pinned_bytes(slab: &Arc<PinSlab>, body: RString) -> Option<Bytes> {
     if body.len() < ZERO_COPY_MIN {
         return None;
@@ -180,6 +207,9 @@ pub fn pinned_bytes(slab: &Arc<PinSlab>, body: RString) -> Option<Bytes> {
     // by the caller. The acquired tmp is rooted by this thread's machine
     // stack (conservatively scanned) until the slab insert publishes it.
     let tmp = unsafe { rb_str_tmp_frozen_acquire(body.as_raw()) };
+    if slab.shareable_only && !flagged_shareable(tmp) {
+        return None;
+    }
     let index = slab.insert(tmp)?;
     // SAFETY: tmp is frozen, alive, and slab-rooted; len >= ZERO_COPY_MIN
     // rules out an embedded buffer, so ptr is a stable heap allocation.
@@ -197,13 +227,22 @@ pub fn pinned_bytes(slab: &Arc<PinSlab>, body: RString) -> Option<Bytes> {
     }))
 }
 
+/// Whether `value` (a heap object) carries the shareable flag. A plain
+/// flag read: a frozen string that no one has checked yet may be
+/// shareable in principle but unflagged, and the GC goes by the flag.
+fn flagged_shareable(value: rb_sys::VALUE) -> bool {
+    let shareable = rb_sys::ruby_fl_type::RUBY_FL_SHAREABLE as rb_sys::VALUE;
+    // SAFETY: value is a live heap object (an RString) under the GVL.
+    unsafe { (*(value as *const rb_sys::RBasic)).flags & shareable != 0 }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
     #[test]
     fn insert_release_reuse_cycle() {
-        let slab = PinSlab::new();
+        let slab = PinSlab::with_capacity(SLAB_CAPACITY);
         let a = slab.insert(0x1000).expect("slot free");
         let b = slab.insert(0x2000).expect("slot free");
         assert_ne!(a, b);
@@ -222,7 +261,7 @@ mod tests {
 
     #[test]
     fn full_slab_refuses_instead_of_evicting() {
-        let slab = PinSlab::new();
+        let slab = PinSlab::with_capacity(SLAB_CAPACITY);
         let indexes: Vec<usize> = (0..SLAB_CAPACITY)
             .map(|i| slab.insert(0x1000 + i as rb_sys::VALUE).expect("capacity"))
             .collect();

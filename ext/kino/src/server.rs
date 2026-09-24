@@ -117,6 +117,7 @@ pub fn server_start(ruby: &Ruby, config: magnus::RHash) -> Result<(u64, u16, Opt
     let (req_tx, req_rx) = flume::bounded(queue_depth);
     let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
 
+    let pin_slab = Arc::new(crate::pin::PinSlab::for_responses(mode == "ractor"));
     let server = Arc::new(ServerInner {
         id: registry::next_server_id(),
         req_tx: Mutex::new(Some(req_tx)),
@@ -150,7 +151,7 @@ pub fn server_start(ruby: &Ruby, config: magnus::RHash) -> Result<(u64, u16, Opt
         access_log: log_requests.then(|| crate::logsink::Sink::new(std::io::stdout())),
         lanes,
         lane_cursor: std::sync::atomic::AtomicUsize::new(0),
-        pin_slab: Arc::new(crate::pin::PinSlab::new()),
+        pin_slab,
         queue_histogram: registry::QueueHistogram::new(),
     });
 

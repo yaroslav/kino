@@ -518,7 +518,7 @@ pub fn test_ctx() -> crate::registry::BoxedCtx {
         body_rx: None,
         leftover: None,
         slot: None,
-        pin_slab: Arc::new(crate::pin::PinSlab::new()),
+        pin_slab: Arc::new(crate::pin::PinSlab::for_responses(false)),
         responder: Arc::new(Responder::new(head_tx)),
         enqueued_at: std::time::Instant::now(),
         timed: false,
