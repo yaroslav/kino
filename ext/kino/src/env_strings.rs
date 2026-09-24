@@ -12,6 +12,10 @@
 //! immortal. Built once, with the GVL held, on the main ractor; read-only
 //! afterwards.
 //!
+//! Every cached string is flagged shareable as it is built, not just
+//! frozen: under per-ractor GC (Ruby 4.1) that flag is what keeps a
+//! string one ractor allocated alive in another ractor's env.
+//!
 //! The LRU caches (hosts, peer addresses, interned header values) are the
 //! exception: they insert and evict from every worker ractor in parallel.
 //! That rules out per-value GC registration, because in Ruby 4.0
@@ -303,9 +307,7 @@ fn frozen(ruby: &Ruby, s: &str) -> Opaque<RString> {
 /// A fresh frozen string, rooted only by the caller's stack until a
 /// cache slot or an env takes it.
 fn frozen_str(ruby: &Ruby, s: &str) -> RString {
-    let string = ruby.str_new(s);
-    string.freeze();
-    string
+    shareable(ruby.str_new(s))
 }
 
 /// Header values are bytes on the wire (not guaranteed UTF-8), so they
@@ -313,8 +315,20 @@ fn frozen_str(ruby: &Ruby, s: &str) -> RString {
 /// uncached path; interning must not change the encoding an app
 /// observes.
 fn frozen_slice(ruby: &Ruby, bytes: &[u8]) -> RString {
-    let string = ruby.str_from_slice(bytes);
+    shareable(ruby.str_from_slice(bytes))
+}
+
+/// Freeze `string` and flag it shareable. Every cached string ends up
+/// in envs on other ractors, and with per-ractor GC (Ruby 4.1) the flag
+/// is what keeps it alive there: a ractor's local sweep never frees a
+/// shareable object, while an unflagged one allocated on a worker
+/// ractor is rooted only by the keeper on main, which that local GC
+/// does not see. Called before any cache lock is taken (module docs).
+fn shareable(string: RString) -> RString {
     string.freeze();
+    // SAFETY: GVL held; a frozen string without ivars is shareable by
+    // definition, so this only sets the flag and cannot raise.
+    unsafe { rb_sys::rb_ractor_make_shareable(string.as_raw()) };
     string
 }
 

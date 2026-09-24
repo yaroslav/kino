@@ -3,6 +3,9 @@
 - Updated Magnus to 0.9 and other dependencies.
 - Kino is now tested against Ruby HEAD (the unreleased next version)
   as well as Ruby 4.0.
+- Fixed a crash on Ruby 4.1 in ractor mode: with Ruby's new
+  per-ractor GC, a worker ractor could collect cached env strings and
+  large response bodies that other ractors were still using.
 
 ## [0.7.0] - 2026-09-08
 
