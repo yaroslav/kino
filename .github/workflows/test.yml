@@ -12,13 +12,17 @@ jobs:
   test:
     name: Ruby ${{ matrix.ruby }} on ${{ matrix.os }}
     runs-on: ${{ matrix.os }}
+    # Ruby head is an early warning, not a gate: it can break for reasons
+    # upstream (rb-sys bindings, ractor internals) before a fix is possible
+    # here, so its failures show in the run without failing the workflow.
+    continue-on-error: ${{ matrix.ruby == 'head' }}
     strategy:
       fail-fast: false
       matrix:
         # No Windows: Kino's signal handling (SIGUSR1 stats, INT/TERM drain)
         # and Ractor scheduling are only exercised on POSIX platforms.
         os: [ubuntu-latest, macos-latest]
-        ruby: ["4.0"]
+        ruby: ["4.0", head]
 
     steps:
       - uses: actions/checkout@v6
