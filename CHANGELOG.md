@@ -1,4 +1,4 @@
-## [Unreleased]
+## [0.7.2] - 2026-10-24
 
 - Updated dependencies, including tokio 1.54, hyper 1.12 and
   parking_lot 0.13, which is faster under lock contention.
