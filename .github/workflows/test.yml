@@ -25,7 +25,7 @@ jobs:
         ruby: ["4.0", head]
 
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
 
       - name: Set up Ruby & Rust
         uses: oxidize-rb/actions/setup-ruby-and-rust@v1

@@ -1,3 +1,8 @@
+## [Unreleased]
+
+- Updated dependencies, including tokio 1.54, hyper 1.12 and
+  parking_lot 0.13, which is faster under lock contention.
+
 ## [0.7.1] - 2026-09-25
 
 - Updated Magnus to 0.9 and other dependencies.

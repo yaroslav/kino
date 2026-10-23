@@ -129,7 +129,10 @@ RSpec.describe "HTTP/2" do
   it "keeps distinct authorities distinct in the host cache" do
     with_server(echo_env) do |_host, port|
       by_ip = h2c_client.get("http://127.0.0.1:#{port}/")
-      by_name = h2c_client.get("http://localhost:#{port}/")
+      # Pin localhost to the IPv4 listener: httpx may resolve it to ::1
+      # first, and the spec server binds 127.0.0.1 only.
+      by_name = h2c_client.with(addresses: {"localhost" => ["127.0.0.1"]})
+        .get("http://localhost:#{port}/")
 
       expect(by_ip.body.to_s)
         .to eq("HTTP/2|127.0.0.1:#{port}|127.0.0.1|#{port}|http")
