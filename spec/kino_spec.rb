@@ -19,11 +19,5 @@ RSpec.describe Kino do
       expect(Kino.available_parallelism).to be_a(Integer)
       expect(Kino.available_parallelism).to be >= 1
     end
-
-    it "is what `workers` defaults to" do
-      allow(Kino).to receive(:available_parallelism).and_return(3)
-
-      expect(Kino::Configuration.new.to_h[:workers]).to eq(3)
-    end
   end
 end

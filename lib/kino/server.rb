@@ -67,7 +67,13 @@ module Kino
       @app = app
       @bind = settings[:bind]
       @requested_port = settings[:port]
-      @workers = Integer(settings[:workers])
+      @on_error = validate_hook(settings[:on_error], :on_error)
+      @after_worker_boot = validate_hook(settings[:after_worker_boot], :after_worker_boot)
+      @after_request_complete = validate_hook(settings[:after_request_complete], :after_request_complete)
+      @after_boot = validate_hook(settings[:after_boot], :after_boot)
+      @on_worker_exit = validate_hook(settings[:on_worker_exit], :on_worker_exit)
+      @mode = resolve_mode(settings[:mode])
+      @workers = Integer(settings[:workers] || default_workers)
       # The pool ceiling; equal to the floor for a fixed pool.
       @max_workers = settings[:max_workers].nil? ? @workers : Integer(settings[:max_workers])
       if @max_workers < @workers
@@ -78,12 +84,6 @@ module Kino
       if !settings[:scale_down_after].nil? && !elastic?
         Log.warn("scale_down_after has no effect unless max_workers is above workers")
       end
-      @on_error = validate_hook(settings[:on_error], :on_error)
-      @after_worker_boot = validate_hook(settings[:after_worker_boot], :after_worker_boot)
-      @after_request_complete = validate_hook(settings[:after_request_complete], :after_request_complete)
-      @after_boot = validate_hook(settings[:after_boot], :after_boot)
-      @on_worker_exit = validate_hook(settings[:on_worker_exit], :on_worker_exit)
-      @mode = resolve_mode(settings[:mode])
       @worker_hooks = WorkerHooks.new(
         on_error: @on_error,
         after_worker_boot: @after_worker_boot,
@@ -255,10 +255,14 @@ module Kino
     # CLI funnels into this too (CLI#serve).
     #
     # @param app [#call] a Rack 3 application
+    # @param credits [Boolean] print the opening credits (the CLI prints them
+    #   itself, ahead of loading the app, and passes false)
+    # @param on_ready [#call, nil] called once the ready block is out; the
+    #   CLI's seam for replaying held-back app output
     # @param opts [Hash] see #initialize
     # @return [Kino::Server] the (stopped) server, after shutdown
-    def self.run(app, **opts)
-      new(app, **opts).run
+    def self.run(app, credits: true, on_ready: nil, **opts)
+      new(app, **opts).run(credits: credits, on_ready: on_ready)
     end
 
     # Serve until shut down: start, print the banner, trap INT/TERM for
@@ -266,17 +270,18 @@ module Kino
     # The Rack handler calls this on a server it built itself.
     #
     # @return [self] after shutdown
-    def run
+    def run(credits: true, on_ready: nil)
       # Startup output must land immediately even when stdout is a pipe or
       # file (process supervisors, `kino > server.log`, `rails server`
       # under Docker); block buffering would hold the banner back until
       # exit.
       $stdout.sync = true
-      CLI.opening_credits
+      CLI.opening_credits if credits
       start
       CLI.action!(self)
       CLI.fin_at_exit
       self.class.trap_signals(self)
+      on_ready&.call
       wait
       self
     end
@@ -357,11 +362,17 @@ module Kino
     # timeslices instead of adding parallelism, and a fresh ractor can wait
     # seconds for its first one while the others are CPU-bound.
     def warn_scheduler_cap
-      cap = Integer(ENV.fetch("RUBY_MAX_CPU", "8"), exception: false) || 8
+      cap = Kino.ruby_max_cpu
       return if @max_workers <= cap
 
       Log.warn("#{@max_workers} ractor workers exceed RUBY_MAX_CPU=#{cap}: only #{cap} can run " \
         "Ruby code at once; set RUBY_MAX_CPU=#{@max_workers} for CPU-bound apps")
+    end
+
+    # Threads are not limited by RUBY_MAX_CPU, ractors are.
+    def default_workers
+      cpus = Kino.available_parallelism
+      (@mode == :ractor) ? [cpus, Kino.ruby_max_cpu].min.clamp(1..) : cpus
     end
 
     def start_pool_scaler

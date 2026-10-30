@@ -4,12 +4,10 @@
 # Run with:  bundle exec kino
 # (the kino CLI picks up config.ru and this file automatically)
 
-# Rails needs :threaded mode today; see the ractor_probe.rb script in this
-# directory for the current state of the :ractor experiment.
-mode :threaded
+# Threaded mode still works: bundle exec kino --mode threaded
+mode :ractor
 
 port 9292
-threads 5
 
 environment "production"
 

@@ -23,6 +23,9 @@ module Kino
   # CPUs this process may use (affinity mask and cgroup quota); never below 1.
   def self.available_parallelism: () -> Integer
 
+  # RUBY_MAX_CPU as Ruby reads it: 8 when unset or not an integer.
+  def self.ruby_max_cpu: () -> Integer
+
   class Server
     attr_reader port: Integer?
     attr_reader control_port: Integer?
@@ -56,10 +59,10 @@ module Kino
     def stats: () -> stats_hash
 
     # Production entry point: build the server and #run it.
-    def self.run: (rack_app app, **untyped opts) -> Server
+    def self.run: (rack_app app, ?credits: bool, ?on_ready: (^() -> void)?, **untyped opts) -> Server
 
     # Serve until shut down: start, banner, signal traps, block until done.
-    def run: () -> self
+    def run: (?credits: bool, ?on_ready: (^() -> void)?) -> self
 
     # INT/TERM drain gracefully (second signal force-exits); USR1 prints stats.
     def self.trap_signals: (Server server) -> void

@@ -2,9 +2,15 @@
 
 source "https://rubygems.org"
 
-# Edge Rails: the Ractor-shareability work (shims merged 2026-05, AR
-# freeze/constantize in progress) only exists on main.
+# Edge Rails: ractorize! only exists on main.
 gem "rails", github: "rails/rails", branch: "main"
+gem "sqlite3", ">= 2.1"
+
+# Unreleased Ractor fixes, as in https://github.com/Shopify/ractor-safe-rails
+# ractorize! requires rack/ractorize, which no rack release ships yet.
+gem "rack", github: "rack/rack", branch: "main"
+# Released i18n keeps its config in class variables that worker Ractors cannot read.
+gem "i18n", github: "Shopify/i18n", branch: "ractor_support"
 
 gem "kino", path: "../.."
 gem "puma"

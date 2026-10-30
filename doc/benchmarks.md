@@ -78,8 +78,8 @@ the deployment most apps run today.
 ## Reading the headline tables
 
 These tables all run the **tiny synthetic Ractor-shareable app**. The real
-Rails app is not Ractor-shareable and runs only in threaded fallback—a
-separate story with separate numbers, in [its own section](#rails).
+Rails app's numbers were measured in threaded mode, before Rails could
+run on Ractors—a separate story, in [its own section](#rails).
 
 - **Plaintext/10k**: Kino's tokio front-end clears the fork cluster by
   1.5-2.1× (lanes plaintext 250,222 vs Puma 118,176 = 2.12×; the
@@ -197,10 +197,11 @@ the Rack contract—which is the experiment this gem exists to run.
 
 ## Rails
 
-Rails is **not Ractor-shareable**, so Kino can only serve it in
-`:threaded` fallback—this whole section is one GVL-bound Kino process,
-never ractor mode. The example app (`examples/rails-hello`, edge Rails,
-production mode, 8 workers × 5 threads) on the same box:
+These are `:threaded` measurements from before Rails could run on
+Ractors, so this whole section is one GVL-bound Kino process; ractor-mode
+Rails is not benchmarked yet. The app is the controller-only Rails hello
+app, kept as the bench subject in `bench/rails_hello.ru` (edge Rails,
+production mode, 8 workers × 5 threads), on the same box:
 
 | | req/s | RSS | PSS |
 |---|---:|---:|---:|
@@ -216,8 +217,8 @@ to read 8× off RSS). Preloading barely moves it—389 MB with
 `preload_app!` vs 400 MB without—because Ruby's GC dirties most heap
 pages, breaking copy-on-write, so even a preloaded cluster keeps a
 private heap per worker. Rails-on-Ractors is interesting precisely
-because it would close the throughput gap at the one-process memory
-cost; the upstream blockers are documented in
+because it could close the throughput gap at the one-process memory
+cost; what runs today is documented in
 [rails-on-ractors.md](rails-on-ractors.md).
 
 ## YJIT × Ractors gotcha (found the hard way)
