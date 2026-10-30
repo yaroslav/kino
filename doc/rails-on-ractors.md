@@ -1,51 +1,135 @@
 # Rails on Kino, and the state of Rails-on-Ractors
 
-`examples/rails-hello` runs edge Rails on Kino.
+Rails main partially runs on Ractors: `Rails.application.ractorize!`
+makes a booted production app shareable, and Kino serves it from worker
+Ractors. `examples/rails-hello` is a single-file Rails app that does
+exactly that. Its Ractor setup follows Shopify's
+[ractor-safe-rails](https://github.com/Shopify/ractor-safe-rails)
+template. The blockers listed here in June 2026 (unshareable boot-time
+procs, class-level state read from worker Ractors) were resolved
+upstream by `ractorize!`.
 
-## What works as of Kino 0.1.0: `:threaded` mode
+## How to run it
 
-Rails 8.2.0.alpha boots and serves with `mode :threaded` (see the
-example's `kino.rb`; just `bundle exec kino` in that directory). Measured
-on the hello-world (c7a.2xlarge, 8 cores, production mode, 8×5):
-~2.6k req/s in 92 MB PSS, single process. The 8-worker Puma cluster
-reaches ~12.1k by parallelizing across forks, at 389 MB PSS (794 MB RSS,
-but its forks share the framework copy-on-write, so PSS is the fair
-figure)—Rails-on-Ractors is interesting precisely because it could offer
-that ~4.6× parallelism at ~1/4th of the memory.
+```sh
+cd examples/rails-hello
+bundle exec kino                   # mode :ractor, from kino.rb
+bundle exec kino --mode threaded   # the same app on plain threads
+bundle exec kino --check           # reports the app Ractor-shareable
+```
 
-Pair it with production-style Rails settings: eager load, no code
-reloading, database pool ≥ workers × threads, logger to stdout or another
-thread-safe device.
+Keep `bundle exec`: the example needs the Gemfile's Rails main, not an
+installed Rails release. `config.ru` calls `HelloApp.ractorize!` and
+runs `HelloApp.instance` (running the class works too, but `--check`
+flags its class-level ivars). Puma in single mode serves it
+(`bundle exec puma config.ru`); in cluster mode it hangs, because the
+Ractor-safe logger's writer thread does not survive fork.
 
-## What doesn't (yet): `:ractor` mode—with the exact blockers
+## What works
 
-`examples/rails-hello/ractor_probe.rb` re-tests this against whatever
-Rails is bundled; when it prints SUCCEEDED *and* a 200 ractor-mode
-response (sharing the app is only the first blocker), flip
-`mode :ractor`. As of June 2026 (rails main):
+Verified on the example in `:ractor` mode:
 
-1. **Sharing the booted app fails.**
-   `Ractor.make_shareable(Rails.application)` raises
-   `Ractor::IsolationError: Proc's self is not shareable` at
-   `railties/lib/rails/application/finisher.rb:151`—a routes-reloader
-   hook lambda Rails registers at boot (in the development path) whose
-   `self` is the unshareable application instance.
-2. **Calling the app from a worker ractor fails** even where
-   `make_shareable` succeeds on a class:
-   `Ractor::IsolationError: can not get unshareable values from instance
-   variables of classes/modules from non-main Ractors (@instance from
-   HelloApp)`—`Rails.application` is a class-level ivar read on the
-   dispatch path.
-3. **Every workaround is closed by one VM rule** (verified on Ruby 4.0.5):
-   class instance variables are main-ractor-only—non-main ractors can
-   neither read them (when the value is unshareable) nor set them, **even
-   inside a `Ruby::Box`** (`RUBY_BOX=1`). Box isolates constant tables,
-   but Ractor isolation still applies to box-local classes:
+- Controllers and routes, including the root route and a posts
+  resource.
+- Active Record on SQLite: reads, inserts, and a table that persists
+  across restarts.
+- Rendering plain text and JSON.
+- Validations: an over-long post body returns 422 with the validation
+  message.
+- Error pages: unknown paths return 404, a request missing a required
+  parameter returns 400, and the server keeps serving.
+- Concurrent reads from several worker Ractors, with no Ractor errors.
 
-   ```
-   Ractor::IsolationError: can not set instance variables of
-   classes/modules by non-main Ractors
-   ```
+## What the example sets, and why
 
-   So booting a private Rails per worker ractor (boxed or not) dies on
-   the first class-ivar write, and sharing one boot dies on reads.
+Most of these fixed a concrete failure. The first block is gems, the
+rest is app code.
+
+**Gems** (`Gemfile`)
+
+- **Rails main.** `ractorize!` exists only there.
+- **rack main.** Boot fails in `ractorize!` with `rack/ractorize not
+  available` because no released rack ships that file.
+- **Shopify's i18n `ractor_support` branch.** Released i18n keeps its
+  config in class variables, which worker Ractors cannot read: every
+  request answers 500 with `can not access class variables from
+  non-main Ractors`.
+
+**Settings** (`app.rb` and `config.ru`)
+
+- **`ENV["RAILS_ENV"] ||= "production"`.** The ractorized app only boots
+  in production.
+- **`ActiveSupport::Ractors.unshareable_proc_action = :raise`.** Without
+  it, boot fails making a boot-time proc shareable (`Proc's self is not
+  shareable`).
+- **`ActiveSupport::TaggedLogging.ractor_logger($stdout)`.** A plain
+  `Logger` holds a `Monitor`, which `ractorize!` cannot make shareable.
+- **`config.i18n.fallbacks = true`.** Without it, every render reads
+  `I18n.fallbacks` from a class variable and answers 500.
+- **`require "i18n/ractorize"` after `ractorize!`.** It makes I18n's
+  backend shareable. Without it, any `I18n.t` from a worker, such as a
+  validation message, answers 500 with an isolation error on
+  `I18n::Config`.
+- **`config.cache_store = :null_store`.** The default cache store is
+  not Ractor-safe, so this protects anyone who adds `Rails.cache`.
+- **`config.public_file_server.enabled = false`.** Carried over from
+  the template; not needed by the example.
+- **Routes through `routes.append` inside the app class, and controllers
+  defined before `initialize!`.** Boot freezes the route set, so a
+  later `routes.draw` fails, and the eager-loading boot looks up each
+  route's controller.
+- **`render body: payload.to_json, content_type: "application/json"`
+  instead of `render json:`.** The JSON renderer is defined with an
+  unshareable block, so worker Ractors cannot call it.
+- **`Post.define_attribute_methods` in the main Ractor.** Without it the
+  first boot passes, but after a restart over existing rows every
+  `/posts` request fails with an isolation error on a generated
+  attribute-methods constant.
+- **`max_connections=64` in the database URL.** Worker Ractors send
+  every database call through one main-Ractor thread; a checkout that
+  waits on the pool blocks the check-ins that would free a connection,
+  and requests time out. Keep it at least workers × threads.
+- **No SQLite busy timeout.** See the limitations below.
+- **`Rails.backtrace_cleaner.remove_filters!`.** Ruby 4.0.9 crashes when
+  a Ractor-shareable proc calls `String#sub` with a regex from many
+  Ractors at once. Rails' backtrace cleaner does exactly that on
+  concurrent errors, so the example clears its filters. Logged
+  backtraces keep full paths.
+
+## What does not work yet
+
+As of Rails main and Ruby 4.0.9:
+
+- **Database work does not scale with workers.** Rails runs every worker
+  Ractor's database call on one main-Ractor thread, through
+  ractor-dispatch's single executor thread. Concurrent SQLite write
+  transactions from several Ractors also contend. The example sets no
+  busy timeout, so the loser fails fast with a 500 (`database is
+  locked`) instead of stalling every worker while it waits.
+- **Action Cable, the default cache store, the Solid gems and the async
+  Active Job adapter are not Ractor-safe yet.** Apps that need them stay
+  on `:threaded`.
+- **Built-in renderers such as `render json:` fail from worker
+  Ractors.** `Renderers.add` defines them with a plain block. The
+  example renders JSON with `render body:`.
+- **Attribute methods must be defined in the main Ractor at boot.** Call
+  `define_attribute_methods` on each model; a worker cannot define them.
+- **Puma cluster mode hangs.** The Ractor-safe logger starts a writer
+  thread at boot, and it does not survive fork. Puma single mode works.
+- **Production only.** The ractorized app only boots in production (the
+  example defaults `RAILS_ENV` to production).
+- **The regex crash above** is a Ruby VM bug; the backtrace filters stay
+  off until it is fixed.
+- **Branch gems.** The example needs rack main and the i18n branch until
+  their Ractor support is released.
+
+## Threaded mode
+
+`:threaded` runs any Rails app, including the parts above. Pair it with
+production-style settings: eager load, no code reloading, a database
+pool of at least workers × threads, and a logger on stdout or another
+thread-safe device. The Rails numbers in the
+[README](../README.md#rails) and [benchmarks](benchmarks.md#rails) were
+measured in `:threaded` mode on the controller-only hello app
+(`bench/rails_hello.ru`), before Rails could run on Ractors; ractor-mode
+Rails is not benchmarked yet.

@@ -9,7 +9,8 @@ Ruby threads cannot run Ruby code in parallel, so production setups fork
 a process per core and pay for each copy in memory. Kino runs your code
 on every core in **one small process**. A **Rust** (tokio + hyper)
 front-end owns the network, parallel **Ractors** run your Rack 3 app,
-and a threaded fallback mode runs everything else, Rails included.
+and a threaded fallback mode runs everything else. Rails main partially
+runs on Ractors too (see [Rails on Ractors](doc/rails-on-ractors.md)).
 
 * **Fast.** On a real 8-core server, every Kino mode is **1.5-1.7×**
   ahead of a Puma fork cluster on I/O-light endpoints—with native
@@ -18,7 +19,7 @@ and a threaded fallback mode runs everything else, Rails included.
   [Benchmarks](#benchmarks) below.
 * **A fraction of the memory.** About **~8×** on the simplistic bench
   Ractor app, and about **4× less memory** than a Puma cluster serving
-  Rails in fallback threaded mode.
+  Rails (measured in threaded mode, before Rails could run on Ractors).
 * **Parallel without forking.** Ractor mode runs CPU work **more than
   5× faster** than Kino's own GVL-bound threaded mode, in the same
   small process.
@@ -74,8 +75,9 @@ Measured on a real server: AWS **c7a.2xlarge** (8-core AMD EPYC 9R14,
 a CPU-bound `fib`, a 5 ms wait—deliberately small, to measure the server
 rather than an app. It is Ractor-shareable, so Kino runs it in `:ractor`
 mode (and `:threaded` for comparison). **A real Rails app is a different
-story:** it is *not* Ractor-shareable, so it runs only in Kino's
-`:threaded` fallback, with its own numbers—see [Rails](#rails) below.
+story:** the Rails numbers were measured in Kino's `:threaded` mode,
+before Rails could run on Ractors, and are reported separately—see
+[Rails](#rails) below.
 Ruby 4.0.6 with YJIT (re-measured 2026-09), every server at its
 defaults: Puma forks 8 workers × 3 threads, Kino stays in one process
 (8 workers; 1 thread each in ractor modes, 3 in threaded). Numbers are
@@ -103,9 +105,10 @@ all private per-worker heap, which copy-on-write can't share:
 | :ractor (8×1)   |         **135 MB** |                 1,072 MB |  ~8×  |
 | :threaded (8×3) |         **107 MB**³|                 1,072 MB | ~10×  |
 
-**A real Rails app** (not Ractor-shareable—Kino's `:threaded` fallback
-only, [below](#rails)). The gap is **~4×**, smaller because Rails' large
-framework *is* shared copy-on-write across Puma's forks:
+**A real Rails app** (measured in Kino's `:threaded` mode, before Rails
+could run on Ractors; [below](#rails)). The gap is **~4×**, smaller
+because Rails' large framework *is* shared copy-on-write across Puma's
+forks:
 
 | Rails hello-world | Kino :threaded | Puma cluster (8 workers) | ratio |
 |-------------------|---------------:|-------------------------:|------:|
@@ -178,9 +181,10 @@ with `bench/h2.sh`.
 
 ### Rails
 
-Rails is not Ractor-shareable today, so Kino serves it in `:threaded`
-fallback—one GVL-bound process. On the same box (`examples/rails-hello`,
-edge Rails, production, 8×5):
+These Rails numbers were measured in `:threaded` mode, one GVL-bound
+process, before Rails could run on Ractors. On the same box (the
+controller-only hello app, kept as the bench subject in
+`bench/rails_hello.ru`; edge Rails, production, 8×5):
 
 | Rails hello-world            |  req/s | memory (PSS) |
 |------------------------------|-------:|-------------:|
@@ -188,9 +192,9 @@ edge Rails, production, 8×5):
 | Puma cluster (8 workers)     | 15,422 |       405 MB |
 
 The honest trade-off: Puma's fork cluster uses all 8 cores, so it serves
-~5.6× the throughput—at ~4× the memory. Ractor-mode Rails would close
-the throughput gap at one-process memory cost; the upstream blockers are
-tracked in [doc/rails-on-ractors.md](doc/rails-on-ractors.md).
+~5.6× the throughput—at ~4× the memory. Ractor-mode Rails is not
+benchmarked yet; what runs and what does not is in
+[doc/rails-on-ractors.md](doc/rails-on-ractors.md).
 
 In short: on the tiny synthetic app, ractor mode beats fork-level CPU parallelism (**5.7×** Kino's
 own GVL-bound threaded mode, +25% over the cluster) in one process, at
@@ -287,7 +291,7 @@ server.shutdown               # graceful: drain → deadline → abort straggler
   `Kino::UnshareableAppError`. A crashed ractor returns 500 to its
   in-flight requests right away, then respawns.
 - **`:threaded`**: the same machinery on `workers × threads` plain
-  Threads. Runs **any** Rack app, including Rails, today. Parallel for
+  Threads. Runs **any** Rack app, including all of Rails. Parallel for
   I/O, serialized by the GVL for CPU.
 - **`:auto`** (default): `:ractor` when the app is shareable, otherwise
   a warning and `:threaded`. One caveat: a *class* used as a Rack app
@@ -656,12 +660,16 @@ optional in Rack 3.
 
 ## Rails
 
-Rails (edge) runs on Kino today in `:threaded` mode (`rails server -u
-kino`, or the `kino` CLI); see `examples/rails-hello`. Ractor-mode Rails
-is blocked upstream. The exact
-blockers, the `Ruby::Box` findings, and what would unlock it are written
-up in [doc/rails-on-ractors.md](doc/rails-on-ractors.md). The example
-ships a probe script that re-tests against whatever Rails you bundle.
+Rails main partially runs on Ractors: `Rails.application.ractorize!`
+makes a production app shareable. `examples/rails-hello` runs in `:ractor`
+mode with Active Record on SQLite (`bundle exec kino` in that directory;
+`--mode threaded` also works). Its Ractor setup follows Shopify's
+[ractor-safe-rails](https://github.com/Shopify/ractor-safe-rails)
+template. Action Cable, the default cache store, the Solid gems, the
+async Active Job adapter and `render json:` are not Ractor-safe yet, so
+apps that use them stay on `:threaded` (`rails server -u kino`, or the
+`kino` CLI). What the example needs, and what still does not work, is in
+[doc/rails-on-ractors.md](doc/rails-on-ractors.md).
 
 ## Development
 

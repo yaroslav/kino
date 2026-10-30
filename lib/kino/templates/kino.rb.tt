@@ -207,6 +207,6 @@
 #   - Set the database pool to at least workers x threads.
 #   - Send logs to stdout or another thread-safe destination.
 #
-# Ractor mode cannot run Rails yet; the blockers are upstream in Rails.
-# Once `Ractor.make_shareable(Rails.application)` works, switching to
-# `mode :ractor` here is all you will need.
+# Rails main partially runs on Ractors via `Rails.application.ractorize!`;
+# see doc/rails-on-ractors.md in the Kino repository. Most apps still
+# need :threaded.

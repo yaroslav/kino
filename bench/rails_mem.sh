@@ -1,12 +1,14 @@
 #!/usr/bin/env bash
-# RSS + PSS for the Rails hello-world example: Kino :threaded (one process)
-# vs a Puma cluster with and without preload_app!. Run inside the
+# RSS + PSS for the Rails hello-world bench app (rails_hello.ru, bundled
+# with examples/rails-hello's Gemfile): Kino :threaded (one process) vs a
+# Puma cluster with and without preload_app!. Run inside the
 # kino-rails-bench container. PSS (proportional set size) is the fair metric
 # for a fork cluster: it splits each copy-on-write shared page across the
 # workers mapping it, so preload's shared framework is not counted N times.
 set -u
 BENCH="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 APP="$(cd "$BENCH/../examples/rails-hello" && pwd)"
+RU="$BENCH/rails_hello.ru"
 cd "$APP"
 export RUBY_YJIT_ENABLE=1 RAILS_ENV=production RACK_ENV=production
 PORT=9293
@@ -17,7 +19,7 @@ awk '/MemTotal|MemAvailable/ {print "  "$0}' /proc/meminfo
 
 wait_ready() {
   for _ in $(seq 1 400); do
-    curl -sf "http://127.0.0.1:$PORT/" >/dev/null 2>&1 && return 0
+    curl -sf --max-time 2 "http://127.0.0.1:$PORT/" >/dev/null 2>&1 && return 0
     sleep 0.1
   done
   echo "NOT UP" >&2; return 1
@@ -62,6 +64,6 @@ run_report() {
 }
 
 echo "=== Rails hello-world (edge Rails, production, ${WORKERS}x${THREADS}) ==="
-run_report "kino-threaded"      bundle exec ruby -e 'require "kino"; require "./app"; Kino::Server.run(HelloApp, bind: "127.0.0.1", port: 9293, workers: Integer(ENV.fetch("WORKERS")), threads: 5, mode: :threaded)'
-run_report "puma-NOpreload"     bundle exec puma -q -w "$WORKERS" -t "$THREADS:$THREADS" -C "$BENCH/puma_no_preload.rb" -p "$PORT" config.ru
-run_report "puma-PRELOAD"       bundle exec puma -q -w "$WORKERS" -t "$THREADS:$THREADS" --preload  -p "$PORT" config.ru
+run_report "kino-threaded"      bundle exec ruby -e 'require "kino"; require "rack"; Kino::Server.run(Rack::Builder.parse_file(ARGV[0]), bind: "127.0.0.1", port: 9293, workers: Integer(ENV.fetch("WORKERS")), threads: 5, mode: :threaded)' "$RU"
+run_report "puma-NOpreload"     bundle exec puma -q -w "$WORKERS" -t "$THREADS:$THREADS" -C "$BENCH/puma_no_preload.rb" -p "$PORT" "$RU"
+run_report "puma-PRELOAD"       bundle exec puma -q -w "$WORKERS" -t "$THREADS:$THREADS" --preload  -p "$PORT" "$RU"

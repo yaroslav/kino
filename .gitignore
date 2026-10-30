@@ -15,4 +15,5 @@ target/
 # rspec failure tracking
 .rspec_status
 examples/rails-hello/log/
+examples/rails-hello/storage/
 /doc/api/
