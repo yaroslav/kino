@@ -255,10 +255,14 @@ module Kino
     # CLI funnels into this too (CLI#serve).
     #
     # @param app [#call] a Rack 3 application
+    # @param credits [Boolean] print the opening credits (the CLI prints them
+    #   itself, ahead of loading the app, and passes false)
+    # @param on_ready [#call, nil] called once the ready block is out; the
+    #   CLI's seam for replaying held-back app output
     # @param opts [Hash] see #initialize
     # @return [Kino::Server] the (stopped) server, after shutdown
-    def self.run(app, **opts)
-      new(app, **opts).run
+    def self.run(app, credits: true, on_ready: nil, **opts)
+      new(app, **opts).run(credits: credits, on_ready: on_ready)
     end
 
     # Serve until shut down: start, print the banner, trap INT/TERM for
@@ -266,17 +270,18 @@ module Kino
     # The Rack handler calls this on a server it built itself.
     #
     # @return [self] after shutdown
-    def run
+    def run(credits: true, on_ready: nil)
       # Startup output must land immediately even when stdout is a pipe or
       # file (process supervisors, `kino > server.log`, `rails server`
       # under Docker); block buffering would hold the banner back until
       # exit.
       $stdout.sync = true
-      CLI.opening_credits
+      CLI.opening_credits if credits
       start
       CLI.action!(self)
       CLI.fin_at_exit
       self.class.trap_signals(self)
+      on_ready&.call
       wait
       self
     end

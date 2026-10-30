@@ -1,6 +1,7 @@
 # frozen_string_literal: true
 
 require "optparse"
+require "tempfile"
 require_relative "version"
 
 module Kino
@@ -112,7 +113,8 @@ module Kino
 
     # The two banner halves around Server#start: credits before, the ready
     # block plus a bold "Action!" after, once mode and port are known.
-    # Server.run is the one caller; the kino CLI funnels into it.
+    # Server#run calls it unless the kino CLI already did, ahead of loading
+    # the app.
     # @return [void]
     def opening_credits
       puts motd
@@ -184,13 +186,28 @@ module Kino
 
       ENV["RACK_ENV"] ||= config[:environment] if config[:environment]
 
-      app = Rack::Builder.parse_file(rackup_file)
-      app = app.first if app.is_a?(Array) # rack < 3 compat
+      return check(rackup_file) if options[:check]
 
-      return Check.print_report(app) ? 0 : 1 if options[:check]
-
-      serve(app, config)
+      $stdout.sync = true
+      opening_credits
+      # The app's boot output is held back and shown under "Action!".
+      capture = OutputCapture.new
+      app = capture.during { load_app(rackup_file) }
+      begin
+        serve(app, config, capture)
+      ensure
+        capture.replay
+      end
       0
+    end
+
+    def load_app(rackup_file)
+      app = Rack::Builder.parse_file(rackup_file)
+      app.is_a?(Array) ? app.first : app # rack < 3 compat
+    end
+
+    def check(rackup_file)
+      Check.print_report(load_app(rackup_file)) ? 0 : 1
     end
 
     # Bun-style colored help, generated from the parser's own switch list
@@ -266,11 +283,85 @@ module Kino
       config
     end
 
-    def serve(app, config)
-      Server.run(app, **config.server_options)
+    def serve(app, config, capture)
+      Server.run(app, credits: false, on_ready: -> { capture.replay },
+        **config.server_options)
     end
 
+    # Holds fd 1 and 2 output in temp files while the app loads. The same
+    # IO objects stay in place (reopened onto the files and back), so
+    # loggers that captured $stdout or $stderr keep working afterwards.
+    class OutputCapture
+      def initialize
+        @files = []
+      end
+
+      # Run the block with output captured; on any exception (SystemExit
+      # included) restore and show what was captured before re-raising.
+      def during
+        begin_capture
+        yield
+      rescue Exception # rubocop:disable Lint/RescueException
+        end_capture
+        replay
+        raise
+      ensure
+        end_capture
+      end
+
+      # Write the captured output to the real streams, once.
+      def replay
+        files, @files = @files, []
+        @ios.zip(files).each do |io, file|
+          next unless file
+
+          file.rewind
+          content = file.read
+          io.write(content) unless content.empty?
+          io.flush
+        rescue IOError, SystemCallError
+          nil # a closed pipe must not take the server down
+        ensure
+          file&.close!
+        end
+      end
+
+      private
+
+      def begin_capture
+        @ios = [$stdout, $stderr]
+        @ios.each(&:flush)
+        @saved = @ios.map(&:dup)
+        @files = [Tempfile.new("kino-out"), Tempfile.new("kino-err")]
+        @ios.zip(@files).each { |io, file| io.reopen(file) }
+      end
+
+      def end_capture
+        return unless @saved
+
+        failure = flush_rails_logger
+        @ios.zip(@saved).each do |io, saved|
+          io.flush
+          io.reopen(saved)
+          io.sync = true
+          saved.close
+        end
+        @saved = nil
+        warn "kino: flushing Rails.logger failed: #{failure.message}" if failure
+      end
+
+      # Returns the error instead of raising: the fds must be restored.
+      def flush_rails_logger
+        logger = defined?(::Rails) && ::Rails.respond_to?(:logger) && ::Rails.logger
+        logger.flush if logger.respond_to?(:flush)
+        nil
+      rescue => e
+        e
+      end
+    end
+    private_constant :OutputCapture
+
     private_class_method :print_help, :option_parser, :write_sample,
-      :resolve_config, :serve, :count
+      :resolve_config, :serve, :count, :load_app, :check
   end
 end
