@@ -137,6 +137,9 @@ pub struct ServerInner {
     pub lanes: bool,
     /// Round-robin cursor for lane dispatch.
     pub lane_cursor: AtomicUsize,
+    /// Lane dispatch: stamps each park, so the dispatcher can tell which
+    /// idle worker parked last (see WorkerSlot::parked_at).
+    pub park_seq: AtomicU64,
     /// GC roots for zero-copy response buffers (pin.rs). The Ruby Server
     /// object holds the marking PinKeeper for this slab.
     pub pin_slab: Arc<crate::pin::PinSlab>,
@@ -160,6 +163,10 @@ pub struct WorkerSlot {
     pub lane_tx: Mutex<Option<flume::Sender<BoxedCtx>>>,
     pub lane_rx: Option<flume::Receiver<BoxedCtx>>,
     pub parked: std::sync::atomic::AtomicBool,
+    /// Lane mode only: when this worker last parked (ServerInner::park_seq;
+    /// 0 = never). With every worker idle, the dispatcher picks the one
+    /// that parked last: its caches are still warm.
+    pub parked_at: AtomicU64,
     /// Per-slot sensors (Relaxed, advisory). served/in_flight mirror the
     /// global counters at slot granularity; last_started_ms (stamped on
     /// admit) drives busy-age (wedge) reporting.
@@ -263,6 +270,7 @@ impl WorkerSlot {
             lane_tx: Mutex::new(lane_tx),
             lane_rx,
             parked: std::sync::atomic::AtomicBool::new(false),
+            parked_at: AtomicU64::new(0),
             served: AtomicU64::new(0),
             in_flight: AtomicUsize::new(0),
             last_started_ms: AtomicU64::new(0),
@@ -291,6 +299,7 @@ impl WorkerSlot {
         self.current.lock().clear();
         self.retired.store(false, Ordering::SeqCst);
         self.parked.store(false, Ordering::SeqCst);
+        self.parked_at.store(0, Ordering::Relaxed);
         self.interrupted.store(false, Ordering::SeqCst);
         self.served.store(0, Ordering::Relaxed);
         self.in_flight.store(0, Ordering::Relaxed);
@@ -409,6 +418,7 @@ pub fn test_server(lanes: bool, queue_depth: usize) -> Arc<ServerInner> {
         access_log: None,
         lanes,
         lane_cursor: AtomicUsize::new(0),
+        park_seq: AtomicU64::new(0),
         pin_slab: Arc::new(crate::pin::PinSlab::for_responses(false)),
         queue_histogram: QueueHistogram::new(),
     })
