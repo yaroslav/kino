@@ -103,6 +103,8 @@ fn lane_take(server: &ServerInner, slot: &Arc<WorkerSlot>) -> Result<Taken, Erro
     // Park. The flag-then-recheck order closes the race with a dispatcher
     // that read parked=false just before we set it: anything it sent lands
     // in the lane, and recv_timeout checks the queue before sleeping.
+    let seq = server.park_seq.fetch_add(1, Ordering::Relaxed) + 1;
+    slot.parked_at.store(seq, Ordering::Relaxed);
     slot.parked.store(true, Ordering::SeqCst);
     let taken = gvl::interruptible(&slot.interrupted, || {
         match lane_rx.recv_timeout(TICK) {

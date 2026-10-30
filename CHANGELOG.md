@@ -4,6 +4,13 @@
   at `RUBY_MAX_CPU` (8 unless set), so a default boot no longer warns
   on machines with more than 8 cores. An explicit `workers` is
   unchanged, and threaded mode still defaults to the CPU count.
+- With `lanes true`, a request that arrives while every worker is idle
+  now goes to the worker that finished most recently, whose caches are
+  still warm, instead of rotating through all of them. A lightly loaded
+  server keeps one client's requests on one worker; a burst still
+  spreads across idle workers. On a Ruby port of Campfire, together
+  with `io_shards true`, this turned a 13-15% single-client deficit
+  against Falcon on its heavier pages into parity or better.
 
 ## [0.7.2] - 2026-10-24
 
