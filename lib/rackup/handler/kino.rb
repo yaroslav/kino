@@ -40,7 +40,7 @@ module Rackup
         {
           "Host=HOST" => "Address to bind (default: 127.0.0.1)",
           "Port=PORT" => "Port to listen on (default: 9292)",
-          "Workers=COUNT" => "Workers: ractors in :ractor mode, thread groups in :threaded (default: one per CPU)",
+          "Workers=COUNT" => "Workers: ractors in :ractor mode, thread groups in :threaded (default: one per CPU; in :ractor mode, at most RUBY_MAX_CPU)",
           "Threads=COUNT" => "Threads per worker (default: 1 in :ractor, 3 in :threaded)",
           "Mode=MODE" => "auto | ractor | threaded (default: auto)",
           "Config=PATH" => "Kino config file (default: kino.rb, then config/kino.rb)"

@@ -43,6 +43,14 @@ module Kino
   def self.available_parallelism
     Native.available_parallelism
   end
+
+  # How many ractors Ruby runs at once: RUBY_MAX_CPU, 8 when unset or
+  # not an integer.
+  #
+  # @return [Integer]
+  def self.ruby_max_cpu
+    Integer(ENV.fetch("RUBY_MAX_CPU", "8"), exception: false) || 8
+  end
 end
 
 require_relative "kino/cli"

@@ -1,3 +1,10 @@
+## [Unreleased]
+
+- In ractor mode the default worker count is now the CPU count capped
+  at `RUBY_MAX_CPU` (8 unless set), so a default boot no longer warns
+  on machines with more than 8 cores. An explicit `workers` is
+  unchanged, and threaded mode still defaults to the CPU count.
+
 ## [0.7.2] - 2026-10-24
 
 - Updated dependencies, including tokio 1.54, hyper 1.12 and

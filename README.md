@@ -262,7 +262,7 @@ Or embedded, with everything spelled out:
 server = Kino::Server.new(app,
   bind: "127.0.0.1",          # or "unix:///run/kino.sock" behind a proxy
   port: 9292,                 # 0 = ephemeral; read back via server.port
-  workers: Kino.available_parallelism, # ractors (parallelism); the default
+  workers: 8,                 # ractors (parallelism); default: CPUs, capped at RUBY_MAX_CPU
   max_workers: nil,           # experimental: grow past workers under load (see Elastic pool)
   scale_down_after: 30,       # seconds idle before an extra worker retires
   threads: 1,                 # per worker; ractor default 1, threaded default 3
@@ -450,7 +450,9 @@ on I/O while cores sit idle; a higher ceiling puts those cores to work,
 and a ractor starts in microseconds, so the pool follows load closely.
 Pure CPU work gains nothing past the core count. In `:ractor` mode Ruby
 itself runs at most `RUBY_MAX_CPU` ractors' Ruby code at once (default
-8), and Kino warns at boot when the pool can exceed it. On a bigger box:
+8). The default `workers` in `:ractor` mode is the CPU count capped at
+that limit, so a default boot never warns; Kino warns only when an
+explicit `workers` or `max_workers` exceeds it. On a bigger box:
 
 ```sh
 RUBY_MAX_CPU=16 kino

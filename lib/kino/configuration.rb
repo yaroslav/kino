@@ -9,7 +9,7 @@ module Kino
     DEFAULTS = {
       bind: "127.0.0.1",
       port: 0,
-      workers: nil, # resolved to Kino.available_parallelism in #to_h
+      workers: nil, # resolved per mode in Server: CPUs, capped at RUBY_MAX_CPU in :ractor
       max_workers: nil, # nil = fixed pool; above workers = elastic pool
       scale_down_after: nil, # resolved to 30 seconds in Server
       threads: nil, # resolved per mode in Server: 1 in :ractor, 3 in :threaded
@@ -130,9 +130,7 @@ module Kino
 
     # @return [Hash{Symbol => Object}] every setting, defaults filled in
     def to_h
-      SETTINGS.to_h { |key| [key, self[key]] }.tap do |h|
-        h[:workers] ||= Kino.available_parallelism
-      end
+      SETTINGS.to_h { |key| [key, self[key]] }
     end
 
     # The settings Server.new accepts: everything except the keys only the
@@ -176,8 +174,9 @@ module Kino
       # Port to listen on; 0 picks an ephemeral port.
       def port(port) = @config.set(:port, Integer(port))
 
-      # Worker count (ractors in :ractor mode); defaults to CPU cores. The
-      # pool floor when max_workers is set.
+      # Worker count (ractors in :ractor mode). Defaults to the CPU count;
+      # in :ractor mode, at most RUBY_MAX_CPU (8 unless set). The pool floor
+      # when max_workers is set.
       def workers(count) = @config.set(:workers, Integer(count))
 
       # Pool ceiling: under sustained queue pressure the pool grows past
