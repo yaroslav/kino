@@ -151,6 +151,7 @@ pub fn server_start(ruby: &Ruby, config: magnus::RHash) -> Result<(u64, u16, Opt
         access_log: log_requests.then(|| crate::logsink::Sink::new(std::io::stdout())),
         lanes,
         lane_cursor: std::sync::atomic::AtomicUsize::new(0),
+        park_seq: std::sync::atomic::AtomicU64::new(0),
         pin_slab,
         queue_histogram: registry::QueueHistogram::new(),
     });
@@ -707,9 +708,11 @@ enum Dispatch {
 }
 
 /// Lane dispatch: prefer an awake (non-parked) lane with room (a hot
-/// worker keeps taking without ever paying a futex wake), then any lane
-/// with room. All lanes full = genuine overload: retry briefly up to
-/// queue_timeout, then give up (caller 503s).
+/// worker keeps taking without ever paying a futex wake); with none,
+/// the idle worker that parked last (its caches are still warm, where
+/// round-robin would wake the coldest); then any lane with room. All
+/// lanes full = genuine overload: retry briefly up to queue_timeout,
+/// then give up (caller 503s).
 fn try_dispatch(server: &ServerInner, mut ctx: BoxedCtx) -> Dispatch {
     let slots = server.slots.read();
     let n = slots.len();
@@ -718,26 +721,49 @@ fn try_dispatch(server: &ServerInner, mut ctx: BoxedCtx) -> Dispatch {
     }
     let start = server.lane_cursor.fetch_add(1, Ordering::Relaxed);
     let mut any_open = false;
-    for pass in 0..2 {
-        for k in 0..n {
-            let slot = &slots[(start + k) % n];
-            if pass == 0 && slot.parked.load(Ordering::Relaxed) {
-                continue;
-            }
-            let guard = slot.lane_tx.lock();
-            let Some(tx) = guard.as_ref() else { continue };
-            any_open = true;
-            // Checked under the lane lock, which WorkerSlot::retire also
-            // takes: see there for the ordering.
-            if slot.retired.load(Ordering::SeqCst) {
-                continue;
-            }
-            match tx.try_send(ctx) {
-                Ok(()) => return Dispatch::Sent,
-                Err(flume::TrySendError::Full(c)) | Err(flume::TrySendError::Disconnected(c)) => {
-                    ctx = c;
-                }
-            }
+    let mut try_lane = |slot: &WorkerSlot, ctx: BoxedCtx| -> Result<(), BoxedCtx> {
+        let guard = slot.lane_tx.lock();
+        let Some(tx) = guard.as_ref() else {
+            return Err(ctx);
+        };
+        any_open = true;
+        // Checked under the lane lock, which WorkerSlot::retire also
+        // takes: see there for the ordering.
+        if slot.retired.load(Ordering::SeqCst) {
+            return Err(ctx);
+        }
+        tx.try_send(ctx).map_err(|e| match e {
+            flume::TrySendError::Full(c) | flume::TrySendError::Disconnected(c) => c,
+        })
+    };
+
+    for k in 0..n {
+        let slot = &slots[(start + k) % n];
+        if slot.parked.load(Ordering::Relaxed) {
+            continue;
+        }
+        match try_lane(slot, ctx) {
+            Ok(()) => return Dispatch::Sent,
+            Err(c) => ctx = c,
+        }
+    }
+    // Only an empty lane qualifies: a burst into an idle server must
+    // spread, not queue behind one hot worker while the rest sleep.
+    let hottest = slots
+        .iter()
+        .filter(|slot| slot.parked.load(Ordering::Relaxed))
+        .filter(|slot| slot.lane_rx.as_ref().is_some_and(|rx| rx.is_empty()))
+        .max_by_key(|slot| slot.parked_at.load(Ordering::Relaxed));
+    if let Some(slot) = hottest {
+        match try_lane(slot, ctx) {
+            Ok(()) => return Dispatch::Sent,
+            Err(c) => ctx = c,
+        }
+    }
+    for k in 0..n {
+        match try_lane(&slots[(start + k) % n], ctx) {
+            Ok(()) => return Dispatch::Sent,
+            Err(c) => ctx = c,
         }
     }
     if any_open {
@@ -1675,6 +1701,41 @@ mod tests {
         assert!(matches!(try_dispatch(&server, test_ctx()), Dispatch::Sent));
         assert!(matches!(try_dispatch(&server, test_ctx()), Dispatch::Sent));
         assert_eq!(server.lane_depths(), Some(vec![0, 2]));
+    }
+
+    fn park_all(server: &ServerInner, parked_at: &[u64]) {
+        for (slot, &at) in server.slots.read().iter().zip(parked_at) {
+            slot.parked.store(true, Ordering::Relaxed);
+            slot.parked_at.store(at, Ordering::Relaxed);
+        }
+    }
+
+    #[test]
+    fn dispatch_prefers_the_idle_worker_that_parked_last() {
+        let server = test_server(true, 4);
+        for _ in 0..3 {
+            server.register_worker();
+        }
+        park_all(&server, &[1, 3, 2]);
+
+        assert!(matches!(try_dispatch(&server, test_ctx()), Dispatch::Sent));
+        assert_eq!(server.lane_depths(), Some(vec![0, 1, 0]));
+    }
+
+    #[test]
+    fn a_burst_into_an_idle_server_spreads_hottest_first() {
+        let server = test_server(true, 4);
+        for _ in 0..3 {
+            server.register_worker();
+        }
+        park_all(&server, &[1, 3, 2]);
+
+        // A lane that already holds a request no longer counts as idle.
+        let expected = [vec![0, 1, 0], vec![0, 1, 1], vec![1, 1, 1]];
+        for depths in expected {
+            assert!(matches!(try_dispatch(&server, test_ctx()), Dispatch::Sent));
+            assert_eq!(server.lane_depths(), Some(depths));
+        }
     }
 
     #[test]
