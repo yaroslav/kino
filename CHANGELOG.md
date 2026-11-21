@@ -1,5 +1,75 @@
 ## [Unreleased]
 
+- Experimental native WebSockets. With `lanes true`, an app accepts a
+  WebSocket handshake by setting `env["rack.upgrade"]` to a handler
+  when `env["rack.upgrade?"]` is `:websocket`, the convention iodine
+  and Agoo use. Kino runs the protocol in Rust, and the handler's
+  `on_open`, `on_message`, `on_drained`, `on_shutdown` and `on_close`
+  run on the worker that accepted the socket, one event at a time and
+  between its requests; an idle socket costs Ruby nothing. With it come
+  topics (`ws.subscribe`, and `Kino::WebSocket.publish` from any thread
+  or Ractor), frozen, shareable socket handles (`Kino::WebSocket[id]`),
+  a per-worker wake hook (`Kino::Worker.on_wake`), flow control
+  (`ws.pending`, `on_drained`), bounded messages, queues and socket
+  counts (`websocket_max_message`, `websocket_max`), keepalive pings
+  (`websocket_ping_interval`), and a graceful drain that runs
+  `on_shutdown` and closes each socket with 1001. A callback that
+  raises drops only its own socket and goes to `on_error`. The Rails
+  example app streams new posts to WebSocket clients in ractor mode.
+- `rack.hijack`, full and partial, is offered on HTTP/1.1 requests that
+  ask to upgrade, in both modes and with or without lanes, over TLS too,
+  so Action Cable runs unmodified in threaded mode. A full hijack
+  answers with a 101, or with a response that carries a Content-Length
+  or has no body (a 204, a 304, the answer to a HEAD); any other
+  response gets a 502. A drain does not wait for hijacked
+  connections. Each holds three file descriptors, so many open at once
+  can run the process out of them below `max_connections`.
+- Out of file descriptors, Kino now waits 10 ms between attempts to
+  accept a connection instead of retrying in a tight loop that kept a
+  CPU busy.
+- A streaming response body's write now raises `Kino::ClientGone`, an
+  `IOError`, once its client has gone, for enumerable bodies and Rack 3
+  streaming bodies alike. Writes to a vanished client used to succeed
+  silently, so an endless body such as a server-sent event feed never
+  ended and held its worker for good. A body whose response can carry
+  none (a HEAD request, a 204 or 304, or one a `request_timeout` 504
+  already answered) ends the same way as soon as it writes. Kino treats
+  this as the normal end of the request: the body is closed and
+  `after_request_complete` runs, with nothing logged and nothing sent
+  to `on_error`. Giving up on a stream whose client stopped reading no
+  longer waits for that client, so a body that raised mid-stream no
+  longer stalls its worker, nor a shutdown past its deadline. Answering
+  a request while a thread of the app's own still reads its body works
+  too, so a full-duplex body can read on one thread while another
+  writes; a `rack.hijack` call then raises an `IOError`, and a WebSocket
+  handshake gets a 500. A Rack 3 streaming body that raises mid-stream
+  now has its connection cut, as an enumerable body's is, instead of
+  ending as if complete.
+- `stats`, `/stats` and `/metrics` now count WebSockets (process-wide,
+  under `websockets`; `kino_websockets_*` and `kino_websocket_*_total`
+  with causes in a `cause` label), wake hook runs (`kino_wakes_total`),
+  open hijacked connections (`kino_hijacked_connections`, and in each
+  `worker_status` row with its open sockets) and streamed responses cut
+  short, by cause (`responses_cut`, `kino_responses_cut_total`). A
+  request leaves `in_flight` once the app hijacks it. `Server#stats`
+  keys and the USR1 stats line now follow the order `/stats` reports
+  them in.
+- In ractor mode, a worker thread that crashes (an exception that is not
+  a `StandardError`) is now cleaned up and replaced inside its ractor:
+  its in-flight requests get their 500 at once, any sibling threads
+  carry on, and the ractor's own state and app threads survive, where
+  before the crash could take the whole ractor down. `on_worker_exit`
+  fires for each crashed thread, with a `Kino::Error` naming a cause
+  that cannot be copied out of its ractor. In both modes, a worker that
+  keeps crashing within a second of starting, before it served a
+  request, `after_worker_boot` included, is now respawned after a delay
+  that doubles from 0.1 s to 5 s instead of thousands of times a second,
+  the log showing the first crash with its backtrace and each later one
+  as a single line; and a crashed worker's slot goes to a later worker
+  once its connections are gone, so crashes no longer grow the
+  per-worker rows of `stats`, `/stats` and `/metrics`, and with
+  `lanes true` a request that arrives while a crashed worker is being
+  replaced waits for a worker instead of getting a 503.
 - In ractor mode the default worker count is now the CPU count capped
   at `RUBY_MAX_CPU` (8 unless set), so a default boot no longer warns
   on machines with more than 8 cores. An explicit `workers` is
@@ -8,9 +78,38 @@
   now goes to the worker that finished most recently, whose caches are
   still warm, instead of rotating through all of them. A lightly loaded
   server keeps one client's requests on one worker; a burst still
-  spreads across idle workers. On a Ruby port of Campfire, together
-  with `io_shards true`, this turned a 13-15% single-client deficit
-  against Falcon on its heavier pages into parity or better.
+  spreads across idle workers. On the heavier server-rendered pages of
+  a database-backed Rails chat app, together with `io_shards true`,
+  this turned a 13-15% single-client deficit against a fiber-based
+  server into parity or better. A request also no longer queues behind
+  a worker that is 100 µs or more into its current request while
+  another worker sits idle: a fast request next to a one-second one used
+  to wait up to 50 ms and is now answered as quickly as without lanes,
+  while handlers faster than 100 µs keep their hot lane. In threaded
+  mode, where every worker shares one GVL, a CPU-bound app keeps its
+  throughput and mean latency, but with four clients on a 0.6 ms
+  endpoint the median rose from 1.2 to 2.4 ms while the 99th percentile
+  fell from 56 to 3 ms.
+- Fixed `Server.run`, the `kino` executable and the Rack handler
+  waiting for the workers to exit rather than for the shutdown to end:
+  after INT or TERM the process could exit with its pidfile and socket
+  files still in place; with `max_workers` above `workers` it could
+  exit on its own once the pool retired its first worker; and in
+  ractor mode a worker stuck past `shutdown_timeout` kept it from
+  exiting at all. They now return once the shutdown has ended and
+  raise its error if it failed, so the process exits non-zero. A
+  `shutdown` called during another now waits for it.
+- Fixed a threaded worker killed by an exception outside
+  `StandardError` (`raise Exception`, a stack overflow) leaving its
+  client unanswered and its request in flight, so the next shutdown
+  waited out `shutdown_timeout` or was cut short by the crash. As in
+  ractor mode, the client now gets a 500 at once and a fresh thread
+  takes its place, counted in `respawns` and
+  `kino_worker_respawns_total`.
+- Fixed a streamed response cut short, as the app raised mid-stream or
+  its worker crashed, sometimes reaching its client as nothing at all,
+  head included, rather than as what was written followed by the cut,
+  over HTTP/1.1 and HTTP/2 alike.
 
 ## [0.7.2] - 2026-10-24
 

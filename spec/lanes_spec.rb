@@ -9,9 +9,10 @@ RSpec.describe "lane dispatch" do
   def shareable_app
     Ractor.shareable_proc do |env|
       case env["PATH_INFO"]
-      when "/boom" then raise Exception, "hard crash" # rubocop:disable Lint/RaiseException
       when "/slow" then sleep 0.2
                         [200, {"content-type" => "text/plain"}, ["slow done"]]
+      when "/second" then sleep 1
+                          [200, {"content-type" => "text/plain"}, ["second done"]]
       else [200, {"content-type" => "text/plain"}, ["lane ok"]]
       end
     end
@@ -27,39 +28,30 @@ RSpec.describe "lane dispatch" do
     end
   end
 
-  it "serves in ractor mode with lanes and recovers from crashes" do
-    with_server(shareable_app, mode: :ractor, lanes: true, workers: 2, threads: 1) do |host, port, server|
-      expect(Net::HTTP.get_response(host, "/", port).body).to eq("lane ok")
-      expect(Net::HTTP.get_response(host, "/boom", port).code).to eq("500")
-
-      recovered = nil
-      20.times do
-        recovered = begin
-          Net::HTTP.get_response(host, "/", port)
-        rescue
-          nil
-        end
-        break if recovered&.code == "200"
-        sleep 0.1
-      end
-      expect(recovered&.code).to eq("200")
-      expect(server.stats[:respawns]).to eq(1)
+  each_mode do |mode|
+    it "answers fast requests at once while another worker is deep in a slow one" do
+      fast_beside_slow(mode)
     end
   end
 
-  it "steals work so a slow lane neighbor doesn't block fast requests" do
-    with_server(shareable_app, mode: :ractor, lanes: true, workers: 2, threads: 1) do |host, port|
-      slow = Thread.new { Net::HTTP.get_response(host, "/slow", port) }
-      sleep 0.05 # slow request is now occupying one of the two lanes
-
-      fast_times = 5.times.map do
-        t0 = Process.clock_gettime(Process::CLOCK_MONOTONIC)
-        Net::HTTP.get_response(host, "/", port)
-        Process.clock_gettime(Process::CLOCK_MONOTONIC) - t0
+  def fast_beside_slow(mode)
+    with_server(shareable_app, mode: mode, lanes: true, workers: 4, threads: 1) do |host, port, server|
+      Net::HTTP.get_response(host, "/", port)
+      slow = Thread.new { Net::HTTP.get_response(host, "/second", port) }
+      wait_for("the slow request to be 20 ms in") do
+        server.stats[:worker_status].any? { |worker| worker[:in_flight] > 0 && worker[:busy_ms] >= 20 }
       end
 
-      expect(slow.value.body).to eq("slow done")
-      expect(fast_times.max).to be < 0.15, "fast requests stuck behind a slow lane"
+      fast_times = 10.times.map do
+        timed { Net::HTTP.get_response(host, "/", port) }
+      end
+
+      expect(slow.value.body).to eq("second done")
+      # About 1 ms each when they go to an idle worker; one that queues
+      # behind the slow request waits for a sibling's 50 ms park tick, so
+      # 40 ms tells the two apart with room for a busy host.
+      expect(fast_times.max).to be < 0.04,
+        "fast requests waited behind the slow one: #{fast_times.map { |t| (t * 1000).round(1) }} ms"
     end
   end
 

@@ -4,35 +4,29 @@
 //! keeps TypedData objects from ever crossing a ractor boundary.
 
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
-use std::sync::{Arc, OnceLock, Weak};
+use std::sync::{Arc, OnceLock};
 use std::time::{Duration, Instant};
 
 use parking_lot::{Mutex, RwLock};
 
 use crate::request::RequestCtx;
-use crate::response::Responder;
+use crate::server::ServerConfig;
+use crate::slot::{WorkerSlot, WS_INBOX};
 
 /// Lifecycle as seen by the control plane's /ready.
 pub const STATE_BOOTING: u8 = 0;
 pub const STATE_READY: u8 = 1;
 pub const STATE_DRAINING: u8 = 2;
 
-/// Boot-time configuration echoed by /stats. Stored resolved: mode is
-/// "ractor" or "threaded", never "auto".
-pub struct Topology {
-    pub mode: String,
-    /// The pool floor: the configured worker count.
-    pub workers: usize,
-    /// The pool ceiling: equal to `workers` for a fixed pool. HTTP/2
-    /// admission (SETTINGS_MAX_CONCURRENT_STREAMS) is advertised from it.
-    pub max_workers: usize,
-    pub threads: usize,
-    pub batch: usize,
-}
-
 /// Requests travel through channels boxed: one heap allocation at accept
 /// time instead of moving ~300 bytes by value through every channel hop.
 pub type BoxedCtx = Box<RequestCtx>;
+
+/// A request, or a doorbell: the worker's WebSocket inbox has events (WorkerSlot::notify).
+pub enum LaneItem {
+    Request(BoxedCtx),
+    Bell,
+}
 
 /// Probed on every take; keys are our own ids, so ahash over SipHash.
 type HashMap<K, V> = std::collections::HashMap<K, V, ahash::RandomState>;
@@ -86,6 +80,8 @@ impl RuntimeHandle {
 /// worker slots.
 pub struct ServerInner {
     pub id: u64,
+    pub config: ServerConfig,
+    pub counters: Counters,
     /// Senders' side of the request queue. `close_queue` takes it; once all
     /// clones drop, blocked workers see Disconnected and exit their loops.
     pub req_tx: Mutex<Option<flume::Sender<BoxedCtx>>>,
@@ -96,96 +92,44 @@ pub struct ServerInner {
     /// takes ownership out of the Arc.
     pub runtime: Mutex<RuntimeHandle>,
     pub slots: RwLock<Vec<Arc<WorkerSlot>>>,
-    pub in_flight: AtomicUsize,
-    /// Requests handed to Ruby workers (admitted), and requests rejected
-    /// with a 503 (queue full / draining). Relaxed: stats-only counters.
-    pub served: AtomicU64,
-    pub rejected: AtomicU64,
-    pub queue_timeout_ms: u64,
-    /// 0 = no request timeout; otherwise the response head must arrive
-    /// within this many ms or the client gets a 504.
-    pub request_timeout_ms: u64,
-    /// 0 = unlimited; otherwise the max request-body bytes accepted before a
-    /// 413 (truthful Content-Length) or a mid-stream abort (chunked/lying).
-    pub max_body_size: usize,
-    pub timeouts: AtomicU64,
     /// Lifecycle for /ready: booting until Ruby reports the workers up,
     /// draining once stop_accepting runs. Relaxed everywhere (advisory).
     pub state: std::sync::atomic::AtomicU8,
-    /// Worker respawns, recorded from the Ruby supervisor. Lives here so
-    /// the control plane reads it without touching Ruby.
-    pub respawns: AtomicU64,
-    /// Replacements spawned by the quarantine monitor (Relaxed, advisory).
-    pub quarantine_replacements: AtomicU64,
-    /// Workers staying in the pool (a worker told to retire no longer
-    /// counts), reported by the Ruby pool as it grows and shrinks; starts
-    /// at the floor. Relaxed, advisory.
-    pub active_workers: AtomicUsize,
-    /// Pool scaler events (Relaxed, advisory).
-    pub scale_ups: AtomicU64,
-    pub scale_downs: AtomicU64,
-    pub topology: Topology,
-    pub https: bool,
-    /// HTTP/2 serving (ALPN over TLS, prior-knowledge h2c on plaintext);
-    /// false pins every connection to HTTP/1.
-    pub http2: bool,
-    /// The socket file of a `unix://` bind, removed at shutdown.
-    pub unix_path: Option<std::path::PathBuf>,
     /// Native access log sink (None unless log_requests is on).
     pub access_log: Option<crate::logsink::Sink>,
-    /// Lane-dispatch mode: per-worker queues, awake-preferring dispatch.
-    pub lanes: bool,
     /// Round-robin cursor for lane dispatch.
     pub lane_cursor: AtomicUsize,
     /// Lane dispatch: stamps each park, so the dispatcher can tell which
-    /// idle worker parked last (see WorkerSlot::parked_at).
+    /// idle worker parked last (see Park::parked_at).
     pub park_seq: AtomicU64,
     /// GC roots for zero-copy response buffers (pin.rs). The Ruby Server
     /// object holds the marking PinKeeper for this slab.
     pub pin_slab: Arc<crate::pin::PinSlab>,
-    /// Queue-wait histogram: recorded at admit (queue.rs), emitted by the
-    /// control plane.
+    /// Warnings printed once per server (Worker#claim_warning).
+    pub warned: Mutex<std::collections::HashSet<String>>,
+    /// How far the drain has closed hijacked connections (hijack::Closed).
+    pub bridges_closed: tokio::sync::watch::Sender<crate::hijack::Closed>,
+    /// Counted until hyper has taken each bridge's answer; close_bridges waits for them.
+    pub bridges_running: Arc<AtomicUsize>,
+}
+
+/// Relaxed and advisory: the control plane reads them without Ruby.
+#[derive(Default)]
+pub struct Counters {
+    pub in_flight: AtomicUsize,
+    /// Requests handed to workers, and 503s (queue full, or draining).
+    pub served: AtomicU64,
+    pub rejected: AtomicU64,
+    pub timeouts: AtomicU64,
+    pub respawns: AtomicU64,
+    pub quarantine_replacements: AtomicU64,
+    /// Workers staying in the pool (not retiring), as the Ruby pool reports; starts at the floor.
+    pub active_workers: AtomicUsize,
+    pub scale_ups: AtomicU64,
+    pub scale_downs: AtomicU64,
+    pub wakes: AtomicU64,
     pub queue_histogram: QueueHistogram,
 }
-
-/// One per worker *thread* (slot count = workers × threads). The interrupt
-/// flag is the UBF target and the shutdown kick: blocking natives poll it
-/// between bounded waits (flume::Selector proved to lose wakeups under
-/// churn, so no select-style blocking anywhere). The in-flight list lets
-/// the supervisor 500 every request a dead ractor was holding; workers
-/// take requests in small batches, so there can be several.
-pub struct WorkerSlot {
-    pub interrupted: std::sync::atomic::AtomicBool,
-    pub current: Mutex<smallvec::SmallVec<[Weak<Responder>; 8]>>,
-    /// Lane mode only: this worker's private queue and its parked flag.
-    /// The dispatcher prefers awake (non-parked) lanes so a hot worker
-    /// keeps taking without ever paying the futex wake.
-    pub lane_tx: Mutex<Option<flume::Sender<BoxedCtx>>>,
-    pub lane_rx: Option<flume::Receiver<BoxedCtx>>,
-    pub parked: std::sync::atomic::AtomicBool,
-    /// Lane mode only: when this worker last parked (ServerInner::park_seq;
-    /// 0 = never). With every worker idle, the dispatcher picks the one
-    /// that parked last: its caches are still warm.
-    pub parked_at: AtomicU64,
-    /// Per-slot sensors (Relaxed, advisory). served/in_flight mirror the
-    /// global counters at slot granularity; last_started_ms (stamped on
-    /// admit) drives busy-age (wedge) reporting.
-    pub served: AtomicU64,
-    pub in_flight: AtomicUsize,
-    pub last_started_ms: AtomicU64,
-    /// Set by the quarantine monitor when this slot is abandoned as wedged:
-    /// excluded from wedge detection, and its busy_ms is reported as 0.
-    pub quarantined: std::sync::atomic::AtomicBool,
-    /// Set by the pool scaler to send this slot's worker home: the lane
-    /// dispatcher skips it, and the take loop ends at its next idle tick
-    /// (a request already taken finishes first). Cleared by `reset` when
-    /// the slot is handed to a new worker.
-    pub retired: std::sync::atomic::AtomicBool,
-}
-
-/// Per-lane depth cap: small, so a slow handler can only ever delay this
-/// many queued neighbors (work stealing rescues them anyway).
-pub const LANE_DEPTH: usize = 4;
 
 /// Fixed queue-wait bucket boundaries in microseconds (0.5ms .. 10s),
 /// ascending. Emitted in seconds. Not a knob (YAGNI).
@@ -197,6 +141,7 @@ pub const QUEUE_BOUNDS_US: [u64; 14] = [
 /// Queue-wait histogram: per-bucket counts plus an overflow (the implicit
 /// +Inf bucket), the sum of waits, and the total count. Relaxed atomics,
 /// advisory like the other counters.
+#[derive(Default)]
 pub struct QueueHistogram {
     pub buckets: [AtomicU64; QUEUE_BOUNDS_US.len()],
     pub overflow: AtomicU64,
@@ -205,6 +150,7 @@ pub struct QueueHistogram {
 }
 
 /// A plain (non-atomic) snapshot for the control thread to emit.
+#[cfg_attr(test, derive(Default))]
 pub struct QueueHistogramSnapshot {
     pub buckets: [u64; QUEUE_BOUNDS_US.len()],
     pub overflow: u64,
@@ -213,15 +159,6 @@ pub struct QueueHistogramSnapshot {
 }
 
 impl QueueHistogram {
-    pub fn new() -> Self {
-        QueueHistogram {
-            buckets: std::array::from_fn(|_| AtomicU64::new(0)),
-            overflow: AtomicU64::new(0),
-            sum_us: AtomicU64::new(0),
-            count: AtomicU64::new(0),
-        }
-    }
-
     /// Place one wait in its bucket (first bound >= wait, else overflow) and
     /// update sum and count. A linear scan over 14 bounds is trivial.
     pub fn record(&self, wait_us: u64) {
@@ -243,67 +180,10 @@ impl QueueHistogram {
     }
 }
 
-impl Default for QueueHistogram {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
 impl QueueHistogramSnapshot {
     /// Summed queue wait, converted from the stored microseconds to seconds.
     pub fn sum_seconds(&self) -> f64 {
         self.sum_us as f64 / 1_000_000.0
-    }
-}
-
-impl WorkerSlot {
-    fn new(lanes: bool) -> Self {
-        let (lane_tx, lane_rx) = if lanes {
-            let (tx, rx) = flume::bounded(LANE_DEPTH);
-            (Some(tx), Some(rx))
-        } else {
-            (None, None)
-        };
-        WorkerSlot {
-            interrupted: std::sync::atomic::AtomicBool::new(false),
-            current: Mutex::new(smallvec::SmallVec::new()),
-            lane_tx: Mutex::new(lane_tx),
-            lane_rx,
-            parked: std::sync::atomic::AtomicBool::new(false),
-            parked_at: AtomicU64::new(0),
-            served: AtomicU64::new(0),
-            in_flight: AtomicUsize::new(0),
-            last_started_ms: AtomicU64::new(0),
-            quarantined: std::sync::atomic::AtomicBool::new(false),
-            retired: std::sync::atomic::AtomicBool::new(false),
-        }
-    }
-
-    /// Send this slot's worker home once it is idle. The flag is raised
-    /// under the lane lock, the same lock the lane dispatcher holds while
-    /// it checks the flag and sends: any dispatch that saw "not retired"
-    /// has landed in the lane before the worker can see the flag and
-    /// drain, so no request is orphaned.
-    pub fn retire(&self) {
-        let _lane = self.lane_tx.lock();
-        self.retired.store(true, Ordering::SeqCst);
-    }
-
-    /// Return a retired slot to its fresh state so a new worker can take
-    /// it over (slots are never removed; recycling keeps the registry
-    /// from growing with every scale-up). The lane channel stays, the new
-    /// occupant simply starts taking from it; the quarantine mark stays
-    /// too, a quarantined slot is never handed out.
-    pub fn reset(&self) {
-        let _lane = self.lane_tx.lock();
-        self.current.lock().clear();
-        self.retired.store(false, Ordering::SeqCst);
-        self.parked.store(false, Ordering::SeqCst);
-        self.parked_at.store(0, Ordering::Relaxed);
-        self.interrupted.store(false, Ordering::SeqCst);
-        self.served.store(0, Ordering::Relaxed);
-        self.in_flight.store(0, Ordering::Relaxed);
-        self.last_started_ms.store(0, Ordering::Relaxed);
     }
 }
 
@@ -339,18 +219,45 @@ pub fn try_get(id: u64) -> Option<Arc<ServerInner>> {
 }
 
 impl ServerInner {
-    /// Per-lane queue depths; None unless lane dispatch is on.
+    /// A booting server, not registered yet, with no runtime and no slots.
+    pub fn new(config: ServerConfig) -> Self {
+        let (req_tx, req_rx) = flume::bounded(config.queue_depth);
+        // The accept loop subscribes once there is one.
+        let (shutdown_tx, _) = tokio::sync::watch::channel(false);
+        ServerInner {
+            id: next_server_id(),
+            counters: Counters {
+                active_workers: AtomicUsize::new(config.topology.workers),
+                ..Counters::default()
+            },
+            req_tx: Mutex::new(Some(req_tx)),
+            req_rx,
+            shutdown_tx,
+            runtime: Mutex::default(),
+            slots: RwLock::default(),
+            state: std::sync::atomic::AtomicU8::new(STATE_BOOTING),
+            access_log: config
+                .log_requests
+                .then(|| crate::logsink::Sink::new(std::io::stdout())),
+            lane_cursor: AtomicUsize::new(0),
+            park_seq: AtomicU64::new(0),
+            pin_slab: Arc::new(crate::pin::PinSlab::for_responses(
+                config.topology.mode == "ractor",
+            )),
+            warned: Mutex::default(),
+            bridges_closed: tokio::sync::watch::Sender::new(crate::hijack::Closed::Nothing),
+            bridges_running: Arc::default(),
+            config,
+        }
+    }
+
+    /// Requests in each lane (None without lanes).
     pub fn lane_depths(&self) -> Option<Vec<usize>> {
-        if !self.lanes {
+        if !self.config.lanes {
             return None;
         }
-        Some(
-            self.slots
-                .read()
-                .iter()
-                .filter_map(|s| s.lane_rx.as_ref().map(|rx| rx.len()))
-                .collect(),
-        )
+        let slots = self.slots.read();
+        Some(slots.iter().filter_map(|s| s.lane.requests()).collect())
     }
 
     /// Requests waiting anywhere: the global queue plus any open lanes.
@@ -358,9 +265,31 @@ impl ServerInner {
         self.req_rx.len() + self.lane_depths().map_or(0, |d| d.iter().sum())
     }
 
+    /// The drain is over: every queue closes.
+    pub fn close_queues(&self) {
+        self.req_tx.lock().take();
+        for slot in self.slots.read().iter() {
+            slot.close_lane();
+        }
+    }
+
+    /// WebSockets whose on_close some worker of this server is still owed.
+    pub fn open_sockets(&self) -> usize {
+        self.slots
+            .read()
+            .iter()
+            .map(|slot| slot.sockets.open())
+            .sum()
+    }
+
+    /// One registered after close_queue (a late respawn) gets a closed lane, so its worker leaves.
     pub fn register_worker(&self) -> usize {
         let mut slots = self.slots.write();
-        slots.push(Arc::new(WorkerSlot::new(self.lanes)));
+        let slot = WorkerSlot::new(self.config.lanes, WS_INBOX);
+        if self.req_tx.lock().is_none() {
+            slot.close_lane();
+        }
+        slots.push(Arc::new(slot));
         slots.len() - 1
     }
 
@@ -378,56 +307,11 @@ impl ServerInner {
     }
 }
 
-/// A ServerInner with no runtime and no registry entry, for pure-Rust
-/// tests of queue accounting and dispatch. Ids are unique so tests that
-/// do insert into the global registry can run in parallel.
-#[cfg(test)]
-pub fn test_server(lanes: bool, queue_depth: usize) -> Arc<ServerInner> {
-    let (req_tx, req_rx) = flume::bounded(queue_depth);
-    let (shutdown_tx, _shutdown_rx) = tokio::sync::watch::channel(false);
-    Arc::new(ServerInner {
-        id: next_server_id(),
-        req_tx: Mutex::new(Some(req_tx)),
-        req_rx,
-        shutdown_tx,
-        runtime: Mutex::new(RuntimeHandle::None),
-        slots: RwLock::new(Vec::new()),
-        in_flight: AtomicUsize::new(0),
-        served: AtomicU64::new(0),
-        rejected: AtomicU64::new(0),
-        queue_timeout_ms: 10,
-        request_timeout_ms: 0,
-        max_body_size: 0,
-        timeouts: AtomicU64::new(0),
-        state: std::sync::atomic::AtomicU8::new(STATE_BOOTING),
-        respawns: AtomicU64::new(0),
-        quarantine_replacements: AtomicU64::new(0),
-        active_workers: AtomicUsize::new(0),
-        scale_ups: AtomicU64::new(0),
-        scale_downs: AtomicU64::new(0),
-        topology: Topology {
-            mode: "threaded".to_string(),
-            workers: 0,
-            max_workers: 0,
-            threads: 0,
-            batch: 1,
-        },
-        https: false,
-        http2: true,
-        unix_path: None,
-        access_log: None,
-        lanes,
-        lane_cursor: AtomicUsize::new(0),
-        park_seq: AtomicU64::new(0),
-        pin_slab: Arc::new(crate::pin::PinSlab::for_responses(false)),
-        queue_histogram: QueueHistogram::new(),
-    })
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::request::test_ctx;
+    use crate::testing::{assign, slot, TestServer};
 
     #[test]
     fn shards_shutdown_joins_threads_that_observe_the_signal() {
@@ -468,58 +352,41 @@ mod tests {
     }
 
     #[test]
-    fn worker_registration_hands_out_sequential_slot_ids() {
-        let server = test_server(false, 4);
+    fn a_slot_registered_once_the_queue_closed_has_its_lane_closed_too() {
+        let server = TestServer::lanes().workers(1).build();
+        server.req_tx.lock().take(); // close_queue
+        slot(&server, 0).lane.tx.lock().take();
 
-        assert_eq!(server.register_worker(), 0);
-        assert_eq!(server.register_worker(), 1);
-        assert_eq!(server.slots.read().len(), 2);
-        // Shared-queue mode creates no lane channels.
-        assert!(server.slots.read()[0].lane_rx.is_none());
+        server.register_worker();
+
+        let lane = slot(&server, 1).lane.rx.clone().expect("lane");
+        let why = "a worker that comes up during shutdown must see its lane closed and leave";
+        assert!(lane.is_disconnected(), "{why}");
     }
 
     #[test]
-    fn lane_mode_slots_get_bounded_lanes() {
-        let server = test_server(true, 4);
-        server.register_worker();
+    fn queued_counts_the_requests_in_the_shared_queue_or_the_lanes_not_their_doorbells() {
+        let shared = TestServer::shared_queue().build();
+        let tx = shared.req_tx.lock().clone().expect("queue open");
+        for _ in 0..2 {
+            tx.send(test_ctx()).expect("queue has room");
+        }
+        assert_eq!((shared.queued(), shared.lane_depths()), (2, None));
 
-        let slots = server.slots.read();
-        let lane_rx = slots[0].lane_rx.as_ref().expect("lane created");
-        assert_eq!(lane_rx.capacity(), Some(LANE_DEPTH));
-        assert!(slots[0].lane_tx.lock().is_some());
-    }
-
-    #[test]
-    fn queued_counts_the_shared_queue() {
-        let server = test_server(false, 4);
-        assert_eq!(server.queued(), 0);
-
-        let tx = server.req_tx.lock().clone().expect("queue open");
-        tx.send(test_ctx()).expect("queue has room");
-        tx.send(test_ctx()).expect("queue has room");
-
-        assert_eq!(server.queued(), 2);
-        assert!(server.lane_depths().is_none());
-    }
-
-    #[test]
-    fn queued_includes_lanes_and_lane_depths_reports_per_slot() {
-        let server = test_server(true, 4);
-        server.register_worker();
-        server.register_worker();
-
-        let slots = server.slots.read();
-        let lane0 = slots[0].lane_tx.lock().clone().expect("lane open");
-        lane0.send(test_ctx()).expect("lane has room");
-        drop(slots);
-
-        assert_eq!(server.lane_depths(), Some(vec![1, 0]));
-        assert_eq!(server.queued(), 1);
+        let lanes = TestServer::lanes().workers(2).build();
+        assign(&slot(&lanes, 0));
+        assert!(slot(&lanes, 1).wake(), "a doorbell in the other lane");
+        assert_eq!(lanes.lane_depths(), Some(vec![1, 0]));
+        assert_eq!(
+            lanes.queued(),
+            1,
+            "the pool scaler must not see a worker's own events as queue pressure"
+        );
     }
 
     #[test]
     fn registry_lifecycle_insert_lookup_remove() {
-        let server = test_server(false, 1);
+        let server = TestServer::shared_queue().build();
         let id = server.id;
 
         assert!(try_get(id).is_none());
@@ -534,136 +401,8 @@ mod tests {
     }
 
     #[test]
-    fn server_ids_are_unique() {
-        let a = next_server_id();
-        let b = next_server_id();
-        assert_ne!(a, b);
-    }
-
-    #[test]
-    fn servers_boot_in_the_booting_state_with_zero_respawns() {
-        let server = test_server(false, 4);
-        assert_eq!(server.state.load(Ordering::Relaxed), STATE_BOOTING);
-        assert_eq!(server.respawns.load(Ordering::Relaxed), 0);
-        assert_eq!(server.topology.batch, 1);
-    }
-
-    #[test]
-    fn pool_counters_start_at_the_configured_floor() {
-        let server = test_server(false, 4);
-        assert_eq!(
-            server.active_workers.load(Ordering::Relaxed),
-            server.topology.workers
-        );
-        assert_eq!(server.topology.max_workers, server.topology.workers);
-        assert_eq!(server.scale_ups.load(Ordering::Relaxed), 0);
-        assert_eq!(server.scale_downs.load(Ordering::Relaxed), 0);
-    }
-
-    #[test]
-    fn fresh_slot_has_zeroed_per_worker_sensors() {
-        let server = test_server(false, 4);
-        server.register_worker();
-        let slots = server.slots.read();
-        let slot = &slots[0];
-        assert_eq!(slot.served.load(Ordering::Relaxed), 0);
-        assert_eq!(slot.in_flight.load(Ordering::Relaxed), 0);
-        assert_eq!(slot.last_started_ms.load(Ordering::Relaxed), 0);
-    }
-
-    #[test]
-    fn fresh_slot_is_not_quarantined() {
-        let server = test_server(false, 4);
-        server.register_worker();
-        assert!(!server.slots.read()[0].quarantined.load(Ordering::Relaxed));
-        assert_eq!(server.quarantine_replacements.load(Ordering::Relaxed), 0);
-    }
-
-    #[test]
-    fn fresh_slot_is_not_retired() {
-        let server = test_server(false, 4);
-        server.register_worker();
-        assert!(!server.slots.read()[0].retired.load(Ordering::Relaxed));
-    }
-
-    #[test]
-    fn retire_then_reset_returns_a_slot_to_its_fresh_state() {
-        let server = test_server(true, 4);
-        server.register_worker();
-        let slot = server.slots.read()[0].clone();
-        slot.parked.store(true, Ordering::Relaxed);
-        slot.interrupted.store(true, Ordering::Relaxed);
-        slot.served.store(5, Ordering::Relaxed);
-        slot.in_flight.store(1, Ordering::Relaxed);
-        slot.last_started_ms.store(9, Ordering::Relaxed);
-        slot.current.lock().push(std::sync::Weak::new());
-
-        slot.retire();
-        assert!(slot.retired.load(Ordering::Relaxed));
-
-        slot.reset();
-        assert!(!slot.retired.load(Ordering::Relaxed));
-        assert!(!slot.parked.load(Ordering::Relaxed));
-        assert!(!slot.interrupted.load(Ordering::Relaxed));
-        assert_eq!(slot.served.load(Ordering::Relaxed), 0);
-        assert_eq!(slot.in_flight.load(Ordering::Relaxed), 0);
-        assert_eq!(slot.last_started_ms.load(Ordering::Relaxed), 0);
-        assert!(slot.current.lock().is_empty());
-        // The lane survives reuse: the next occupant takes from it.
-        assert!(slot.lane_tx.lock().is_some());
-    }
-
-    #[test]
-    fn reset_keeps_a_quarantine_mark() {
-        let server = test_server(false, 4);
-        server.register_worker();
-        let slot = server.slots.read()[0].clone();
-        slot.quarantined.store(true, Ordering::Relaxed);
-
-        slot.retire();
-        slot.reset();
-
-        // A wedged slot stays flagged even if it ever came back around.
-        assert!(slot.quarantined.load(Ordering::Relaxed));
-    }
-
-    #[test]
-    fn retire_releases_the_lane_lock() {
-        let server = test_server(true, 4);
-        server.register_worker();
-        let slot = server.slots.read()[0].clone();
-
-        slot.retire();
-
-        assert!(slot.lane_tx.try_lock().is_some());
-    }
-
-    #[test]
-    fn retire_waits_for_a_dispatcher_holding_the_lane_lock() {
-        let server = test_server(true, 4);
-        server.register_worker();
-        let slot = server.slots.read()[0].clone();
-
-        // A dispatcher that has already read "not retired" and is sending.
-        let sending = slot.lane_tx.lock();
-        let retiring = std::thread::spawn({
-            let slot = slot.clone();
-            move || slot.retire()
-        });
-        std::thread::sleep(Duration::from_millis(30));
-        assert!(
-            !slot.retired.load(Ordering::SeqCst),
-            "the flag must not go up under a dispatcher's lock"
-        );
-
-        drop(sending);
-        retiring.join().expect("retire thread");
-        assert!(slot.retired.load(Ordering::SeqCst));
-    }
-
-    #[test]
     fn queue_histogram_buckets_by_wait() {
-        let h = QueueHistogram::new();
+        let h = QueueHistogram::default();
         h.record(400); // <= 500 -> bucket 0
         h.record(500); // == 500 -> bucket 0 (inclusive)
         h.record(600); // (500, 1000] -> bucket 1

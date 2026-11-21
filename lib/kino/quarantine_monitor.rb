@@ -19,8 +19,8 @@ module Kino
     private
 
     def scan
-      Native.worker_stats(@server_id).each do |index, _served, _in_flight, busy_ms, quarantined|
-        next if quarantined || busy_ms <= @timeout_ms
+      WorkerRow.all(@server_id).each do |row|
+        next if row.quarantined || row.busy_ms <= @timeout_ms
 
         if @outstanding >= @max
           unless @at_cap_logged
@@ -30,7 +30,7 @@ module Kino
           next
         end
 
-        if @replacer.replace(index)
+        if @replacer.replace(row.slot, row.generation)
           Native.record_quarantine_replacement(@server_id)
           @outstanding += 1
           @at_cap_logged = false

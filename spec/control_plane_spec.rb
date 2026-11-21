@@ -13,13 +13,6 @@ RSpec.describe "control plane" do
                                queue_depth: 8, queue_timeout_ms: 100}.merge(extra))
   end
 
-  def native_teardown(id)
-    Kino::Native.stop_accepting(id)
-    Kino::Native.close_queue(id)
-    Kino::Native.shutdown_runtime(id, 200)
-    Kino::Native.control_stop(id)
-  end
-
   def control_get(port, path)
     Net::HTTP.get_response("127.0.0.1", path, port)
   end

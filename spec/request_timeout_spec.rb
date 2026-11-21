@@ -10,9 +10,8 @@ RSpec.describe "request timeout" do
     end
 
     with_server(slow, request_timeout: 0.2) do |host, port, server|
-      started = Process.clock_gettime(Process::CLOCK_MONOTONIC)
-      response = Net::HTTP.get_response(host, "/", port)
-      elapsed = Process.clock_gettime(Process::CLOCK_MONOTONIC) - started
+      response = nil
+      elapsed = timed { response = Net::HTTP.get_response(host, "/", port) }
 
       expect(response.code).to eq("504")
       expect(response.body).to include("Gateway Timeout")

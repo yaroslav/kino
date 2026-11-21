@@ -3,65 +3,23 @@
 module Kino
   # @private
   # Spawns worker ractors and keeps them alive. One supervisor thread per
-  # ractor: it blocks in Ractor#value, and a crash (anything that kills the
-  # ractor, Exception from app code included) wakes it to 500 the in-flight
-  # requests and respawn. Clean exits (queue drained at shutdown, or the
-  # worker retired by the pool scaler) end supervision.
+  # ractor: a crashed worker thread is replaced on a bank slot while its
+  # siblings serve on, and a dead ractor's requests get their 500 before it
+  # respawns, both paced by a CrashBackoff.
   #
-  # Also the :ractor-mode pool behind PoolScaler: `grow` adds a worker,
-  # `retire` sends one home, `groups` lists the ones that may be retired,
-  # and `active_count` is what the control plane reports.
-  class RactorSupervisor
-    def initialize(server_id, app, workers:, threads:, batch: 1, hooks: nil, on_worker_exit: nil)
-      @server_id = server_id
-      @app = app
-      @workers = workers
-      @threads = threads
-      @batch = batch
-      @hooks = hooks
-      @on_worker_exit = on_worker_exit
-      @draining = false
-      @lock = Mutex.new
+  # The :ractor-mode Pool.
+  class RactorSupervisor < Pool
+    # A worker thread's crash report, sent to its supervisor's port (.report_crash). The only
+    # other message there is Ractor#monitor's end notice (a Symbol up to Ruby 4.0, an Array from
+    # 4.1): a class of its own keeps the two apart.
+    Crash = Data.define(:position, :id, :error, :backtrace, :started_at, :crashed_at, :reply)
+
+    def initialize(...)
+      super
       @supervisor_threads = []
-      @worker_slots = {}
-      @slot_to_worker = {}
       @replaced = {}
-      # Worker index => true while its ractor runs, and => true once the
-      # scaler asked it to leave. Retired workers hand their slots back to
-      # the bank for the next worker to take over.
+      # Worker index => true while its Ractor runs.
       @live = {}
-      @retiring = {}
-      @bank = SlotBank.new(server_id)
-      # The first replacement's index; `replace` increments before using it,
-      # so this starts one below the first free index (@workers).
-      @next_worker_index = @workers - 1
-    end
-
-    def start
-      @supervisor_threads = Array.new(@workers) { |index| supervise(index) }
-      report_active
-      self
-    end
-
-    # Flag the drain and join supervisors up to the (numeric) deadline;
-    # callers wanting an unbounded wait use #join instead.
-    def shutdown(timeout)
-      @lock.synchronize { @draining = true }
-      deadline = Process.clock_gettime(Process::CLOCK_MONOTONIC) + timeout
-      @lock.synchronize { @supervisor_threads.dup }.each do |thread|
-        remaining = deadline - Process.clock_gettime(Process::CLOCK_MONOTONIC)
-        thread.join([remaining, 0.01].max)
-      end
-    end
-
-    def done?
-      @lock.synchronize { @supervisor_threads.dup }.none?(&:alive?)
-    end
-
-    # Block until the workers exit on their own (drain elsewhere): join
-    # without flipping the draining flag.
-    def join
-      @lock.synchronize { @supervisor_threads.dup }.each(&:join)
     end
 
     # Ractors cannot be force-killed; their clients were already freed by
@@ -87,74 +45,97 @@ module Kino
     # yet is not listed until it has).
     def groups
       @lock.synchronize do
-        @live.keys
-          .reject { |index| @retiring.key?(index) || @replaced.key?(index) || !@worker_slots.key?(index) }
-          .to_h { |index| [index, @worker_slots[index].dup] }
+        @slots.slice(*@live.keys).reject { |index, _| @retiring.key?(index) || @replaced.key?(index) }
       end
     end
 
-    # Add one supervised worker; returns its index.
-    def grow
-      new_index = @lock.synchronize { @next_worker_index += 1 }
-      thread = supervise(new_index)
-      @lock.synchronize { @supervisor_threads << thread }
-      report_active
-      new_index
-    end
+    # Replace the Ractor on slot `worker_id` at `generation`: spawn a fresh one, then quarantine
+    # the old one's slots; the old Ractor leaks, unrespawned. False for a slot that moved on.
+    def replace(worker_id, generation)
+      # Checked and claimed at once, so a slot that moves on cannot get a healthy Ractor
+      # quarantined; the slots are marked then (see Pool). A stale snapshot replaces a Ractor once.
+      worker_index, slot_ids = @lock.synchronize do
+        index = @owner[worker_id]
+        next unless index && @bank.generation(worker_id) == generation && !@replaced.key?(index)
 
-    # Send a worker home. Its slots stop receiving work now; the worker
-    # finishes what it holds, leaves at its next idle tick, and its slots
-    # come back to the free list once the ractor has exited. Returns
-    # false when there is no such live worker to retire.
-    def retire(worker_index)
-      slot_ids = @lock.synchronize do
-        next nil unless @live.key?(worker_index) && !@retiring.key?(worker_index)
-
-        @retiring[worker_index] = true
-        @worker_slots[worker_index]
+        @replaced[index] = true
+        @slots[index].each { |id| @quarantined[id] = true }
+        [index, @slots[index].map { |id| [id, @bank.generation(id)] }]
       end
-      return false unless slot_ids
-
-      slot_ids.each { |id| Native.retire_slot(@server_id, id) }
-      true
-    end
-
-    # Replace the ractor owning slot `worker_id`: spawn a fresh supervised
-    # ractor, then quarantine the old ractor's slots. The old supervisor
-    # thread stays blocked in ractor.value on the wedged ractor (it and the
-    # ractor leak until process exit; a wedged ractor cannot be
-    # force-killed). Returns true if a replacement was spawned.
-    def replace(worker_id)
-      worker_index = @lock.synchronize { @slot_to_worker[worker_id] }
       return false unless worker_index
 
-      # Idempotent per ractor: a stale monitor snapshot can list two sibling
-      # slots of the same ractor, only the first replaces it.
-      claimed = @lock.synchronize do
-        if @replaced.key?(worker_index)
-          false
-        else
-          @replaced[worker_index] = true
-          true
-        end
-      end
-      return false unless claimed
-
-      new_index = @lock.synchronize { @next_worker_index += 1 }
       thread =
         begin
-          supervise(new_index) # spawn FIRST, nothing quarantined yet
+          supervise(next_index) # spawn FIRST, nothing quarantined yet
         rescue
           @lock.synchronize { @replaced.delete(worker_index) } # allow retry next tick
+          unmark(slot_ids.map(&:first))
           raise
         end
-      slot_ids = @lock.synchronize { @worker_slots[worker_index] } || []
-      slot_ids.each { |id| Native.quarantine_slot(@server_id, id) } # quarantine only after success
+      # Quarantine only after success; each slot's sockets close with 1011.
+      slot_ids.each { |id, slot_generation| quarantine(id, slot_generation) }
       @lock.synchronize { @supervisor_threads << thread }
       true
     end
 
+    # @private
+    # A worker Ractor's main thread, one worker thread per slot; a crashed one waits for a new slot.
+    def self.run_worker(server_id, ids, app, batch, hooks, supervisor)
+      # Crashes are the supervisor's to log; no thread here prints one.
+      Thread.current.report_on_exception = false
+      ended = Thread::Queue.new
+      start = lambda do |id, position|
+        Thread.new do
+          Thread.current.report_on_exception = false
+          Thread.current.name = "thread-#{position + 1}" if ids.size > 1
+          started_at = Kino.monotonic
+          fresh = nil
+          begin
+            Worker.run(server_id, id, app, batch, hooks)
+          rescue Exception => e # rubocop:disable Lint/RescueException -- reported, then replaced
+            fresh = report_crash(supervisor, position, id, e, started_at)
+          ensure
+            replaced = begin
+              fresh && start.call(fresh, position)
+            rescue ThreadError
+              nil
+            end
+            ended << position unless replaced
+          end
+        end
+      end
+      ids.each_with_index { |id, position| start.call(id, position) }
+      ids.size.times { ended.pop }
+    end
+
+    # Report a crash and return the answer; the exception crosses as a copy, its backtrace aside.
+    def self.report_crash(supervisor, position, id, error, started_at)
+      crashed_at = Kino.monotonic
+      reply = Ractor::Port.new
+      crash = Crash.new(position, id, error, error.backtrace, started_at, crashed_at, reply)
+      begin
+        supervisor << crash
+      rescue TypeError, Ractor::Error
+        supervisor << crash.with(error: Error.new("#{error.class}: #{error.message}"))
+      end
+      reply.receive
+    ensure
+      reply&.close
+    end
+    private_class_method :report_crash
+
     private
+
+    def add_worker
+      index = next_index
+      thread = supervise(index)
+      @lock.synchronize { @supervisor_threads << thread }
+      index
+    end
+
+    def join_set = @lock.synchronize { @supervisor_threads.dup }
+
+    def member?(index) = @live.key?(index)
 
     def supervise(index)
       # Live from the moment it is asked for, not from when its thread gets
@@ -162,87 +143,109 @@ module Kino
       @lock.synchronize { @live[index] = true }
       Thread.new do
         Thread.current.name = "supervisor-#{index}"
-        crashes = 0
+        backoff = CrashBackoff.new("worker-#{index}")
         loop do
-          ractor, worker_ids = spawn_worker(index)
+          port = Ractor::Port.new
+          ractor = spawn_worker(index, port)
+          backoff.started
+          tend(index, ractor, port)
           begin
-            ractor.value # blocks until the ractor terminates
-            HookFire.fire(@on_worker_exit, "on_worker_exit", index, nil) # clean exit: drained or retired
-            exited(index, worker_ids)
+            ractor.value
+            worker_exited(index, nil) # drained or retired
+            exited(index, clean: true)
             break
           rescue Ractor::Error => e
             # The ractor died mid-flight. Anything it was serving will never
             # be answered by Ruby: 500 those clients NOW (not when GC gets
             # around to dropping the dead heap), then decide on respawn.
-            worker_ids.each { |id| Native.abort_inflight(@server_id, id) }
+            # Its sockets close too: their handlers died with it.
+            dead = @lock.synchronize { @slots[index] }
+            dead.each { |id| Native.abort_inflight(@server_id, id) }
             cause = (e.respond_to?(:cause) && e.cause) ? e.cause : e
-            HookFire.fire(@on_worker_exit, "on_worker_exit", index, cause)
-            if draining?
-              exited(index, nil)
+            # A replaced worker is not respawned; a leaving one is, and the scaler retires it again.
+            respawn = recover(index, dead, cause, backoff, leaving_respawns: true) { worker_exited(index, cause) }
+            unless respawn
+              exited(index, clean: false)
               break
             end
 
-            crashes += 1
             Native.record_respawn(@server_id)
-            Log.error("worker-#{index} crashed (#{cause.class}: #{cause.message}); respawning")
-            # A crashed worker that was on its way out respawns on fresh
-            # slots like any other; the scaler retires it again when idle.
             @lock.synchronize { @retiring.delete(index) }
-            # Policy (crash recovery): unlimited respawn
-            # keeps the server up under rare crashes but turns a
-            # crash-on-every-request bug into a busy loop. A circuit breaker
-            # (give up / cool down after N crashes in T seconds) trades
-            # availability for fail-fast. Current policy: respawn forever.
           end
         end
       end
     end
 
+    # Answer each Crash on its own thread (each waits only its own delay) until the Ractor exits.
+    def tend(index, ractor, port)
+      ractor.monitor(port) # the notice comes after any crash report
+      backoffs = Array.new(@threads) { |position| CrashBackoff.for(index, position, @threads) }
+      run = {over: false}
+      while (crash = port.receive).is_a?(Crash)
+        Thread.new(crash) { |report| answer(index, report, backoffs, run) }
+      end
+    ensure
+      @lock.synchronize { run[:over] = true } if run
+      port.close
+    end
+
+    def answer(index, crash, backoffs, run)
+      Thread.current.name = "supervisor-#{index}"
+      cause = crash.error
+      # A copied exception arrives without its backtrace.
+      cause.set_backtrace(crash.backtrace) if crash.backtrace && !cause.frozen?
+      backoff = backoffs[crash.position]
+      backoff.started(crash.started_at)
+      crash.reply << replace_thread(index, crash.id, cause, backoff, crash.crashed_at, run)
+    rescue Ractor::ClosedError
+      nil # the ractor is gone; the supervisor sees to its slots
+    end
+
+    # Release the crashed thread's slot (unless wedged); after its backoff, a fresh one, if due.
+    def replace_thread(index, dead_id, cause, backoff, crashed_at, run)
+      return unless recover(index, [dead_id], cause, backoff, crashed_at) { worker_exited(index, cause) }
+
+      id = claim_slot(index) { run[:over] || @retiring.key?(index) || @replaced.key?(index) }
+      Native.record_respawn(@server_id) if id
+      id
+    rescue => e
+      replacement_failed(index, e)
+      nil
+    end
+
+    # Unmap before the bank may hand the slots on, so no generation pairs with a later worker.
+    def forget_slots(index, ids)
+      @lock.synchronize { [releasable(unmap(index, ids)), @replaced.key?(index), @retiring.key?(index)] }
+    end
+
     # Fresh ractor on slots from the bank: fresh ones, or ones a retired
-    # worker handed back.
-    def spawn_worker(worker_index)
+    # worker handed back. It asks for replacement threads on `port`.
+    def spawn_worker(worker_index, port)
       worker_ids = Array.new(@threads) { @bank.claim }
       @lock.synchronize do
-        @worker_slots[worker_index] = worker_ids
-        worker_ids.each { |id| @slot_to_worker[id] = worker_index }
+        @slots[worker_index] = worker_ids
+        worker_ids.each { |id| @owner[id] = worker_index }
       end
       # Named so log lines from inside say which worker spoke: the ractor
       # alone for a single thread, `worker-N/thread-M` for more.
-      ractor = Ractor.new(@server_id, worker_ids, @app, @batch, @hooks,
-        name: "worker-#{worker_index}") do |server_id, ids, app, batch, hooks|
-        ids.each_with_index.map do |id, position|
-          Thread.new do
-            # Crashes surface via Ractor#value in the supervisor; don't also
-            # spray the backtrace to stderr from inside the dying ractor.
-            Thread.current.report_on_exception = false
-            Thread.current.name = "thread-#{position + 1}" if ids.size > 1
-            Kino::Worker.run(server_id, id, app, batch, hooks)
-          end
-        end.each(&:join)
+      Ractor.new(@server_id, worker_ids, @app, @batch, @hooks, port, name: "worker-#{worker_index}") do |*worker|
+        Kino::RactorSupervisor.run_worker(*worker)
       end
-      [ractor, worker_ids]
     end
 
     # Bookkeeping for a supervisor thread that is done: the worker is no
     # longer live, a retired worker's slots go back to the bank, and the
     # thread leaves the join set so a long-lived elastic pool does not
     # accumulate dead threads.
-    def exited(index, worker_ids)
-      retired = @lock.synchronize do
+    def exited(index, clean:)
+      released = @lock.synchronize do
         @live.delete(index)
         @supervisor_threads.delete(Thread.current)
-        @retiring.delete(index)
+        retired = @retiring.delete(index)
+        (retired && clean) ? releasable(@slots[index]) : []
       end
-      @bank.release(worker_ids) if retired && worker_ids
+      @bank.release(released)
       report_active
-    end
-
-    def report_active
-      Native.set_active_workers(@server_id, active_count)
-    end
-
-    def draining?
-      @lock.synchronize { @draining }
     end
   end
 end

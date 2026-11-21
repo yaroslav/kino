@@ -59,9 +59,16 @@ module Kino
     # @param status [Integer] the status the client got
     # @return [void]
     def exception(error, env, status: 500)
+      failure("#{status} #{env["REQUEST_METHOD"]} #{env["PATH_INFO"]}", error)
+    end
+
+    # @private
+    # The failed-request report: `subject` (a request line, a socket's callback), the error and
+    # where it raised, then the backtrace.
+    def failure(subject, error)
       frames, depth = trace(error)
       site = frames.first ? " (#{frames.first})" : ""
-      lines = ["#{status} #{env["REQUEST_METHOD"]} #{env["PATH_INFO"]} · #{error.class}: #{error.message}#{site}"]
+      lines = ["#{subject} · #{error.class}: #{error.message}#{site}"]
       frames.each { |frame| lines << "    #{frame}" }
       lines << "    … #{depth - frames.size} more" if depth > frames.size
       error(lines.join("\n"))

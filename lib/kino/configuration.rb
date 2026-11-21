@@ -21,6 +21,9 @@ module Kino
       max_body_size: 50 * 1024 * 1024, # 50 MB; nil/0 = unlimited
       batch: 1,
       lanes: false,
+      websocket_max_message: 1_048_576, # 1 MiB
+      websocket_max: nil, # nil = only max_connections bounds open sockets
+      websocket_ping_interval: 30, # seconds; nil or 0 = no pings, no dead-peer drops
       log_requests: false,
       on_error: nil,
       after_boot: nil,
@@ -186,6 +189,7 @@ module Kino
 
       # Seconds a worker above the floor must sit idle before it is
       # retired (default 30). Only meaningful with max_workers.
+      # A worker with open sockets or hijacked connections is busy, not idle.
       def scale_down_after(seconds) = @config.set(:scale_down_after, seconds)
 
       # Threads per worker (I/O concurrency inside one ractor); default is
@@ -215,8 +219,21 @@ module Kino
       # Requests a worker may grab per queue visit (default 1).
       def batch(count) = @config.set(:batch, Integer(count))
 
-      # EXPERIMENTAL per-worker lane dispatch.
+      # EXPERIMENTAL per-worker lane dispatch (default false). Native
+      # WebSockets and Kino::Worker.on_wake hooks need it.
       def lanes(enabled) = @config.set(:lanes, !!enabled)
+
+      # Largest WebSocket message a client may send, in bytes (default
+      # 1 MiB); a bigger one closes the socket with 1009.
+      def websocket_max_message(bytes) = @config.set(:websocket_max_message, Integer(bytes))
+
+      # Most native WebSockets open at once; past it, handshakes get a
+      # 503. nil (the default) leaves only max_connections.
+      def websocket_max(count) = @config.set(:websocket_max, count && Integer(count))
+
+      # Ping a WebSocket client silent this many seconds, and drop one silent for
+      # twice that (default 30); nil or 0 sends no pings.
+      def websocket_ping_interval(seconds) = @config.set(:websocket_ping_interval, seconds)
 
       # Native access log: one status-colored line per request to stdout.
       def log_requests(enabled) = @config.set(:log_requests, !!enabled)

@@ -366,10 +366,8 @@ depth, which is also why it's a config knob and not a hardcoded win).
 The shared-queue design pays a futex wake per request at saturation
 (every worker parks on an empty queue between requests). Lane mode gives
 each worker a small private queue; the dispatcher prefers *awake* lanes—so
-a hot worker keeps taking without ever being woken—with two
-safeguards: lane depth is capped at 4, and workers steal from siblings
-before parking (plus on every park tick), so a slow request can't strand
-its lane's backlog.
+a hot worker keeps taking without ever being woken (the rules are in
+[architecture](architecture.md#lane-dispatch)).
 
 Same-session A/B on c7a.2xlarge, ractor mode at the default topology
 (8×1):

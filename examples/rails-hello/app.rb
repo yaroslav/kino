@@ -36,6 +36,8 @@ class PostsController < ActionController::Base
     post = Post.new(body: params.require(:body))
     if post.save
       render_json(post.as_json(only: %i[id body]), status: :created)
+      # Kino::WebSocket is absent under other servers.
+      Kino::WebSocket.publish("posts", response.body) if defined?(Kino::WebSocket)
     else
       render_json({errors: post.errors.full_messages}, status: :unprocessable_content)
     end
@@ -46,6 +48,20 @@ class PostsController < ActionController::Base
   # Not `render json:`: that renderer is an unshareable block, uncallable from workers.
   def render_json(payload, status: :ok)
     render body: payload.to_json, content_type: "application/json", status: status
+  end
+end
+
+# GET /live over Kino's native WebSockets: each new post, as create returns it.
+module LiveFeed
+  def self.on_open(ws) = ws.subscribe("posts")
+end
+
+class LiveController < ActionController::Base
+  def show
+    return head(:upgrade_required) unless request.env["rack.upgrade?"] == :websocket
+
+    request.env["rack.upgrade"] = LiveFeed
+    head :switching_protocols
   end
 end
 
@@ -72,6 +88,7 @@ class HelloApp < Rails::Application
   routes.append do
     root to: "hello#index"
     resources :posts, only: %i[index create]
+    get "live", to: "live#show"
   end
 end
 

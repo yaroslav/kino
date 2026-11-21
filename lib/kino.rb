@@ -9,14 +9,19 @@ require "kino/kino"
 # Ractor-shareable.
 #
 # The public API is {Kino::Server}, {Kino::Configuration}, {Kino::Check},
-# {Kino::Logger}, and {Kino.sleep}; the `kino` executable is implemented
-# by {Kino::CLI}.
+# {Kino::Logger}, {Kino::WebSocket}, {Kino::Worker.on_wake}, and
+# {Kino.sleep}; the `kino` executable is implemented by {Kino::CLI}.
 module Kino
-  # Base class for all errors raised by Kino.
+  # Base class for the errors Kino raises (ClientGone aside).
   class Error < StandardError; end
 
   # Raised when mode: :ractor is forced but the app is not Ractor-shareable.
   class UnshareableAppError < Error; end
+
+  # Raised by a streaming body's write once nothing reaches the client: it left, Kino cut the
+  # response, or the response has no body (HEAD, 204, 304, a request_timeout 504). An IOError,
+  # so a body that stops on IOError needs no change; Kino ends the request quietly.
+  class ClientGone < IOError; end
 
   # High-resolution sleep that bypasses the VM timer (whose wakeups inside
   # non-main ractors are coarse: ~+2.5ms on Linux). Sleeps on the OS clock
@@ -44,6 +49,10 @@ module Kino
     Native.available_parallelism
   end
 
+  # @private
+  # Seconds on the monotonic clock; callable from any Ractor.
+  def self.monotonic = Process.clock_gettime(Process::CLOCK_MONOTONIC)
+
   # How many ractors Ruby runs at once: RUBY_MAX_CPU, 8 when unset or
   # not an integer.
   #
@@ -61,11 +70,16 @@ require_relative "kino/input"
 require_relative "kino/null_input"
 require_relative "kino/errors_stream"
 require_relative "kino/stream"
+require_relative "kino/web_socket"
 require_relative "kino/configuration"
 require_relative "kino/hook_fire"
+require_relative "kino/teardown"
 require_relative "kino/worker_hooks"
 require_relative "kino/worker"
+require_relative "kino/worker_row"
 require_relative "kino/slot_bank"
+require_relative "kino/crash_backoff"
+require_relative "kino/pool"
 require_relative "kino/ractor_supervisor"
 require_relative "kino/threaded_pool"
 require_relative "kino/monitor"

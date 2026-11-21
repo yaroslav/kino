@@ -1,10 +1,9 @@
 //! `Kino::Native::Request`: the opaque per-request handle. Created INSIDE
-//! the worker ractor by the take calls (queue.rs), so the wrapping Ruby
+//! the worker ractor by the take calls (queue/worker.rs), so the wrapping Ruby
 //! object is owned by the ractor that will use it, and never crosses
 //! ractor boundaries.
 
-use std::cell::RefCell;
-use std::net::SocketAddr;
+use std::cell::{Cell, RefCell, RefMut};
 use std::sync::Arc;
 
 use bytes::Bytes;
@@ -13,15 +12,15 @@ use magnus::value::ReprValue;
 use magnus::{Error, RArray, RHash, RString, Ruby, Value};
 
 use crate::gvl;
-use crate::response::{full_body, BodyFrame, Responder};
+use crate::response::{full_body, BodyFrame, Cut, Responder};
+use crate::server::Peer;
 
 pub struct RequestCtx {
     pub method: http::Method,
     pub uri: http::Uri,
     pub version: http::Version,
     pub headers: http::HeaderMap,
-    pub remote_addr: SocketAddr,
-    pub local_addr: SocketAddr,
+    pub peer: Peer,
     pub https: bool,
     /// Request body, streamed from hyper through a bounded channel: hyper is
     /// only polled as Ruby consumes, so inbound backpressure is free. None
@@ -29,37 +28,87 @@ pub struct RequestCtx {
     /// channel allocation entirely.
     pub body_rx: Option<flume::Receiver<Bytes>>,
     /// When a frame is bigger than read_body's max_len, the rest waits here.
-    pub leftover: Option<Bytes>,
-    /// The owning worker slot (set at admit time, queue.rs); its interrupt
+    pub leftover: Cell<Option<Bytes>>,
+    /// The owning worker slot (set at admit time, queue/worker.rs); its interrupt
     /// flag makes blocked body reads/writes interruptible like the queue pop.
-    pub slot: Option<Arc<crate::registry::WorkerSlot>>,
+    pub slot: Option<Arc<crate::slot::WorkerSlot>>,
     /// The server's zero-copy roots: large response bodies are pinned
     /// here and ride to hyper without a copy (pin.rs).
     pub pin_slab: Arc<crate::pin::PinSlab>,
     pub responder: Arc<Responder>,
     /// When this request entered the queue, for the queue-wait histogram.
-    /// Stamped at ctx creation; read once at admit (queue.rs).
+    /// Stamped at ctx creation; read once at admit (queue/worker.rs).
     pub enqueued_at: std::time::Instant,
     /// Whether the access log wants timing: decided at intake, read on
     /// the way out, so an idle log costs nothing per request.
     pub timed: bool,
-    /// Queue wait, stamped at admit (queue.rs): the log's `wait`.
+    /// Queue wait, stamped at admit (queue/worker.rs): the log's `wait`.
     pub wait: std::time::Duration,
     /// When a worker took the request; elapsed at the response head it is
     /// the log's `ruby`.
     pub admitted_at: std::time::Instant,
     /// GC pause and objects allocated during the app call, when the
-    /// worker measured them (Request#timing).
-    pub gc: Option<(std::time::Duration, u64)>,
+    /// worker measured them (Request#timing). A Cell: another thread may wait.
+    pub gc: Cell<Option<(std::time::Duration, u64)>>,
+    /// HTTP/1.1 with an Upgrade header: ws::accept or rack.hijack claims the connection.
+    pub upgrade: Option<crate::upgrade::Upgrade>,
+    pub hijacked: bool,
+    /// Whose in-flight count a hijack leaves.
+    pub server_id: u64,
 }
 
 impl RequestCtx {
+    /// A request as it joins the queue: its wait starts now.
+    pub fn new(
+        parts: http::request::Parts,
+        peer: Peer,
+        server: &crate::registry::ServerInner,
+        responder: Arc<Responder>,
+        body_rx: Option<flume::Receiver<Bytes>>,
+        upgrade: Option<crate::upgrade::Upgrade>,
+    ) -> crate::registry::BoxedCtx {
+        let now = std::time::Instant::now();
+        Box::new(RequestCtx {
+            method: parts.method,
+            uri: parts.uri,
+            version: parts.version,
+            headers: parts.headers,
+            peer,
+            https: server.config.tls.is_some(),
+            body_rx,
+            leftover: Cell::new(None),
+            slot: None,
+            pin_slab: server.pin_slab.clone(),
+            responder,
+            enqueued_at: now,
+            timed: server.access_log.is_some(),
+            wait: std::time::Duration::ZERO,
+            admitted_at: now,
+            gc: Cell::new(None),
+            upgrade,
+            hijacked: false,
+            server_id: server.id,
+        })
+    }
+
+    /// A plain answer: the task holding the connection for a claim ends now, not at GC.
+    pub fn decline_upgrade(&mut self) {
+        self.upgrade = None;
+    }
+
+    pub fn offers_websocket(&self) -> bool {
+        self.upgrade
+            .as_ref()
+            .and_then(crate::upgrade::Upgrade::websocket)
+            .is_some()
+    }
+
     /// The timing this request carries to the access log.
     fn timing(&self) -> crate::access_log::Timing {
         crate::access_log::Timing {
             wait: self.wait,
             ruby: self.admitted_at.elapsed(),
-            gc: self.gc,
+            gc: self.gc.get(),
         }
     }
 }
@@ -83,20 +132,20 @@ impl Drop for RequestCtx {
     /// the client gets a 500/abort instead of a hung connection. Never
     /// touches the Ruby API: safe under `free_immediately`.
     fn drop(&mut self) {
-        self.responder.respond_500_if_unsent();
+        self.responder.give_up(Cut::Crash);
     }
 }
 
 /// Block on a channel operation with the GVL released, waking on the
 /// slot's interrupt flag. `attempt` performs one bounded tick and returns
 /// Some when done; None on timeout. Ok(None) = interrupted. Every Ruby
-/// handle is created by `admit` (queue.rs), which always sets the slot.
+/// handle is created by `admit` (queue/worker.rs), which always sets the slot.
 fn block_on<T>(
-    slot: &Option<Arc<crate::registry::WorkerSlot>>,
+    slot: &Option<Arc<crate::slot::WorkerSlot>>,
     attempt: impl FnMut() -> Option<T>,
 ) -> Result<Option<T>, Error> {
     let slot = slot.as_ref().expect("slot set by admit");
-    gvl::interruptible(&slot.interrupted, attempt)
+    gvl::interruptible(&slot.life.interrupted, attempt)
 }
 
 fn interrupted_error(ruby: &Ruby) -> Error {
@@ -120,6 +169,27 @@ fn body_timeout_error(ruby: &Ruby) -> Error {
     )
 }
 
+/// A write nothing reaches any more (hyper dropped the body, or Kino gave the stream
+/// up): Kino::ClientGone, an IOError, ends the body's write loop.
+fn client_gone_error(ruby: &Ruby) -> Error {
+    use magnus::Module;
+
+    let class = ruby
+        .class_object()
+        .const_get::<_, magnus::RModule>("Kino")
+        .and_then(|kino| kino.const_get::<_, magnus::ExceptionClass>("ClientGone"))
+        .unwrap_or_else(|_| ruby.exception_io_error());
+    Error::new(class, "Kino: the response stream is closed")
+}
+
+/// Why what needs the request to itself cannot happen now.
+pub(crate) const BUSY: &str =
+    "another of the app's threads is waiting on this request (reading its body or writing its response)";
+
+fn busy_error(ruby: &Ruby) -> Error {
+    Error::new(ruby.exception_runtime_error(), format!("Kino: {BUSY}"))
+}
+
 fn invalid_response(ruby: &Ruby, e: impl std::fmt::Display) -> Error {
     Error::new(
         ruby.exception_runtime_error(),
@@ -130,10 +200,25 @@ fn invalid_response(ruby: &Ruby, e: impl std::fmt::Display) -> Error {
 #[magnus::wrap(class = "Kino::Native::Request", free_immediately)]
 pub struct Request(pub RefCell<RequestCtx>);
 
+impl Request {
+    /// None while another thread holds the request shared, waiting with the GVL released
+    /// in read_body or write_chunk, where borrow_mut would panic.
+    fn exclusive(&self) -> Option<RefMut<'_, RequestCtx>> {
+        self.0.try_borrow_mut().ok()
+    }
+
+    /// While another thread waits on the request, the upgrade is declined at GC instead.
+    fn decline_upgrade(&self) {
+        if let Some(mut ctx) = self.exclusive() {
+            ctx.decline_upgrade();
+        }
+    }
+}
+
 /// Build the complete Rack env for a request. Static keys and common
 /// values come from the frozen, Ractor-shareable cache (env_strings);
 /// only genuinely dynamic strings are allocated. Called by `admit`
-/// (queue.rs) with the GVL held, before the ctx is wrapped.
+/// (queue/worker.rs) with the GVL held, before the ctx is wrapped.
 pub fn build_env(ruby: &Ruby, ctx: &RequestCtx) -> Result<RHash, Error> {
     use crate::env_strings;
 
@@ -166,7 +251,7 @@ pub fn build_env(ruby: &Ruby, ctx: &RequestCtx) -> Result<RHash, Error> {
         _ => s.http11,
     };
     env.aset(live(s.server_protocol), live(protocol))?;
-    env_strings::set_addr_env(ruby, env, ctx.remote_addr.ip())?;
+    env_strings::set_addr_env(ruby, env, ctx.peer.remote.ip())?;
     // The scheme is the transport's to know, not the app config's.
     let scheme = if ctx.https { s.https } else { s.http };
     env.aset(live(s.rack_url_scheme), live(scheme))?;
@@ -230,7 +315,7 @@ pub fn build_env(ruby: &Ruby, ctx: &RequestCtx) -> Result<RHash, Error> {
     // address. Runs after the header loop so an authority-derived
     // HTTP_HOST wins over a literal host header a proxy forwarded.
     if let Some(authority) = ctx.uri.authority() {
-        let local_port = ctx.local_addr.port();
+        let local_port = ctx.peer.local.port();
         env_strings::set_authority_env(ruby, env, authority.as_str(), || {
             (
                 authority.host().to_string(),
@@ -240,7 +325,7 @@ pub fn build_env(ruby: &Ruby, ctx: &RequestCtx) -> Result<RHash, Error> {
     } else {
         match ctx.headers.get(http::header::HOST) {
             Some(host) => {
-                let local_port = ctx.local_addr.port();
+                let local_port = ctx.peer.local.port();
                 env_strings::set_host_env(
                     ruby,
                     env,
@@ -255,8 +340,8 @@ pub fn build_env(ruby: &Ruby, ctx: &RequestCtx) -> Result<RHash, Error> {
                 )?;
             }
             None => {
-                let ip = ctx.local_addr.ip();
-                let port = ctx.local_addr.port();
+                let ip = ctx.peer.local.ip();
+                let port = ctx.peer.local.port();
                 env_strings::set_host_env(ruby, env, format!("\0{ip}:{port}").as_bytes(), || {
                     (ip.to_string(), port)
                 })?;
@@ -270,17 +355,19 @@ pub fn build_env(ruby: &Ruby, ctx: &RequestCtx) -> Result<RHash, Error> {
 /// Bodyless requests carry no channel at all; a present channel that is
 /// disconnected and empty (EOF already reached) also has nothing left.
 fn body_possible(ctx: &RequestCtx) -> bool {
-    ctx.leftover.is_some()
-        || ctx
-            .body_rx
-            .as_ref()
-            .is_some_and(|rx| !(rx.is_empty() && rx.is_disconnected()))
+    let leftover = ctx.leftover.take();
+    let left = leftover.is_some();
+    ctx.leftover.set(leftover);
+    left || ctx
+        .body_rx
+        .as_ref()
+        .is_some_and(|rx| !(rx.is_empty() && rx.is_disconnected()))
 }
 
 /// Complete response in one shot: status, the Rack headers Hash (iterated
 /// here, no intermediate array on the Ruby side), full body. Free function
 /// shared by the `send_simple` binding and the fused respond_and_take path
-/// (queue.rs).
+/// (queue/worker.rs).
 pub fn respond_simple(
     ruby: &Ruby,
     request: &Request,
@@ -288,6 +375,7 @@ pub fn respond_simple(
     headers: RHash,
     body: RString,
 ) -> Result<bool, Error> {
+    request.decline_upgrade();
     let ctx = request.0.borrow();
     let builder = timed(&ctx, build_head(status, headers)?);
     let bytes = body_bytes(&ctx, body);
@@ -308,11 +396,82 @@ fn body_bytes(ctx: &RequestCtx, body: RString) -> Bytes {
 }
 
 impl Request {
+    /// Accept a handshake (ws::accept), its 101 carrying `headers` for switch_protocols: the
+    /// socket id, false for Kino's 503 refusal, nil when it is no handshake or there are no lanes.
+    pub fn upgrade_websocket(
+        ruby: &Ruby,
+        rb_self: &Request,
+        headers: RHash,
+        on_shutdown: bool,
+    ) -> Result<magnus::Value, Error> {
+        let head = build_head(101, headers)?
+            .body(())
+            .map_err(|e| invalid_response(ruby, e))?;
+        let extra: Vec<_> = head
+            .headers()
+            .iter()
+            .map(|(name, value)| (name.clone(), value.clone()))
+            .collect();
+        let mut ctx = rb_self.exclusive().ok_or_else(|| busy_error(ruby))?;
+        Ok(match crate::ws::accept(&mut ctx, &extra, on_shutdown) {
+            crate::ws::Accept::Opened(id) => ruby.into_value(id),
+            crate::ws::Accept::Refused => ruby.qfalse().as_value(),
+            crate::ws::Accept::Declined => ruby.qnil().as_value(),
+        })
+    }
+
+    /// The accepted handshake's 101, once on_open ran; false when the request was answered
+    /// otherwise first, which closes the connection.
+    pub fn switch_protocols(ruby: &Ruby, rb_self: &Request) -> Result<bool, Error> {
+        let ctx = rb_self.exclusive().ok_or_else(|| busy_error(ruby))?;
+        Ok(ctx.responder.switch())
+    }
+
+    /// rack.hijack: the fd of the app's end of the bridge.
+    pub fn hijack(ruby: &Ruby, rb_self: &Request) -> Result<i32, Error> {
+        rb_self.hijacked_fd(ruby, None)
+    }
+
+    /// A 101 with a callable (a partial hijack, or a Rack 3 streaming body): sends it with
+    /// `headers` and takes the connection over; the fd of the app's end.
+    pub fn hijack_switched(ruby: &Ruby, rb_self: &Request, headers: RHash) -> Result<i32, Error> {
+        let head = build_head(101, headers)?
+            .body(full_body(Bytes::new()))
+            .map_err(|e| invalid_response(ruby, e))?;
+        rb_self.hijacked_fd(ruby, Some(head))
+    }
+
+    /// The fd of the app's end of a bridge that took the connection over (hijack::take).
+    fn hijacked_fd(
+        &self,
+        ruby: &Ruby,
+        head: Option<crate::response::HyperResponse>,
+    ) -> Result<i32, Error> {
+        use std::os::fd::IntoRawFd;
+
+        let taken = match self.exclusive() {
+            Some(mut ctx) => crate::hijack::take(&mut ctx, head),
+            None => Err(crate::hijack::Refused::Busy),
+        };
+        let io = taken.map_err(|refused| {
+            Error::new(
+                ruby.exception_io_error(),
+                format!("Kino: rack.hijack failed: {refused}"),
+            )
+        })?;
+        Ok(io.into_raw_fd())
+    }
+
+    pub fn hijacked(_ruby: &Ruby, rb_self: &Request) -> bool {
+        rb_self.0.borrow().hijacked
+    }
+
     /// The worker's measurements around the app call, for the access log's
     /// breakdown: the GC pause in nanoseconds and the objects allocated.
     /// Called only when the access log is on.
     pub fn set_timing(_ruby: &Ruby, rb_self: &Request, gc_nanos: u64, allocs: u64) {
-        rb_self.0.borrow_mut().gc = Some((std::time::Duration::from_nanos(gc_nanos), allocs));
+        let gc = std::time::Duration::from_nanos(gc_nanos);
+        rb_self.0.borrow().gc.set(Some((gc, allocs)));
     }
 
     /// Next chunk of the request body, at most `max_len` bytes; nil at EOF.
@@ -322,9 +481,10 @@ impl Request {
         rb_self: &Request,
         max_len: usize,
     ) -> Result<Option<RString>, Error> {
-        let mut ctx = rb_self.0.borrow_mut();
         let max_len = max_len.max(1);
 
+        // Shared across the wait: other threads may abort or answer the request meanwhile.
+        let ctx = rb_self.0.borrow();
         let mut chunk = match ctx.leftover.take() {
             Some(bytes) => bytes,
             None => {
@@ -356,7 +516,7 @@ impl Request {
         };
 
         if chunk.len() > max_len {
-            ctx.leftover = Some(chunk.split_off(max_len));
+            ctx.leftover.set(Some(chunk.split_off(max_len)));
             return Ok(Some(ruby.str_from_slice(&chunk)));
         }
 
@@ -375,7 +535,7 @@ impl Request {
                     break;
                 };
                 if more.len() > max_len - total {
-                    ctx.leftover = Some(more.split_off(max_len - total));
+                    ctx.leftover.set(Some(more.split_off(max_len - total)));
                 }
                 total += more.len();
                 let out = *assembled.get_or_insert_with(|| {
@@ -393,25 +553,31 @@ impl Request {
     }
 
     /// Start a streaming response: head goes out now, chunks follow via
-    /// write_chunk, terminated by finish.
+    /// write_chunk, terminated by finish. Once Kino answered, the first write ends the body.
     pub fn send_headers(
         ruby: &Ruby,
         rb_self: &Request,
         status: u16,
         headers: RHash,
     ) -> Result<bool, Error> {
+        rb_self.decline_upgrade();
         let ctx = rb_self.0.borrow();
         let builder = timed(&ctx, build_head(status, headers)?);
+        let bodiless = crate::framing::bodiless(status, ctx.method == http::Method::HEAD);
         ctx.responder
-            .send_stream_head(builder)
+            .send_stream_head(builder, bodiless)
             .map_err(|e| invalid_response(ruby, e))
     }
 
     /// One body chunk. Blocks (GVL released) when the client is slower than
-    /// the app: this is the outbound backpressure.
+    /// the app: this is the outbound backpressure. Raises ClientGone once the
+    /// client is gone or Kino gave the stream up.
     pub fn write_chunk(ruby: &Ruby, rb_self: &Request, chunk: RString) -> Result<(), Error> {
         let ctx = rb_self.0.borrow();
         let Some(sender) = ctx.responder.body_sender() else {
+            if ctx.responder.stream_cut() {
+                return Err(client_gone_error(ruby));
+            }
             return Err(Error::new(
                 ruby.exception_runtime_error(),
                 "Kino: response stream not started or already finished",
@@ -424,6 +590,9 @@ impl Request {
             let frame = pending.take().expect("frame consumed twice");
             match sender.send_timeout(frame, crate::queue::TICK) {
                 Ok(()) => Some(true),
+                Err(flume::SendTimeoutError::Timeout(_)) if ctx.responder.stream_cut() => {
+                    Some(false)
+                }
                 Err(flume::SendTimeoutError::Timeout(frame)) => {
                     pending = Some(frame); // client slow; keep waiting
                     None
@@ -432,9 +601,12 @@ impl Request {
             }
         })?;
         match outcome {
-            // Receiver dropped = client went away; the app keeps writing
-            // into the void harmlessly (Rack has no error contract here).
-            Some(_) => Ok(()),
+            Some(true) => Ok(()),
+            // Gone, or given up (and counted then).
+            Some(false) => {
+                ctx.responder.cut_stream(crate::response::Cut::ClientGone);
+                Err(client_gone_error(ruby))
+            }
             None => Err(interrupted_error(ruby)),
         }
     }
@@ -446,9 +618,13 @@ impl Request {
     }
 
     /// Give up on this request: canned 500 if the head wasn't sent, abort
-    /// the connection if mid-stream. Used by the worker's rescue path.
+    /// the connection if mid-stream. Used by the worker's rescue path. It
+    /// borrows no more than threads waiting on the request do, so a waiting write fails.
     pub fn abort(_ruby: &Ruby, rb_self: &Request) -> Result<(), Error> {
-        rb_self.0.borrow().responder.respond_500_if_unsent();
+        rb_self.decline_upgrade();
+        if let Ok(ctx) = rb_self.0.try_borrow() {
+            ctx.responder.give_up(Cut::Crash);
+        }
         Ok(())
     }
 }
@@ -507,25 +683,14 @@ pub(crate) fn split_host_port(host: &str, default_port: u16) -> (String, u16) {
 #[cfg(test)]
 pub fn test_ctx() -> crate::registry::BoxedCtx {
     let (head_tx, _head_rx) = tokio::sync::oneshot::channel();
-    Box::new(RequestCtx {
-        method: http::Method::GET,
-        uri: "/".parse().expect("static uri"),
-        version: http::Version::HTTP_11,
-        headers: http::HeaderMap::new(),
-        remote_addr: "127.0.0.1:40000".parse().expect("static addr"),
-        local_addr: "127.0.0.1:9292".parse().expect("static addr"),
-        https: false,
-        body_rx: None,
-        leftover: None,
-        slot: None,
-        pin_slab: Arc::new(crate::pin::PinSlab::for_responses(false)),
-        responder: Arc::new(Responder::new(head_tx)),
-        enqueued_at: std::time::Instant::now(),
-        timed: false,
-        wait: std::time::Duration::ZERO,
-        admitted_at: std::time::Instant::now(),
-        gc: None,
-    })
+    let (parts, ()) = http::Request::new(()).into_parts();
+    let peer = Peer {
+        remote: "127.0.0.1:40000".parse().expect("static addr"),
+        local: "127.0.0.1:9292".parse().expect("static addr"),
+    };
+    let server = crate::testing::TestServer::shared_queue().build();
+    let responder = Arc::new(Responder::new(head_tx));
+    RequestCtx::new(parts, peer, &server, responder, None, None)
 }
 
 #[cfg(test)]
@@ -562,39 +727,14 @@ mod tests {
     }
 
     #[test]
-    fn authority_host_port_derivation() {
-        // The same derivation build_env applies to a URI authority (the
-        // h2 :authority pseudo-header): http::uri does the split, the
-        // socket's local port fills a missing port.
-        let with_port: http::Uri = "https://example.com:8443/x".parse().expect("uri");
-        let authority = with_port.authority().expect("authority");
-        assert_eq!(authority.host(), "example.com");
-        assert_eq!(authority.port_u16(), Some(8443));
-        assert_eq!(authority.as_str(), "example.com:8443");
-
-        let bare: http::Uri = "https://example.com/x".parse().expect("uri");
-        let authority = bare.authority().expect("authority");
-        assert_eq!(authority.host(), "example.com");
-        assert_eq!(authority.port_u16().unwrap_or(9292), 9292);
-
-        // Bracketed IPv6: host() keeps the brackets, matching the h1
-        // split_host_port convention for SERVER_NAME.
-        let v6: http::Uri = "https://[::1]:8443/x".parse().expect("uri");
-        let authority = v6.authority().expect("authority");
-        assert_eq!(authority.host(), "[::1]");
-        assert_eq!(authority.port_u16(), Some(8443));
-        assert_eq!(authority.as_str(), "[::1]:8443");
-    }
-
-    #[test]
     fn body_possible_reflects_channel_and_leftover_state() {
         // test_ctx carries no channel: bodyless by construction.
         let ctx = test_ctx();
         assert!(!body_possible(&ctx));
 
         // A leftover chunk means there is still body to read.
-        let mut ctx = test_ctx();
-        ctx.leftover = Some(bytes::Bytes::from_static(b"tail"));
+        let ctx = test_ctx();
+        ctx.leftover.set(Some(bytes::Bytes::from_static(b"tail")));
         assert!(body_possible(&ctx));
 
         // A live sender means bytes may still arrive.

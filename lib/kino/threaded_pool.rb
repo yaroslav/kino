@@ -2,39 +2,15 @@
 
 module Kino
   # @private
-  # The :threaded-mode worker pool: `workers` groups of `threads` plain
-  # Threads, each thread on its own dispatch slot. A group is one ractor's
-  # worth of capacity, so `workers` and `max_workers` mean the same thing
-  # in both modes. Behind PoolScaler here (`grow`, `retire`, `groups`,
-  # `active_count`), the quarantine monitor's replacer (`replace`), and
-  # the join/kill sweeps Server#shutdown runs.
-  class ThreadedPool
-    def initialize(server_id, app, threads:, batch: 1, hooks: nil, on_worker_exit: nil)
-      @server_id = server_id
-      @app = app
-      @threads = threads
-      @batch = batch
-      @hooks = hooks
-      @on_worker_exit = on_worker_exit
-      @lock = Mutex.new
-      # index => {slots:, threads:}; the groups asked to leave; quarantine
-      # replacements (one thread each, standing in for a wedged slot:
-      # neither counted nor retired, so the wedged group keeps counting as
-      # the capacity it still is). Retired groups hand their slots back to
-      # the bank.
+  # The :threaded-mode Pool: `workers` groups of `threads` Threads, a group being one Ractor's
+  # worth of capacity; a crashed thread is replaced in its group, paced by a CrashBackoff.
+  class ThreadedPool < Pool
+    def initialize(...)
+      super
+      # index => its threads; quarantine replacements (one thread each: not counted, not retired).
       @groups = {}
-      @slot_to_group = {}
-      @retiring = {}
-      @bank = SlotBank.new(server_id)
       @replacements = {}
       @wedged = {}
-      @next_index = -1
-    end
-
-    def start(workers)
-      workers.times { spawn_group }
-      report_active
-      self
     end
 
     # Groups that are staying: quarantine replacements aside, and minus
@@ -52,111 +28,112 @@ module Kino
     def groups
       reap
       @lock.synchronize do
-        @groups
-          .reject { |index, _| @retiring.key?(index) || @wedged.key?(index) || @replacements.key?(index) }
-          .transform_values { |group| group[:slots].dup }
+        @slots.reject { |index, _| @retiring.key?(index) || @wedged.key?(index) || @replacements.key?(index) }
       end
     end
 
-    # Add one group; returns its index.
+    # Retiring groups that have left are reaped first.
     def grow
       reap
-      index = spawn_group
-      report_active
-      index
+      super
     end
 
-    # Send a group home: its slots stop receiving work now, each thread
-    # finishes what it holds and leaves at its next idle tick, and the
-    # slots come back to the free list once every thread has exited.
-    def retire(index)
-      slots = @lock.synchronize do
-        next nil unless @groups.key?(index) && !@retiring.key?(index)
+    # The quarantine replacer for slot `worker_id` at `generation`: mark the slot (a crash
+    # meanwhile gets no second replacement), spawn a replacement on a bank slot (a ThreadError
+    # unmarks it), then quarantine. False for a slot that moved on since the sample.
+    def replace(worker_id, generation)
+      marked = @lock.synchronize do
+        next false if @quarantined.key?(worker_id) || !@owner.key?(worker_id)
+        next false unless @bank.generation(worker_id) == generation
 
-        @retiring[index] = true
-        @groups[index][:slots]
+        @quarantined[worker_id] = true
       end
-      return false unless slots
+      return false unless marked
 
-      slots.each { |id| Native.retire_slot(@server_id, id) }
-      true
-    end
-
-    # The quarantine replacer: spawn a replacement thread on a fresh slot
-    # FIRST (may raise ThreadError), then quarantine the wedged slot.
-    def replace(worker_id)
-      spawn_group(slots: 1, replacement: true)
-      Native.quarantine_slot(@server_id, worker_id)
-      @lock.synchronize do
-        wedged = @slot_to_group[worker_id]
-        @wedged[wedged] = true if wedged
+      begin
+        spawn_group(slots: 1, replacement: true)
+      rescue
+        unmark([worker_id])
+        raise
+      end
+      if quarantine(worker_id, generation)
+        @lock.synchronize { @wedged[@owner[worker_id]] = true if @owner.key?(worker_id) }
       end
       true
-    end
-
-    # Join every thread up to the (numeric) deadline.
-    def shutdown(timeout)
-      deadline = Process.clock_gettime(Process::CLOCK_MONOTONIC) + timeout
-      all_threads.each do |thread|
-        remaining = deadline - Process.clock_gettime(Process::CLOCK_MONOTONIC)
-        thread.join([remaining, 0.01].max)
-      end
-    end
-
-    def done?
-      all_threads.none?(&:alive?)
-    end
-
-    # Block until every thread exits on its own (drain elsewhere).
-    def join
-      all_threads.each(&:join)
     end
 
     def kill_stragglers
-      all_threads.each { |thread| thread.kill if thread.alive? }
+      join_set.each { |thread| thread.kill if thread.alive? }
     end
 
     private
 
-    def all_threads
-      @lock.synchronize { @groups.values.flat_map { |group| group[:threads] } }
-    end
+    def add_worker = spawn_group
+
+    def join_set = @lock.synchronize { @groups.values.flatten }
+
+    def member?(index) = @groups.key?(index)
 
     # The group is in the table before its first thread starts, so a
     # ThreadError partway through leaves nothing untracked for shutdown.
     def spawn_group(slots: @threads, replacement: false)
-      group = {slots: [], threads: []}
+      threads = []
       index = @lock.synchronize do
         @next_index += 1
-        @groups[@next_index] = group
+        @groups[@next_index] = threads
+        @slots[@next_index] = []
         @replacements[@next_index] = true if replacement
         @next_index
       end
-      slots.times do
+      slots.times do |position|
         id = @bank.claim
-        @lock.synchronize do
-          group[:slots] << id
-          @slot_to_group[id] = index
-        end
-        thread = spawn_thread(id)
-        @lock.synchronize { group[:threads] << thread }
+        @lock.synchronize { map_slot(index, id) }
+        thread = spawn_thread(index, id, CrashBackoff.for(index, position, slots))
+        @lock.synchronize { threads << thread }
       end
       index
     end
 
-    def spawn_thread(worker_id)
+    def spawn_thread(index, worker_id, backoff)
       Thread.new do
         # Named so log lines from inside say which worker spoke.
         Thread.current.name = "worker-#{worker_id}"
-        error = nil
+        backoff.started
+        error = crashed_at = nil
         begin
           Worker.run(@server_id, worker_id, @app, @batch, @hooks)
-        rescue Exception => e # rubocop:disable Lint/RescueException -- a hard crash in a threaded worker thread
+        rescue Exception => e # rubocop:disable Lint/RescueException -- a crash, cleaned up after by Worker.run
           error = e
-          raise
+          crashed_at = Kino.monotonic
         ensure
-          HookFire.fire(@on_worker_exit, "on_worker_exit", worker_id, error)
+          worker_exited(worker_id, error)
         end
+        replace_crashed(index, worker_id, backoff, error, crashed_at) if error
+      end
+    end
+
+    # A crashed thread's last act, as its replacement's supervisor: release its slot, then after
+    # the backoff spawn a fresh thread, unless the group is leaving, the slot wedged, or draining.
+    def replace_crashed(index, dead_id, backoff, error, crashed_at)
+      Thread.current.name = "supervisor-#{index}"
+      return unless recover(index, [dead_id], error, backoff, crashed_at)
+
+      id = claim_slot(index) { draining? || @retiring.key?(index) }
+      return unless id
+
+      Native.record_respawn(@server_id)
+      thread = spawn_thread(index, id, backoff)
+      @lock.synchronize { @groups[index].keep_if(&:alive?) << thread }
+    rescue => e
+      replacement_failed(index, e)
+    end
+
+    # Unmap the group's slots of `ids`; returns the releasable ones, wedged, and leaving.
+    def forget_slots(index, ids)
+      @lock.synchronize do
+        forgotten = unmap(index, ids)
+        released = releasable(forgotten)
+        [released, released.size < forgotten.size, !@groups.key?(index) || @retiring.key?(index)]
       end
     end
 
@@ -165,22 +142,19 @@ module Kino
     # the control plane sees never lags by more than a scaler tick.
     def reap
       freed = @lock.synchronize do
-        done = @retiring.keys.select { |index| @groups[index][:threads].none?(&:alive?) }
+        done = @retiring.keys.select { |index| @groups[index].none?(&:alive?) }
         done.flat_map do |index|
-          group = @groups.delete(index)
+          @groups.delete(index)
           @retiring.delete(index)
-          group[:slots].each { |id| @slot_to_group.delete(id) }
-          group[:slots]
+          slots = @slots.delete(index)
+          slots.each { |id| @owner.delete(id) }
+          releasable(slots)
         end
       end
       return if freed.empty?
 
       @bank.release(freed)
       report_active
-    end
-
-    def report_active
-      Native.set_active_workers(@server_id, active_count)
     end
   end
 end

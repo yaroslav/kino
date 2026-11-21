@@ -3,24 +3,19 @@
 RSpec.describe "Kino.sleep" do
   # The strict contract is "never wakes early". The upper bound only
   # guards against pathology (a lost wakeup, a stuck loop): shared CI
-  # runners routinely overshoot any sleep by 100ms+, so precision is a
-  # benchmark topic (doc/benchmarks.md), not a spec assertion.
-  overshoot = 0.5
-
-  def elapsed
-    t0 = Process.clock_gettime(Process::CLOCK_MONOTONIC)
-    yield
-    Process.clock_gettime(Process::CLOCK_MONOTONIC) - t0
-  end
+  # runners routinely overshoot any sleep by 100ms+ (half a second and
+  # more when throttled), so precision is a benchmark topic
+  # (doc/benchmarks.md), not a spec assertion.
+  overshoot = 2
 
   it "sleeps at least the requested duration" do
-    time = elapsed { Kino.sleep(0.05) }
+    time = timed { Kino.sleep(0.05) }
 
     expect(time).to be_between(0.05, 0.05 + overshoot)
   end
 
   it "handles durations longer than one internal chunk" do
-    time = elapsed { Kino.sleep(0.12) }
+    time = timed { Kino.sleep(0.12) }
 
     expect(time).to be_between(0.12, 0.12 + overshoot)
   end

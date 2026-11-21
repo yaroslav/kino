@@ -2,7 +2,7 @@
 
 require "rack"
 
-# Phase 2: Rack 3 spec compliance, enforced by Rack::Lint on a real socket.
+# Rack 3 spec compliance, enforced by Rack::Lint on a real socket.
 # Every app here is wrapped in lint: if kino mis-builds the env or mishandles
 # a body shape, lint raises and the spec fails with a 500.
 RSpec.describe "Rack 3 compliance" do
@@ -118,9 +118,9 @@ RSpec.describe "Rack 3 compliance" do
         started = nil
         Net::HTTP.start(host, port) do |http|
           http.request(Net::HTTP::Get.new("/")) do |response|
-            started = Process.clock_gettime(Process::CLOCK_MONOTONIC)
+            started = monotonic
             response.read_body do |chunk|
-              arrivals << [chunk, Process.clock_gettime(Process::CLOCK_MONOTONIC) - started]
+              arrivals << [chunk, monotonic - started]
             end
           end
         end
@@ -157,12 +157,13 @@ RSpec.describe "Rack 3 compliance" do
       end)
 
       with_server(app, workers: 1, threads: 4) do |host, port|
-        started = Process.clock_gettime(Process::CLOCK_MONOTONIC)
-        threads = 4.times.map do
-          Thread.new { Net::HTTP.get_response(host, "/", port).code }
+        codes = nil
+        elapsed = timed do
+          threads = 4.times.map do
+            Thread.new { Net::HTTP.get_response(host, "/", port).code }
+          end
+          codes = threads.map(&:value)
         end
-        codes = threads.map(&:value)
-        elapsed = Process.clock_gettime(Process::CLOCK_MONOTONIC) - started
 
         expect(codes).to all(eq("200"))
         expect(elapsed).to be < 0.8, "4 x 0.25s requests on 4 workers took #{elapsed.round(2)}s"

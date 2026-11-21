@@ -6,9 +6,13 @@ static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
 
 mod access_log;
 mod control;
+mod counters;
 mod cpus;
+mod dispatch;
 mod env_strings;
+mod framing;
 mod gvl;
+mod hijack;
 mod io_shards;
 mod listen;
 mod log;
@@ -20,14 +24,34 @@ mod registry;
 mod request;
 mod response;
 mod server;
+mod slot;
+mod stats;
 mod style;
 mod test_support;
+#[cfg(test)]
+mod testing;
 mod timer;
 mod tls;
+mod upgrade;
+mod ws;
 
 use magnus::{function, method, prelude::*, Error, Ruby};
 
 use crate::request::Request;
+
+/// Each `"name" => function, arity;` row as a singleton function of `$on`.
+macro_rules! functions {
+    ($on:ident: $($name:literal => $function:path, $arity:tt;)*) => {
+        $($on.define_singleton_method($name, function!($function, $arity))?;)*
+    };
+}
+
+/// Each `"name" => method, arity;` row as an instance method of `$on`.
+macro_rules! methods {
+    ($on:ident: $($name:literal => $method:path, $arity:tt;)*) => {
+        $($on.define_method($name, method!($method, $arity))?;)*
+    };
+}
 
 #[magnus::init]
 fn init(ruby: &Ruby) -> Result<(), Error> {
@@ -39,76 +63,85 @@ fn init(ruby: &Ruby) -> Result<(), Error> {
     let module = ruby.define_module("Kino")?;
 
     let native = module.define_module("Native")?;
-    native.define_singleton_method("server_start", function!(server::server_start, 1))?;
-    native.define_singleton_method("register_worker", function!(server::register_worker, 1))?;
-    native.define_singleton_method("worker", function!(queue::worker, 2))?;
-    native.define_singleton_method("stop_accepting", function!(server::stop_accepting, 1))?;
-    native.define_singleton_method("close_queue", function!(server::close_queue, 1))?;
-    native.define_singleton_method("queue_stats", function!(server::queue_stats, 1))?;
-    native.define_singleton_method("server_stats", function!(server::server_stats, 1))?;
-    native.define_singleton_method("worker_stats", function!(server::worker_stats, 1))?;
-    native.define_singleton_method("queue_time", function!(server::queue_time, 1))?;
-    native.define_singleton_method("quarantine_slot", function!(server::quarantine_slot, 2))?;
-    native.define_singleton_method("retire_slot", function!(server::retire_slot, 2))?;
-    native.define_singleton_method("reset_slot", function!(server::reset_slot, 2))?;
-    native.define_singleton_method(
-        "set_active_workers",
-        function!(server::set_active_workers, 2),
-    )?;
-    native.define_singleton_method("record_scale_up", function!(server::record_scale_up, 1))?;
-    native.define_singleton_method("record_scale_down", function!(server::record_scale_down, 1))?;
-    native.define_singleton_method("pool_stats", function!(server::pool_stats, 1))?;
-    native.define_singleton_method(
-        "record_quarantine_replacement",
-        function!(server::record_quarantine_replacement, 1),
-    )?;
-    native.define_singleton_method("control_ready", function!(server::control_ready, 1))?;
-    native.define_singleton_method("record_respawn", function!(server::record_respawn, 1))?;
-    native.define_singleton_method("control_stop", function!(control::control_stop, 1))?;
-    native.define_singleton_method("abort_inflight", function!(server::abort_inflight, 2))?;
-    native.define_singleton_method(
-        "abort_all_inflight",
-        function!(server::abort_all_inflight, 1),
-    )?;
-    native.define_singleton_method(
-        "interrupt_all_workers",
-        function!(server::interrupt_all_workers, 1),
-    )?;
-    native.define_singleton_method("shutdown_runtime", function!(server::shutdown_runtime, 2))?;
-    native.define_singleton_method("log_line", function!(log::log_line, 3))?;
-    native.define_singleton_method("sleep_chunk", function!(timer::sleep_chunk, 1))?;
-    native.define_singleton_method(
-        "available_parallelism",
-        function!(cpus::available_parallelism, 0),
-    )?;
-    native.define_singleton_method("log_device_open", function!(logsink::device_open, 1))?;
-    native.define_singleton_method("log_device_write", function!(logsink::device_write, 2))?;
-    native.define_singleton_method("log_device_close", function!(logsink::device_close, 1))?;
-    native.define_singleton_method(
-        "register_defaults",
-        function!(env_strings::register_defaults, 2),
-    )?;
-
     native.define_class("PinKeeper", ruby.class_object())?;
-    native.define_singleton_method("pin_keeper", function!(server::pin_keeper, 1))?;
+    functions!(native:
+        "server_start" => server::server_start, 1;
+        "register_worker" => server::register_worker, 1;
+        "worker" => queue::worker, 2;
+        "wake_worker" => queue::wake_worker, 3;
+        "stop_accepting" => server::stop_accepting, 1;
+        "close_queue" => server::close_queue, 1;
+        "close_bridges" => server::close_bridges, 1;
+        "queue_stats" => server::queue_stats, 1;
+        "stats" => server::stats, 1;
+        "worker_stats" => server::worker_stats, 1;
+        "quarantine_slot" => server::quarantine_slot, 3;
+        "retire_slot" => server::retire_slot, 3;
+        "reset_slot" => server::reset_slot, 2;
+        "ws_leave_all" => server::ws_leave_all, 2;
+        "set_active_workers" => server::set_active_workers, 2;
+        "record_scale_up" => server::record_scale_up, 1;
+        "record_scale_down" => server::record_scale_down, 1;
+        "record_quarantine_replacement" => server::record_quarantine_replacement, 1;
+        "control_ready" => server::control_ready, 1;
+        "record_respawn" => server::record_respawn, 1;
+        "control_stop" => control::control_stop, 1;
+        "abort_inflight" => server::abort_inflight, 2;
+        "abort_all_inflight" => server::abort_all_inflight, 1;
+        "interrupt_all_workers" => server::interrupt_all_workers, 1;
+        "shutdown_runtime" => server::shutdown_runtime, 2;
+        "log_line" => log::log_line, 3;
+        "sleep_chunk" => timer::sleep_chunk, 1;
+        "available_parallelism" => cpus::available_parallelism, 0;
+        "log_device_open" => logsink::device_open, 1;
+        "log_device_write" => logsink::device_write, 2;
+        "log_device_close" => logsink::device_close, 1;
+        "register_defaults" => env_strings::register_defaults, 2;
+        "pin_keeper" => server::pin_keeper, 1;
+    );
 
     let worker = native.define_class("Worker", ruby.class_object())?;
-    worker.define_method("take_one", method!(queue::Worker::take_one, 0))?;
-    worker.define_method("take_batch", method!(queue::Worker::take_batch, 1))?;
+    methods!(worker:
+        "take_one" => queue::Worker::take_one, 0;
+        "take_batch" => queue::Worker::take_batch, 1;
+        "identity" => queue::Worker::identity, 0;
+        "release" => queue::Worker::release, 0;
+        "lanes?" => queue::Worker::lanes, 0;
+        "claim_warning" => queue::Worker::claim_warning, 1;
+    );
 
     let request = native.define_class("Request", ruby.class_object())?;
-    request.define_method("respond_and_take", method!(queue::respond_and_take, 5))?;
-    request.define_method(
-        "respond_and_take_one",
-        method!(queue::respond_and_take_one, 4),
-    )?;
-    request.define_method("read_body", method!(Request::read_body, 1))?;
-    request.define_method("send_simple", method!(crate::request::respond_simple, 3))?;
-    request.define_method("send_headers", method!(Request::send_headers, 2))?;
-    request.define_method("write_chunk", method!(Request::write_chunk, 1))?;
-    request.define_method("finish", method!(Request::finish, 0))?;
-    request.define_method("abort", method!(Request::abort, 0))?;
-    request.define_method("timing", method!(Request::set_timing, 2))?;
+    methods!(request:
+        "respond_and_take" => queue::respond_and_take, 5;
+        "respond_and_take_one" => queue::respond_and_take_one, 4;
+        "read_body" => Request::read_body, 1;
+        "send_simple" => crate::request::respond_simple, 3;
+        "send_headers" => Request::send_headers, 2;
+        "write_chunk" => Request::write_chunk, 1;
+        "finish" => Request::finish, 0;
+        "abort" => Request::abort, 0;
+        "timing" => Request::set_timing, 2;
+        "upgrade_websocket" => Request::upgrade_websocket, 2;
+        "switch_protocols" => Request::switch_protocols, 0;
+        "hijack" => Request::hijack, 0;
+        "hijack_switched" => Request::hijack_switched, 1;
+        "hijacked?" => Request::hijacked, 0;
+    );
+    functions!(native:
+        "ws_write" => ws::ws_write, 2;
+        "ws_write_binary" => ws::ws_write_binary, 2;
+        "ws_write_raw" => ws::ws_write_raw, 2;
+        "ws_close" => ws::ws_close, 2;
+        "ws_abort" => ws::abort, 1;
+        "ws_fail" => ws::fail, 1;
+        "ws_handled" => ws::handled, 1;
+        "ws_shutdown_ran" => ws::shutdown_ran, 1;
+        "ws_pending" => ws::pending, 1;
+        "ws_registered" => ws::registered, 1;
+        "ws_subscribe" => ws::topics::ws_subscribe, 5;
+        "ws_unsubscribe" => ws::topics::ws_unsubscribe, 3;
+        "ws_publish" => ws::topics::ws_publish, 3;
+    );
 
     // Force-resolve the TypedData class caches on the main ractor: magnus
     // resolves them lazily on first wrap, and a racy first resolution from
@@ -121,12 +154,14 @@ fn init(ruby: &Ruby) -> Result<(), Error> {
     // shared by every worker ractor afterwards.
     env_strings::init(ruby);
 
-    native.define_singleton_method("_test_channel_create", function!(test_support::create, 1))?;
-    native.define_singleton_method("_test_push", function!(test_support::push, 2))?;
-    native.define_singleton_method("_test_take", function!(test_support::take, 1))?;
-    native.define_singleton_method("_test_close", function!(test_support::close, 1))?;
-    native.define_singleton_method("_test_panic", function!(test_support::panic_in_release, 0))?;
-    native.define_singleton_method("_test_env_probe", function!(test_support::env_probe, 4))?;
+    functions!(native:
+        "_test_channel_create" => test_support::create, 1;
+        "_test_push" => test_support::push, 2;
+        "_test_take" => test_support::take, 1;
+        "_test_close" => test_support::close, 1;
+        "_test_panic" => test_support::panic_in_release, 0;
+        "_test_env_probe" => test_support::env_probe, 4;
+    );
 
     Ok(())
 }

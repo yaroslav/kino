@@ -13,6 +13,36 @@ module ServerHelper
     server&.shutdown
   end
 
+  # A GET over TLS; the fixture cert is self-signed, so it is not verified.
+  def https_get(host, port, path)
+    http = Net::HTTP.new(host, port)
+    http.use_ssl = true
+    http.verify_mode = OpenSSL::SSL::VERIFY_NONE
+    http.start { |session| session.get(path) }
+  end
+
+  # Run the block with RUBY_MAX_CPU set to `value` (unset when nil), then
+  # restore what it was.
+  def with_max_cpu(value)
+    previous = ENV["RUBY_MAX_CPU"]
+    value.nil? ? ENV.delete("RUBY_MAX_CPU") : ENV["RUBY_MAX_CPU"] = value
+    yield
+  ensure
+    previous.nil? ? ENV.delete("RUBY_MAX_CPU") : ENV["RUBY_MAX_CPU"] = previous
+  end
+
+  # The native id of `server`, which the natives and Kino::WorkerRow take.
+  def server_id(server) = server.instance_variable_get(:@id)
+
+  # Retire the worker on dispatch `slot` natively, as the pool scaler
+  # would, whatever the pool thinks: what a worker meets when a retirement
+  # races something that just happened to it.
+  def retire_slot(server, slot)
+    id = server_id(server)
+    generation = Kino::WorkerRow.all(id).find { |row| row.slot == slot }.generation
+    Kino::Native.retire_slot(id, slot, generation)
+  end
+
   # Spawn the real `kino` CLI as a subprocess on an ephemeral port (so
   # concurrent spec runs never collide), wait for the startup banner, and
   # yield the bound port plus the stdout capture path. Always reaps.
@@ -40,6 +70,13 @@ module ServerHelper
       Process.kill("TERM", pid)
       Process.wait(pid)
     end
+  end
+
+  def native_teardown(id)
+    Kino::Native.stop_accepting(id)
+    Kino::Native.close_queue(id)
+    Kino::Native.shutdown_runtime(id, 200)
+    Kino::Native.control_stop(id)
   end
 end
 

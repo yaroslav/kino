@@ -10,17 +10,10 @@ RSpec.describe "worker pools" do
                                mode: "threaded", workers: 2, threads: 1})
   end
 
-  def native_teardown(id)
-    Kino::Native.stop_accepting(id)
-    Kino::Native.close_queue(id)
-    Kino::Native.shutdown_runtime(id, 200)
-    Kino::Native.control_stop(id)
-  end
-
   it "counts a retiring thread group out before its threads have exited" do
     id, = native_boot
     app = ->(_env) { [200, {"content-type" => "text/plain"}, ["ok"]] }
-    pool = Kino::ThreadedPool.new(id, app, threads: 1).start(2)
+    pool = Kino::ThreadedPool.new(id, app, workers: 2, threads: 1).start
     expect(pool.active_count).to eq(2)
 
     expect(pool.retire(1)).to be(true)
@@ -40,8 +33,7 @@ RSpec.describe "worker pools" do
     expect(supervisor.active_count).to eq(2)
     # Only a worker whose supervisor thread has assigned its slots is
     # retirable; the scaler retires from this listing too.
-    deadline = Process.clock_gettime(Process::CLOCK_MONOTONIC) + 2
-    sleep 0.01 until supervisor.groups.size == 2 || Process.clock_gettime(Process::CLOCK_MONOTONIC) > deadline
+    wait_for("both workers to be assigned their slots", timeout: 2, every: 0.01) { supervisor.groups.size == 2 }
 
     expect(supervisor.retire(1)).to be(true)
 

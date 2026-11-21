@@ -6,13 +6,6 @@ require "tmpdir"
 RSpec.describe "elastic pool" do
   let(:ok_app) { ->(_env) { [200, {"content-type" => "text/plain"}, ["ok"]] } }
 
-  def monotonic = Process.clock_gettime(Process::CLOCK_MONOTONIC)
-
-  def wait_for(timeout = 5)
-    deadline = monotonic + timeout
-    sleep 0.02 until yield || monotonic > deadline
-  end
-
   # Slow enough that a burst keeps the queue non-empty across several
   # scaler ticks (100 ms), fast enough that specs stay short.
   def slow_shareable_app
@@ -77,30 +70,44 @@ RSpec.describe "elastic pool" do
     end
   end
 
-  describe "ractor mode" do
-    it "grows under queue pressure, shrinks back to the floor when idle, and recycles slots" do
-      server = Kino::Server.new(slow_shareable_app, mode: :ractor, workers: 1, threads: 1,
-        max_workers: 3, scale_down_after: 0.3).start
-      host, port = "127.0.0.1", server.port
-
-      requests = burst(host, port, 4)
-      wait_for { server.stats[:active_workers] == 3 }
-      expect(server.stats).to include(active_workers: 3, scale_ups: 2)
-      requests.each { |t| expect(t.value.code).to eq("200") }
-
-      wait_for { server.stats[:active_workers] == 1 }
-      expect(server.stats).to include(active_workers: 1, scale_downs: 2)
-      slots = server.stats[:worker_status].length
-
-      requests = burst(host, port, 4)
-      wait_for { server.stats[:active_workers] == 3 }
-      requests.each { |t| expect(t.value.code).to eq("200") }
-      # Retired slots were handed to the new workers: the registry did not grow.
-      expect(server.stats[:worker_status].length).to eq(slots)
-    ensure
-      server&.shutdown(timeout: 1)
+  let(:slow_app) do
+    lambda do |env|
+      sleep 0.4 if env["PATH_INFO"] == "/slow"
+      [200, {"content-type" => "text/plain"}, ["ok"]]
     end
+  end
 
+  describe "growing and shrinking" do
+    {ractor: :slow_shareable_app, threaded: :slow_app}.each do |mode, app|
+      it "grows under queue pressure, shrinks back to the floor when idle, and recycles slots (#{mode} mode)" do
+        exits = Thread::Queue.new
+        server = Kino::Server.new(send(app), mode: mode, workers: 1, threads: 1,
+          max_workers: 3, scale_down_after: 0.3, on_worker_exit: ->(*) { exits << :exit }).start
+        host, port = "127.0.0.1", server.port
+
+        requests = burst(host, port, 4)
+        wait_for { server.stats[:active_workers] == 3 }
+        expect(server.stats).to include(active_workers: 3, scale_ups: 2)
+        requests.each { |t| expect(t.value.code).to eq("200") }
+
+        wait_for { server.stats[:active_workers] == 1 }
+        expect(server.stats).to include(active_workers: 1, scale_downs: 2)
+        # A retiring worker leaves the count at once, and its slots only as it exits.
+        wait_for("the retired workers to exit") { exits.size == 2 }
+        slots = server.stats[:worker_status].length
+
+        requests = burst(host, port, 4)
+        wait_for { server.stats[:active_workers] == 3 }
+        requests.each { |t| expect(t.value.code).to eq("200") }
+        # Retired slots were handed to the new workers: the registry did not grow.
+        expect(server.stats[:worker_status].length).to eq(slots)
+      ensure
+        server&.shutdown(timeout: 1)
+      end
+    end
+  end
+
+  describe "ractor mode" do
     it "fires on_worker_exit with a nil cause for each retired worker" do
       exits = Queue.new
       server = Kino::Server.new(slow_shareable_app, mode: :ractor, workers: 1, threads: 1,
@@ -120,35 +127,6 @@ RSpec.describe "elastic pool" do
   end
 
   describe "threaded mode" do
-    let(:slow_app) do
-      lambda do |env|
-        sleep 0.4 if env["PATH_INFO"] == "/slow"
-        [200, {"content-type" => "text/plain"}, ["ok"]]
-      end
-    end
-
-    it "grows under queue pressure, shrinks back to the floor when idle, and recycles slots" do
-      server = Kino::Server.new(slow_app, mode: :threaded, workers: 1, threads: 1,
-        max_workers: 3, scale_down_after: 0.3).start
-      host, port = "127.0.0.1", server.port
-
-      requests = burst(host, port, 4)
-      wait_for { server.stats[:active_workers] == 3 }
-      expect(server.stats).to include(active_workers: 3, scale_ups: 2)
-      requests.each { |t| expect(t.value.code).to eq("200") }
-
-      wait_for { server.stats[:active_workers] == 1 }
-      expect(server.stats).to include(active_workers: 1, scale_downs: 2)
-      slots = server.stats[:worker_status].length
-
-      requests = burst(host, port, 4)
-      wait_for { server.stats[:active_workers] == 3 }
-      requests.each { |t| expect(t.value.code).to eq("200") }
-      expect(server.stats[:worker_status].length).to eq(slots)
-    ensure
-      server&.shutdown(timeout: 1)
-    end
-
     it "grows and retires whole workers when a worker is several threads" do
       server = Kino::Server.new(slow_app, mode: :threaded, workers: 1, threads: 2,
         max_workers: 2, scale_down_after: 0.3).start
@@ -247,14 +225,6 @@ RSpec.describe "elastic pool" do
   describe "the Ruby scheduler cap" do
     # Ruby runs non-main ractors' Ruby code on at most RUBY_MAX_CPU native
     # threads (default 8); a pool past that gains no CPU parallelism.
-    def with_max_cpu(value)
-      previous = ENV["RUBY_MAX_CPU"]
-      ENV["RUBY_MAX_CPU"] = value
-      yield
-    ensure
-      ENV["RUBY_MAX_CPU"] = previous
-    end
-
     def start_and_stop(**opts)
       app = Ractor.shareable_proc { |_env| [200, {"content-type" => "text/plain"}, ["ok"]] }
       capture_native_stderr do
@@ -274,6 +244,33 @@ RSpec.describe "elastic pool" do
       err = with_max_cpu("2") { start_and_stop(workers: 1, max_workers: 2) }
 
       expect(err).not_to include("RUBY_MAX_CPU")
+    end
+  end
+
+  # Server.run serves for as long as #wait waits.
+  describe "Server#wait" do
+    each_mode do |mode|
+      it "keeps waiting while the pool retires its first worker, until a shutdown" do
+        exits = Thread::Queue.new
+        server = Kino::Server.new(slow_shareable_app, mode: mode, workers: 1, threads: 1, max_workers: 2,
+          scale_down_after: 0.2, on_worker_exit: ->(index, _error) { exits << index }).start
+        host, port = "127.0.0.1", server.port
+        waiter = Thread.new { server.wait }
+
+        # The scaler retires the worker idle longest. Of two slow requests
+        # the first worker takes the first, so it idles first.
+        wait_for("the first worker to retire", timeout: 30) do
+          burst(host, port, 2).each(&:join)
+          exits.pop(timeout: 2) == 0
+        end
+
+        expect(waiter.join(0.3)).to be_nil, "wait returned while the server was still serving"
+        expect(Net::HTTP.get_response(host, "/", port).code).to eq("200")
+        server.shutdown(timeout: 1)
+        expect(waiter.join(5)).to eq(waiter), "wait did not return after the shutdown"
+      ensure
+        server&.shutdown(timeout: 1)
+      end
     end
   end
 end

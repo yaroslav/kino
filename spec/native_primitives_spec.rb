@@ -1,6 +1,6 @@
 # frozen_string_literal: true
 
-# Phase 0 proofs: the native layer is Ractor-safe, blocking takes release the
+# Proofs that the native layer is Ractor-safe, blocking takes release the
 # GVL, and the unblock function (UBF) makes blocked workers interruptible.
 # Everything later (the request queue) is these primitives at scale.
 RSpec.describe "native primitives" do

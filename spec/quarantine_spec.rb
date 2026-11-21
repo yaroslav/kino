@@ -26,10 +26,7 @@ RSpec.describe "quarantine" do
 
     wedge = Thread.new { Net::HTTP.get_response(host, "/", port) }
     # Wait for the monitor (0.5s tick, 0.2s timeout) to quarantine + replace.
-    deadline = monotonic + 5
-    until server.stats[:quarantined] >= 1 || monotonic > deadline
-      sleep 0.05
-    end
+    wait_for("a quarantine", every: 0.05) { server.stats[:quarantined] >= 1 }
     expect(server.stats[:quarantined]).to eq(1)
     expect(server.stats[:worker_status].count { |w| w[:quarantined] }).to eq(1)
     # A replacement slot was registered, so total slots grew past the
@@ -68,9 +65,9 @@ RSpec.describe "quarantine" do
     host, port = "127.0.0.1", server.port
 
     wedge = Thread.new { Net::HTTP.get_response(host, "/wedge", port) }
-    deadline = monotonic + 6
-    sleep 0.05 until (server.stats[:quarantined] >= 1 &&
-                      server.stats[:worker_status].length > 2) || monotonic > deadline
+    wait_for("a quarantine and its replacement", timeout: 6, every: 0.05) do
+      server.stats[:quarantined] >= 1 && server.stats[:worker_status].length > 2
+    end
 
     expect(server.stats[:quarantined]).to eq(1)
     expect(server.stats[:worker_status].any? { |w| w[:quarantined] }).to be(true)
@@ -90,8 +87,7 @@ RSpec.describe "quarantine" do
 
     # Wedge two of the three slots; only one quarantine is allowed.
     wedges = Array.new(2) { Thread.new { Net::HTTP.get_response(host, "/", port) } }
-    deadline = monotonic + 5
-    sleep 0.05 until server.stats[:quarantined] >= 1 || monotonic > deadline
+    wait_for("a quarantine", every: 0.05) { server.stats[:quarantined] >= 1 }
     sleep 1 # give the monitor several ticks to (not) exceed the cap
 
     expect(server.stats[:quarantined]).to eq(1)
@@ -120,9 +116,9 @@ RSpec.describe "quarantine" do
     host, port = "127.0.0.1", server.port
 
     wedges = Array.new(2) { Thread.new { Net::HTTP.get_response(host, "/wedge", port) } }
-    deadline = monotonic + 6
-    sleep 0.05 until (server.stats[:quarantined] >= 2 &&
-                      server.stats[:worker_status].length == 4) || monotonic > deadline
+    wait_for("both slots quarantined and one replacement", timeout: 6, every: 0.05) do
+      server.stats[:quarantined] >= 2 && server.stats[:worker_status].length == 4
+    end
 
     expect(server.stats[:quarantined]).to eq(2)
     # One replacement ractor of 2 slots (2 original + 2 replacement = 4),
@@ -136,6 +132,4 @@ RSpec.describe "quarantine" do
   ensure
     server&.shutdown(timeout: 0.2)
   end
-
-  def monotonic = Process.clock_gettime(Process::CLOCK_MONOTONIC)
 end

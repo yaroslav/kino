@@ -12,9 +12,8 @@ module Kino
   # the queue on two consecutive ticks (a burst that clears within a tick
   # is not pressure); retire one worker per tick, the one idle longest,
   # once it has been idle for `scale_down_after`. "Idle" means no slot of
-  # the worker held a request at two consecutive samples and its served
-  # count did not move between them, so a worker serving short requests
-  # between samples is never mistaken for an idle one.
+  # the worker held a request, an open socket or an open hijacked connection
+  # at two consecutive samples, and its served count did not move between them.
   class PoolScaler < Monitor
     TICK = 0.1
     # Consecutive ticks with a non-empty queue before the pool grows.
@@ -33,9 +32,8 @@ module Kino
     end
 
     # One policy step over one set of observations: the monotonic time,
-    # the queue depth, and worker_stats rows ([slot, served, in_flight,
-    # busy_ms, quarantined, retired]). Public so the policy is testable
-    # without a server.
+    # the queue depth, and a WorkerRow per slot. Public so the policy is
+    # testable without a server.
     def step(now, queued, rows)
       @pressure = queued.positive? ? @pressure + 1 : 0
       if @pressure >= PRESSURE_TICKS
@@ -56,7 +54,7 @@ module Kino
 
     def scan
       queued, _in_flight = Native.queue_stats(@server_id)
-      step(Process.clock_gettime(Process::CLOCK_MONOTONIC), queued, Native.worker_stats(@server_id))
+      step(Kino.monotonic, queued, WorkerRow.all(@server_id))
     end
 
     def grow
@@ -75,16 +73,15 @@ module Kino
       Log.info("pool shrank to #{@pool.active_count} workers (worker-#{index} idle)")
     end
 
-    # Per worker: idle when no slot holds a request at this sample and the
-    # served total did not move since the previous one. First sighting of
-    # a worker is never idle (it takes two samples to know).
+    # Per worker: idle when no slot is occupied (WorkerRow#occupied?) at this sample and the
+    # served total did not move since the previous one; a first sighting is never idle.
     def observe_idle(now, rows)
-      by_slot = rows.to_h { |row| [row[0], row] }
+      by_slot = rows.to_h { |row| [row.slot, row] }
       groups = @pool.groups
       (@idle_since.keys - groups.keys).each { |index| forget(index) }
       groups.each do |index, slot_ids|
-        served = slot_ids.sum { |id| by_slot.dig(id, 1) || 0 }
-        busy = slot_ids.any? { |id| (by_slot.dig(id, 2) || 0).positive? }
+        served = slot_ids.sum { |id| by_slot[id]&.served || 0 }
+        busy = slot_ids.any? { |id| by_slot[id]&.occupied? }
         idle = !busy && @last_served[index] == served
         @last_served[index] = served
         if idle

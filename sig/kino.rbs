@@ -1,7 +1,6 @@
-# Public interfaces only. Internals (Kino::Worker, Kino::RactorSupervisor,
-# Kino::Input, Kino::NullInput, Kino::ErrorsStream, Kino::Stream,
-# Kino::Native) are deliberately unsigned: they are implementation detail
-# and may change without notice.
+# Public interfaces only. Internals, everything marked @private and the
+# extension's Kino::Native, are deliberately unsigned: they are
+# implementation detail and may change without notice.
 module Kino
   VERSION: String
 
@@ -15,6 +14,10 @@ module Kino
 
   # Raised when mode: :ractor is forced but the app is not Ractor-shareable.
   class UnshareableAppError < Error
+  end
+
+  # Raised by a streaming body's write once its client has gone.
+  class ClientGone < IOError
   end
 
   # High-resolution sleep on the OS clock with the GVL released.
@@ -52,10 +55,12 @@ module Kino
     # Graceful shutdown: drain to the deadline, then abort stragglers.
     def shutdown: (?timeout: Numeric?) -> nil
 
-    def wait: () -> untyped
+    # Block until a shutdown has ended; raises its error if it failed.
+    def wait: () -> void
 
     # Live snapshot: config echo plus native counters (queued, in_flight,
-    # served, rejected, timeouts, respawns, lane_depths when lanes are on).
+    # served, rejected, timeouts, respawns, ...), in the order /stats lists
+    # them; :responses_cut and :websockets cover the whole process.
     def stats: () -> stats_hash
 
     # Production entry point: build the server and #run it.
@@ -123,7 +128,15 @@ module Kino
       def max_connections: (int count) -> untyped
       def max_body_size: (int? bytes) -> untyped
       def batch: (int count) -> untyped
+      # Per-worker lanes (default false); native WebSockets and wake
+      # hooks need them.
       def lanes: (boolish enabled) -> untyped
+      # Largest message a client may send (default 1 MiB); past it, 1009.
+      def websocket_max_message: (int bytes) -> untyped
+      # Most native sockets open at once (default nil: no cap of its own).
+      def websocket_max: (int? count) -> untyped
+      # Seconds of silence before a ping (default 30); nil or 0: no pings.
+      def websocket_ping_interval: (Numeric? seconds) -> untyped
       def log_requests: (boolish enabled) -> untyped
       def on_error: (?^(Exception, Hash[String, untyped]) -> void handler) ?{ (Exception, Hash[String, untyped]) -> void } -> untyped
       def after_boot: (?^() -> void handler) ?{ () -> void } -> untyped
@@ -132,7 +145,7 @@ module Kino
       def on_worker_exit: (?^(Integer, Exception?) -> void handler) ?{ (Integer, Exception?) -> void } -> untyped
       def shutdown_timeout: (Numeric seconds) -> untyped
       def io_shards: (?boolish enabled) -> untyped
-      def io_threads: (int? count) -> untyped
+      def io_threads: (int count) -> untyped
       def tokio_threads: (int count) -> untyped
       def tls: (cert: String, key: String) -> untyped
       def http2: (?boolish enabled) -> untyped
@@ -143,6 +156,64 @@ module Kino
       def quarantine_timeout: (Numeric? seconds) -> untyped
       def quarantine_max: (int count) -> untyped
       def rackup: (String path) -> untyped
+    end
+  end
+
+  # A handle to a native WebSocket, handed to the callbacks of the handler an app sets as
+  # env["rack.upgrade"]: frozen, shareable, and usable from any thread or Ractor.
+  class WebSocket
+    attr_reader id: Integer
+
+    # The socket with this id; nil once it is gone.
+    def self.[]: (Integer id) -> WebSocket?
+
+    def ==: (untyped other) -> bool
+
+    def eql?: (untyped other) -> bool
+
+    def hash: () -> Integer
+
+    # One text frame.
+    def write: (String data) -> bool
+
+    # One binary frame.
+    def write_binary: (String data) -> bool
+
+    # Bytes that already form complete frames.
+    def write_raw: (String frames) -> bool
+
+    # A close frame after what is queued (5 s to answer); the first close stands, on_close
+    # follows. False on a full queue; ArgumentError for a code no endpoint may send.
+    def close: (?Integer code) -> bool
+
+    # Drop the connection now; on_close follows.
+    def abort: () -> bool
+
+    # Data frames queued and not yet written; 0 once the socket is gone.
+    def pending: () -> Integer
+
+    # Receive `topic`'s publishes as `prefix + body + suffix` frames; a full queue drops the
+    # socket (:close) or skips the message (:skip). False once gone.
+    def subscribe: (String topic, ?prefix: String, ?suffix: String, ?when_full: :close | :skip) -> bool
+
+    # End every subscription to `topic`, or those made with `prefix`; false if none.
+    def unsubscribe: (String topic, ?prefix: String?) -> bool
+
+    # Queue `body` for `topic`'s subscribers from any Ractor, as text (UTF-8) or binary; false
+    # only when the fan-out queue is full.
+    def self.publish: (String topic, String body, ?binary: boolish) -> bool
+  end
+
+  # The worker's wake hook: work on the worker's own thread between requests. Needs lanes.
+  class Worker
+    # Register (or replace) this worker thread's hook; ArgumentError off a worker thread.
+    def self.on_wake: () { () -> void } -> Waker
+
+    # Wakes one worker, from any thread or Ractor (frozen, shareable).
+    class Waker
+      # The hook runs soon; wakes before it coalesce. False once the worker has exited or is
+      # retiring, or without lanes.
+      def wake: () -> bool
     end
   end
 

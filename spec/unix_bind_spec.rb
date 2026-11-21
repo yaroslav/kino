@@ -15,7 +15,7 @@ RSpec.describe "unix socket bind" do
     end
   end
 
-  def get(path, target)
+  def unix_get(path, target)
     UNIXSocket.open(path) do |sock|
       sock.write("GET #{target} HTTP/1.1\r\nHost: kino\r\nConnection: close\r\n\r\n")
       sock.read
@@ -27,7 +27,7 @@ RSpec.describe "unix socket bind" do
       expect(port).to eq(0)
       expect(File.socket?(@path)).to be(true)
 
-      response = get(@path, "/hello")
+      response = unix_get(@path, "/hello")
 
       expect(response).to start_with("HTTP/1.1 200")
       expect(response).to end_with("hi 127.0.0.1 /hello")
@@ -46,7 +46,7 @@ RSpec.describe "unix socket bind" do
     expect(File.exist?(@path)).to be(true)
 
     with_server(app, bind: "unix://#{@path}") do
-      expect(get(@path, "/")).to start_with("HTTP/1.1 200")
+      expect(unix_get(@path, "/")).to start_with("HTTP/1.1 200")
     end
   end
 
@@ -62,7 +62,7 @@ RSpec.describe "unix socket bind" do
 
   it "rejects TLS on a unix socket" do
     expect {
-      Kino::Server.new(app, bind: "unix://#{@path}", tls: {cert: TlsFixture.cert_pem, key: TlsFixture.key_pem})
+      Kino::Server.new(app, bind: "unix://#{@path}", **TlsFixture.options)
     }.to raise_error(ArgumentError, /unix/)
   end
 
