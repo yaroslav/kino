@@ -9,18 +9,21 @@ module NativeStreams
     capture_native($stderr, &block)
   end
 
-  def capture_native_stdout(&block)
-    capture_native($stdout, &block)
+  # With `awaiting`, returns once the stream holds a match for it: the
+  # access log is written by a thread of its own, after the response.
+  def capture_native_stdout(awaiting: nil, &block)
+    capture_native($stdout, awaiting, &block)
   end
 
   private
 
-  def capture_native(stream)
+  def capture_native(stream, awaiting = nil)
     original = stream.dup
     Tempfile.create("kino-stream") do |captured|
       stream.reopen(captured)
       yield
       stream.flush
+      wait_for("#{awaiting.inspect} in the captured stream") { File.read(captured.path).match?(awaiting) } if awaiting
       captured.rewind
       captured.read
     ensure

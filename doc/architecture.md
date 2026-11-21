@@ -48,28 +48,84 @@ Puma-style two-level: `workers × threads`.
   [benchmarks](benchmarks.md#lane-dispatch-experimental-lanes-true)).
   Native WebSockets need it: a lane also carries the bell that wakes its
   worker for its sockets' events (see [WebSockets](#websockets)).
+- `worker_loop` hands each worker thread to the app's own fiber
+  scheduler, which runs many requests at once there through Kino's
+  nonblocking takes (see [Worker loops](#worker-loops)). It runs on
+  lanes and turns them on.
 
 ## Lane dispatch
 
 With `lanes true` each worker slot has a lane of at most 4 requests,
-and the tokio side picks one for each request:
+or for a `worker_loop` worker as many as it has room for (its
+`concurrency` less the requests it has open) when that is more, and
+the tokio side picks one for each request:
 
 1. An awake lane with room (its worker is not parked), round-robin, so
-   a hot worker keeps taking without paying a futex wake. A worker
-   100 µs or more into its current item (a request, a socket event, a
-   wake hook) is passed over while a sibling sits idle: fast handlers
+   a hot worker keeps taking without paying a futex wake; this step
+   fills a lane only to 4 requests, however deep it is. While a sibling
+   sits idle, a classic worker 100 µs or more into its current item (a
+   request, a socket event, a wake hook) is passed over: fast handlers
    keep their hot lane, and past that, waking the sibling (tens of
-   microseconds) beats waiting out the rest.
-2. Else the idle worker that parked last, whose caches are still warm.
-   Only an empty lane qualifies, so a burst into an idle server spreads
-   instead of queueing behind one worker.
-3. Else any lane with room. With every lane full the dispatcher retries
-   until `queue_timeout`, then answers 503.
+   microseconds) beats waiting out the rest. A `worker_loop` worker is
+   passed over while it holds a request at all: one it has not answered
+   yet (or a socket event, a wake hook), or one waiting in its lane.
+   What it runs after its answer, and its fibers that only wait, do not
+   count, so one client's requests in turn keep their hot lane. This
+   spreads a few clients over the workers instead of stacking them on
+   one, a trade: with four clients a page endpoint served about a fifth
+   more requests with a median about 15% lower, for a 99th percentile
+   about 40% higher and about a third more CPU per request (more
+   workers awake); at one client and at sixteen nothing moved.
+2. Else the idle worker with the fewest requests open, and of those the
+   one that parked last, whose caches are still warm. A classic worker
+   idles with none open; a `worker_loop` worker idles while its fibers
+   wait, so requests that wait spread over the workers instead of
+   piling onto the one that parked last. Only an empty lane qualifies,
+   so a burst into an idle server spreads instead of queueing behind
+   one worker.
+3. Else any lane with room, round-robin. A `worker_loop` lane fills
+   past 4 only here.
+
+A `worker_loop` worker takes a request whenever its thread comes back
+to its loop with a job slot free, so its lane may hold as many as it
+has room for: a lane of 4 turned requests away from a worker with room
+for them while its thread ran a job. A lane deeper than the room left
+would hold requests its worker cannot start yet, behind long polls or
+slow clients, while a sibling could. Dispatch reads the worker's loop,
+not its fibers: a job the app leaves queued starts only once the loop
+has parked the worker, which then reads idle and is sent requests that
+wait behind those jobs. In a chat app on 8 workers, requests then
+waited 2.0 ms in the scheduler before they started, against 0.02-0.03
+ms when each job started at once.
+
+With every lane full, on a `worker_loop` server, a request waits its
+turn for room behind those that came before it, and gets a 503 if none
+comes within `queue_timeout`. Only the first in line dispatches: a
+worker that takes a request from a lane, parks, or drops below its
+`concurrency` tells it to look again, and once it has gone in, the next
+in line looks; a lane that gains room any other way (it deepens as its
+worker answers below its `concurrency`) is seen at the next look, 50 ms
+later at most. A newcomer lines up behind those waiting, so requests
+that waited go in the order they came. While nobody waits, the signal
+costs a worker's take one load. `queued` in the stats counts the
+requests in line too. Without a `worker_loop` a request retries every
+500 µs instead, in whatever order the retries fall; requests retrying
+do not count in `queued`. Measured against that retry on a
+`worker_loop` server with every lane full, the line served the same
+throughput with a 99th percentile 3 to 10 times lower and, with
+hundreds waiting, less CPU; at 64 clients its median was higher.
 
 Retired slots, and a crashed worker's slot until it is recycled, take
 nothing. Workers steal from a sibling's lane before they park and on
-every 50 ms tick while parked. A WebSocket handshake tries the workers
-that own the fewest open sockets first, in the same order.
+every 50 ms tick while parked, so a request that reached a worker just
+before its item turned slow waits for a sibling that runs out of work
+of its own, at most until the next steal of an idle one. A worker that
+a tick woke leaves a lane whose own worker idles on it, as the send
+woke that one: taking its request would move one client's requests in
+turn to a cold worker. (A `worker_loop` worker whose doorbell wait is a
+tick overdue is away on a job, and its lane is not left to it.) A
+WebSocket handshake tries the workers that own the fewest open sockets
+first, in the same order.
 
 In `:threaded` mode every worker shares one GVL, so passing a CPU-bound
 request to an idle thread spreads the wait rather than shortening it:
@@ -86,11 +142,28 @@ and the 99th percentile falls from 56 to 3 ms.
   (`Kino::Native::Request`, a TypedData object) is created *inside* the
   worker ractor by the take calls (`take_one`/`take_batch`), so its
   ownership is correct by construction.
-- **Blocking discipline:** every blocking native call goes through
-  `rb_thread_call_without_gvl` (rb-sys; magnus doesn't wrap it) so a
-  blocked worker holds no VM lock. Waits poll an atomic interrupt flag
-  between bounded `recv_timeout` ticks; the unblock function (UBF) just
-  sets the flag. `flume::Selector` lost wakeups under sustained load
+- **Blocking discipline:** every blocking native call releases the GVL
+  through `rb_thread_call_without_gvl` or its `_gvl2` variant (rb-sys;
+  magnus doesn't wrap them) so a blocked worker holds no VM lock. Waits
+  poll an atomic interrupt flag between bounded `recv_timeout` ticks;
+  the unblock function (UBF) just sets the flag. A worker waiting for
+  its next request, and a request waiting on its client (a body read, a
+  streamed write), tell the shutdown, which raises the slot's halted
+  flag, from the VM's own unblocking (`Thread#wakeup`, `#run`, `#raise`,
+  `#kill`), which raises a flag of the wait's own:
+  then the wait runs its thread's pending interrupts in a protected call
+  and waits again, or raises what they raised, so no jump crosses Rust
+  frames and every borrow of the request is released on the way out. A
+  request a worker's wait took as the unblock function fired goes back
+  (to the shared queue, or the worker's lane) before those interrupts
+  run, so a raise cannot beat it to Ruby and lose it; one with no room
+  to go back is held while they run, and a raise answers it with a 500
+  at once. A WebSocket event goes to the worker as taken, and a raise
+  fires at Ruby's first interrupt check, before the event's callback,
+  so that event is lost (a message keeps its inbound credit, a shutdown
+  or close event never runs its callback); the socket's later events
+  keep their order.
+  `flume::Selector` lost wakeups under sustained load
   (workers went permanently deaf to a non-empty queue after ~100k
   requests) and is not used anywhere.
 - **Fast path:** when a request is already queued, `take_one` takes it
@@ -112,6 +185,78 @@ and the 99th percentile falls from 56 to 3 ms.
   iterated on the Rust side (`RHash#foreach`); header bytes are borrowed
   in place from rooted Ruby strings (safe: GVL held, hyper copies
   immediately). Single-chunk bodies skip the join copy.
+
+## Worker loops
+
+What an app sees is in [worker-loop.md](worker-loop.md); this is how
+it works inside.
+
+A `worker_loop` worker's `serve` is Kino's loop written for the app's
+fiber scheduler. It never blocks in native code: its takes do not wait,
+and with nothing to take it waits on the worker's readiness descriptor,
+which the scheduler turns into a fiber wait. A request's job runs the
+classic loop's own code (the env, the app call, the response path,
+upgrades, hijacks, hooks); jobs end in any order, so the fused
+respond-and-take is not used. Apps without a `worker_loop` keep the
+classic loop as it was.
+
+**Readiness doorbell.** Each slot of a `worker_loop` server has a
+doorbell: a nonblocking Unix socket pair and an armed flag. A take that
+finds nothing arms it and looks once more, so a send that raced the arm
+is taken now. Every lane send, the lane's close, and a socket event or
+wake for a worker too full to read its lane ring it: a ring loads the
+flag and, only if it is armed, swaps it off and writes one byte. A busy
+worker never arms, so a send to it costs no syscall; an idle one costs
+one write per wake-up, as a futex wake does in the classic loop. The
+wait has no timeout, so the scheduler keeps no timer for it: one ticker
+thread per server rings every armed doorbell each 50 ms, and the take
+that answers is the lane tick a parked classic worker gets (a retired
+worker's exit, a deferred wake, a steal).
+
+**Takes.** The loop takes what it has room for: anything, in the
+classic take's order; with every job slot busy, only socket events and
+wakes (a full worker does not park, so dispatch does not read it as
+idle); with its backlog of 64 taken events full, only requests, so the
+inbox fills and pushes back on the sockets' readers. With room for one
+kind only and none of it ready, the loop waits on its doorbell, which a
+job that frees a slot or a backlog that drains also rings.
+
+**Open requests.** A take with room prunes the slot's list of open
+requests instead of resetting it, and answering a request prunes it
+too, so dispatch sees the worker's load at once. A slot at its
+`concurrency` is the exception: only its next take with room lowers the
+count, as that take is what tells the request first in line for lane
+room.
+
+**Jobs.** Socket events and wakes queue in Ruby, per socket and for the
+wake hook: the first event of a queue starts a job that drains it in
+order, and a socket's `on_open` holds its queue on the handshake's job.
+At most one wake run waits beside the running one. Jobs report their
+end through a queue the scheduler waits on: a request's job frees its
+slot, and a socket's or the wake job that ended with events left fails
+`serve`.
+
+**Heartbeat.** Each time the thread comes back to its loop, the slot is
+stamped with the time; going to wait on the doorbell stamps it one tick
+ahead, as that wait is time in the loop until it is overdue. A worker
+is busy while it has a request open or something waits for it, and its
+`busy_ms` is the stamp's age. Whether the thread holds something right
+now, which dispatch's pass-over reads, is a flag of its own: raised by
+a take that hands it something, lowered as it answers that request or
+comes back to its loop.
+
+**Per-request bells.** Under any fiber scheduler, `rack.input` reads
+and streamed writes take steps that never block: each returns its
+result, or a descriptor to wait on. A request has two bells of the
+doorbell's kind, opened by their first wait: one for the next body
+chunk or the body's end, one for room in the response stream or its
+end. A step arms its bell and looks once more before it hands out the
+descriptor. The body forwarder rings the first after each chunk and
+when it stops, and the response body rings the second each time hyper
+takes a frame or drops it, so a read and a write of one request can
+wait at once. The bells close when the job ends, or once the last wait
+on them is back. Past the shutdown deadline a step that would wait
+fails as interrupted, and what already waits is rung.
 
 ## Backpressure, in both directions
 

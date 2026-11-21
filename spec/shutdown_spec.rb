@@ -59,17 +59,21 @@ RSpec.describe "graceful shutdown" do
   end
 
   # Server.run on `app` (Ruby source for a shareable Rack app) in a child
-  # process, yielded once its signal traps are in (on_ready runs after
-  # them) and always reaped. As the child begins to exit, it prints which
-  # of the files a finished shutdown removes are still there.
-  def launch(mode, app = "Ractor.shareable_proc { |_env| [200, {}, []] }", **extra)
+  # process, with `worker_loop` a server whose workers run each request as
+  # an Async task, yielded once its signal traps are in (on_ready runs
+  # after them) and always reaped. As the child begins to exit, it prints
+  # which of the files a finished shutdown removes are still there.
+  def launch(mode, app = "Ractor.shareable_proc { |_env| [200, {}, []] }", worker_loop: false, **extra)
     Dir.mktmpdir do |dir|
+      serve = "Ractor.shareable_proc { |worker| " \
+        "Sync { |task| worker.serve(concurrency: 8) { |job| task.async { job.call } } } }"
       script = <<~RUBY
         Warning[:experimental] = false
         require "kino"
+        #{'require "async"' if worker_loop}
         at_exit { puts "left at exit: \#{%w[kino.pid kino.sock control.sock].select { |f| File.exist?(f) }.join(" ")}." }
         Kino::Server.run(#{app}, credits: false, on_ready: -> { puts "spec: ready" },
-          **#{settings(dir, mode, workers: 2, **extra).inspect})
+          #{"worker_loop: #{serve}," if worker_loop} **#{settings(dir, mode, workers: 2, **extra).inspect})
       RUBY
       pid = spawn(Gem.ruby, "-I", File.expand_path("../lib", __dir__), "-e", script,
         chdir: dir, out: "#{dir}/out.log", err: [:child, :out])
@@ -203,13 +207,18 @@ RSpec.describe "graceful shutdown" do
     # A signal's shutdown runs on a thread of its own, beside the main
     # thread blocked in Server.run, so these boot a real process.
     describe "on a signal" do
-      it "exits 0 only once the whole shutdown is done" do
-        launch(mode) do |pid, dir|
-          expect(Dir.children(dir)).to include("kino.pid", "kino.sock", "control.sock")
-          Process.kill("TERM", pid)
+      {"" => false, " under a worker_loop" => true}.each do |name, worker_loop|
+        it "exits 0 only once the whole shutdown is done#{name}" do
+          launch(mode, worker_loop:) do |pid, dir|
+            expect(Dir.children(dir)).to include("kino.pid", "kino.sock", "control.sock")
+            client = request_in_background(dir)
+            answer = client.join(5) && client.value
+            expect(answer).to start_with("HTTP/1.1 200"), "wanted a 200 within 5 s, got #{answer.inspect}\n#{output(dir)}"
+            Process.kill("TERM", pid)
 
-          expect(exit_status(pid)&.exitstatus).to eq(0), output(dir)
-          expect(left_at_exit(dir)).to eq(""), "the process began to exit before its shutdown was done:\n#{output(dir)}"
+            expect(exit_status(pid)&.exitstatus).to eq(0), output(dir)
+            expect(left_at_exit(dir)).to eq(""), "the process began to exit before its shutdown was done:\n#{output(dir)}"
+          end
         end
       end
 

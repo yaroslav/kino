@@ -20,8 +20,10 @@ mod tests;
 mod worker;
 
 #[cfg(test)]
-pub(crate) use take::{Take, Taker};
-pub use worker::{respond_and_take, respond_and_take_one, wake_worker, worker, Worker};
+pub(crate) use take::{Room, Take, Taker};
+pub use worker::{
+    lingering_loops, respond_and_take, respond_and_take_one, wake_worker, worker, Worker,
+};
 
 pub const TICK: Duration = Duration::from_millis(50);
 
@@ -31,6 +33,6 @@ pub enum Item {
     Wake,
 }
 
-/// None = shutdown (queue closed or interrupted); the caller can't tell
+/// None = shutdown (queue closed, or slot halted past the deadline); the caller can't tell
 /// the difference and doesn't need to.
 pub(crate) type Taken = Option<Item>;

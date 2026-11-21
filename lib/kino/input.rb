@@ -58,7 +58,7 @@ module Kino
     def pull
       return if @eof
 
-      chunk = @request.read_body(CHUNK_SIZE)
+      chunk = @request.read_some(CHUNK_SIZE)
       chunk ? @buffer << chunk : @eof = true
     end
 

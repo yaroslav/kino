@@ -147,8 +147,10 @@ RSpec.describe "native WebSockets" do
     expect(log).to include("lanes true")
   end
 
+  # Budgets, inbound credit and flow control hold the same under a
+  # worker_loop, whose socket callbacks run as fibers.
   each_mode do |mode|
-    it "holds 256 frames for a client however small they are, and 4 MiB however few" do
+    it_in_both_loops "holds 256 frames for a client however small they are, and 4 MiB however few" do
       reported = reports.port
       app = Ractor.shareable_proc do |env|
         if env["rack.upgrade?"] == :websocket
@@ -170,7 +172,7 @@ RSpec.describe "native WebSockets" do
       end
     end
 
-    it "lets a handler leave out callbacks, and gives back the credit of messages it has no on_message for" do
+    it_in_both_loops "lets a handler leave out callbacks, and gives back the credit of messages it has no on_message for" do
       log = capture_native_stderr do
         with_ws_server(ws_app(CloseOnlySocket.new(port: reports.port)), mode:) do |port|
           client = connect(port)
@@ -187,7 +189,7 @@ RSpec.describe "native WebSockets" do
       expect(log).to be_empty
     end
 
-    it "counts frames not yet written in ws.pending, and runs on_drained once a refused write's queue empties, " \
+    it_in_both_loops "counts frames not yet written in ws.pending, and runs on_drained once a refused write's queue empties, " \
       "and only then" do
       with_ws_server(ws_app(DrainingSocket.new(port: reports.port)), mode:) do |port|
         client = connect(port)
@@ -207,7 +209,9 @@ RSpec.describe "native WebSockets" do
         expect(reports.next(awaiting: "on_drained")).to eq([:drained, 0])
       end
     end
+  end
 
+  each_mode do |mode|
     it "gives each socket its own handler object, with mutable state" do
       app = Ractor.shareable_proc do |env|
         env["rack.upgrade"] = CountingSocket.new if env["rack.upgrade?"] == :websocket

@@ -4,6 +4,7 @@
 //! thread or task does.
 
 use std::fmt::Display;
+use std::sync::atomic::AtomicBool;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -13,6 +14,8 @@ use hyper::client::conn::http1::SendRequest;
 use hyper_util::rt::TokioIo;
 use tokio::io::{AsyncRead, AsyncReadExt};
 
+use crate::doorbell::Doorbell;
+use crate::gvl::Parker;
 use crate::registry::{BoxedCtx, ServerInner};
 use crate::server::{ServerConfig, Topology};
 use crate::slot::{WorkerSlot, WS_INBOX};
@@ -94,10 +97,42 @@ pub fn slot(server: &ServerInner, index: usize) -> Arc<WorkerSlot> {
     server.slots.read()[index].clone()
 }
 
-/// The dispatcher's part: a request lands in `slot`'s lane.
+/// The dispatcher's part: a request lands in `slot`'s lane, ringing
+/// its doorbell if a worker_loop worker armed it.
 pub fn assign(slot: &WorkerSlot) {
     let request = crate::registry::LaneItem::Request(crate::request::test_ctx());
     assert!(slot.send_lane(request).is_ok(), "lane open, with room");
+}
+
+/// The Parker of tests, which have no VM: a worker's wait runs through
+/// `release`, handed the flag the VM's unblock function raises and the
+/// wait, which it runs or not, and `interrupts` stands for the VM's
+/// pending interrupts.
+pub struct InPlace<R, I> {
+    pub release: R,
+    pub interrupts: I,
+}
+
+impl<R, I> Parker for InPlace<R, I>
+where
+    R: FnMut(&AtomicBool, &mut dyn FnMut()),
+    I: FnMut() -> Result<(), &'static str>,
+{
+    type Error = &'static str;
+
+    fn release<T>(
+        &mut self,
+        woken: &AtomicBool,
+        f: impl FnOnce() -> T,
+    ) -> Result<Option<T>, Self::Error> {
+        let (mut f, mut ran) = (Some(f), None);
+        (self.release)(woken, &mut || ran = f.take().map(|f| f()));
+        Ok(ran)
+    }
+
+    fn check_ints(&mut self) -> Result<(), Self::Error> {
+        (self.interrupts)()
+    }
 }
 
 /// A ServerInner with no runtime of its own: lane dispatch or the shared
@@ -118,6 +153,11 @@ impl TestServer {
     /// Requests wait in the shared queue.
     pub fn shared_queue() -> Self {
         Self::new(false)
+    }
+
+    /// Lanes, each worker running its own loop: its slot has a doorbell.
+    pub fn worker_loop() -> Self {
+        Self::new(true).with(|c| c.worker_loop = true)
     }
 
     fn new(lanes: bool) -> Self {
@@ -165,10 +205,11 @@ impl TestServer {
     }
 
     pub fn build(self) -> Arc<ServerInner> {
-        let lanes = self.config.lanes;
+        let (lanes, worker_loop) = (self.config.lanes, self.config.worker_loop);
         let server = Arc::new(ServerInner::new(self.config));
         for _ in 0..self.workers {
-            let slot = WorkerSlot::new(lanes, self.inbox);
+            let doorbell = worker_loop.then(|| Doorbell::new().expect("a doorbell"));
+            let slot = WorkerSlot::new(lanes, self.inbox, doorbell);
             server.slots.write().push(Arc::new(slot));
         }
         server

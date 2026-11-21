@@ -128,7 +128,7 @@ module Kino
       def max_connections: (int count) -> untyped
       def max_body_size: (int? bytes) -> untyped
       def batch: (int count) -> untyped
-      # Per-worker lanes (default false); native WebSockets and wake
+      # Per-worker lanes (default: on with a worker_loop, else off); native WebSockets and wake
       # hooks need them.
       def lanes: (boolish enabled) -> untyped
       # Largest message a client may send (default 1 MiB); past it, 1009.
@@ -143,6 +143,7 @@ module Kino
       def after_worker_boot: (?^(Integer) -> void handler) ?{ (Integer) -> void } -> untyped
       def after_request_complete: (?^(Hash[String, untyped], Integer) -> void handler) ?{ (Hash[String, untyped], Integer) -> void } -> untyped
       def on_worker_exit: (?^(Integer, Exception?) -> void handler) ?{ (Integer, Exception?) -> void } -> untyped
+      def worker_loop: (?^(Worker::Loop) -> void handler) ?{ (Worker::Loop) -> void } -> untyped
       def shutdown_timeout: (Numeric seconds) -> untyped
       def io_shards: (?boolish enabled) -> untyped
       def io_threads: (int count) -> untyped
@@ -204,7 +205,7 @@ module Kino
     def self.publish: (String topic, String body, ?binary: boolish) -> bool
   end
 
-  # The worker's wake hook: work on the worker's own thread between requests. Needs lanes.
+  # The worker's wake hook: work on the worker's own thread (::on_wake). Needs lanes.
   class Worker
     # Register (or replace) this worker thread's hook; ArgumentError off a worker thread.
     def self.on_wake: () { () -> void } -> Waker
@@ -214,6 +215,14 @@ module Kino
       # The hook runs soon; wakes before it coalesce. False once the worker has exited or is
       # retiring, or without lanes.
       def wake: () -> bool
+    end
+
+    # What a worker_loop gets: Kino's loop, for the app's fiber scheduler to run.
+    class Loop
+      # Serve the worker's requests as jobs the block starts, at most `concurrency` at a time;
+      # each socket's events, and the wakes, run in order on jobs of their own. Returns once the
+      # worker is drained.
+      def serve: (concurrency: Integer) { (^() -> void job) -> void } -> nil
     end
   end
 

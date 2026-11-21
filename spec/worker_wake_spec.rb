@@ -77,12 +77,6 @@ RSpec.describe "worker wake hook" do
     end
   end
 
-  def get(port, path)
-    Net::HTTP.start("127.0.0.1", port, read_timeout: WsClient::DEADLINE) { |http| http.get(path).body }
-  rescue Net::ReadTimeout
-    raise "GET #{path} got no answer within #{WsClient::DEADLINE}s"
-  end
-
   it "never runs the hook alongside a request" do
     with_wake_server do |port, (_, worker_thread, _)|
       get(port, "/slow")

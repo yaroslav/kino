@@ -7,11 +7,36 @@ module Kino
     # @private
     # The request handle is its own rack.hijack callable: calling it takes the connection over.
     class Request
-      def call = UNIXSocket.for_fd(hijack)
+      def call = UNIXSocket.for_fd(hijack).tap { Kino::Worker::Loop.switched(self) }
+
+      # Up to `max` bytes of the body, nil at its end; cooperative under a fiber scheduler.
+      def read_some(max) = Fiber.current_scheduler ? cooperatively { read_body_nonblock(max) } : read_body(max)
+
+      # All of `chunk`, onto the response stream, the way read_some waits.
+      def write_all(chunk) = Fiber.current_scheduler ? cooperatively { write_chunk_nonblock(chunk) } : write_chunk(chunk)
+
+      private
+
+      # Every request's fiber shares the thread: never block it. While the client is slower than
+      # the app, wait until the native side rings the descriptor it handed out.
+      def cooperatively
+        while (step = yield).is_a?(Integer)
+          wait_until_rung(step)
+        end
+        step
+      end
+
+      # The request's descriptor, open until #waited: this IO must never close it, and is made
+      # afresh each wait, as the number may change.
+      def wait_until_rung(fd)
+        IO.for_fd(fd, autoclose: false).wait_readable
+      ensure
+        waited
+      end
     end
   end
 
-  # A worker's wake hook: work on the worker's own thread between requests (::on_wake). Needs lanes.
+  # A worker's wake hook: work on the worker's own thread (::on_wake). Needs lanes.
   # An instance is one worker thread's request loop (private API).
   class Worker
     RACK_INPUT = "rack.input"
@@ -19,17 +44,19 @@ module Kino
     RACK_HIJACK_OFFERED = "rack.hijack?"
     RACK_HIJACK = "rack.hijack"
     KINO_REQUEST = "kino.request"
-    # Thread variables, so fibers on the thread see them: the native handle and the wake hook.
+    # Thread variables, so fibers on the thread see them: the native handle, the wake hook, the Loop.
     HANDLE = :kino_worker
     HOOK = :kino_wake_hook
+    CUSTOM_LOOP = :kino_worker_loop
     WAKE = :wake
     WAKE_ENV = Ractor.make_shareable({"kino.callback" => "on_wake"})
     # What a worker without hooks runs with.
     NO_HOOKS = Ractor.make_shareable(
-      WorkerHooks.new(on_error: nil, after_worker_boot: nil, after_request_complete: nil, access_timing: false)
+      WorkerHooks.new(on_error: nil, after_worker_boot: nil, after_request_complete: nil, worker_loop: nil,
+        access_timing: false)
     )
     private_constant :RACK_INPUT, :RACK_UPGRADE, :RACK_HIJACK_OFFERED, :RACK_HIJACK, :KINO_REQUEST, :HANDLE, :HOOK,
-      :WAKE, :WAKE_ENV, :NO_HOOKS
+      :CUSTOM_LOOP, :WAKE, :WAKE_ENV, :NO_HOOKS
 
     # Wakes one worker's hook, from any thread or Ractor (frozen, shareable); returns at once.
     class Waker
@@ -48,6 +75,7 @@ module Kino
     # Run `block` on this worker's thread, between requests and socket events, whenever the
     # returned Waker is used; wakes coalesce, a self-waking hook alternates with waiting requests,
     # and calling again replaces the hook. A raising hook goes to on_error, as on_wake's callback.
+    # Under a worker_loop it runs as a job of its own, alongside requests, one run at a time.
     # @raise [ArgumentError] off a worker thread, or without a block
     # @return [Waker] wakes this worker
     def self.on_wake(&block)
@@ -86,7 +114,13 @@ module Kino
       Thread.current.thread_variable_set(HANDLE, @worker)
       HookFire.fire(@hooks.after_worker_boot, "after_worker_boot", @worker_id)
       return unless @worker
-      if @batch_size <= 1
+      if (custom = @hooks.worker_loop)
+        served = Loop.new(self, @worker)
+        Thread.current.thread_variable_set(CUSTOM_LOOP, served)
+        custom.call(served)
+        # Its lane would stay open to dispatch with no one taking.
+        raise Error, "worker_loop returned before its worker was drained" unless served.drained?
+      elsif @batch_size <= 1
         env = @worker.take_one
         env = handle_one(env) while env
       else
@@ -102,6 +136,7 @@ module Kino
       @worker&.release
       Thread.current.thread_variable_set(HANDLE, nil)
       Thread.current.thread_variable_set(HOOK, nil)
+      Thread.current.thread_variable_set(CUSTOM_LOOP, nil)
     end
 
     # serve() returns this when the response did NOT ride a fused
@@ -238,7 +273,7 @@ module Kino
       if id
         # The 101 goes out only after on_open, so what it writes and subscribes is in place;
         # if on_open raised, the client gets a 500 before on_error hears of it.
-        if (failure = WebSocket::Events.open(id, handler))
+        if (failure = Loop.opening(id) { WebSocket::Events.open(id, handler) })
           request.abort
           WebSocket::Events.report(failure, id, "on_open", @hooks.on_error)
         elsif request.switch_protocols
@@ -276,6 +311,7 @@ module Kino
     # the switched connection as a socket. Kino closes it once a streaming body returns.
     def switch_hijacked(request, headers, callable, body, env)
       io = UNIXSocket.for_fd(request.hijack_switched(headers.except(RACK_HIJACK)))
+      Loop.switched(request)
       begin
         callable.call(io)
       rescue
@@ -323,7 +359,7 @@ module Kino
         # connection (serve's rescue), not fake a clean end of stream that
         # the client cannot tell from a complete response.
         closing(body) do
-          body.each { |chunk| request.write_chunk(chunk) }
+          body.each { |chunk| request.write_all(chunk) }
           request.finish
         end
       end
@@ -345,5 +381,9 @@ module Kino
     def after_request_complete(env, status)
       HookFire.fire(@hooks.after_request_complete, "after_request_complete", env, status)
     end
+
+    # @private
+    # A worker_loop's jobs run these (Worker::Loop).
+    public :serve, :dispatch
   end
 end

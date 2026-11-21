@@ -67,6 +67,12 @@ pub fn server_start(ruby: &Ruby, config: magnus::RHash) -> Result<(u64, u16, Opt
         .transpose()?;
 
     let server = Arc::new(ServerInner::new(config));
+    // Before the runtime, as a server that fails here has nothing running yet.
+    if server.config.worker_loop {
+        let ticker = crate::ticker::Ticker::start(&server)
+            .map_err(|e| io_error(ruby, "worker_loop ticker failed", e))?;
+        *server.ticker.lock() = Some(ticker);
+    }
     let runtime =
         start_runtime(&server, listener, acceptor).map_err(|(what, e)| io_error(ruby, what, e))?;
     *server.runtime.lock() = runtime;

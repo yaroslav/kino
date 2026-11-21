@@ -9,9 +9,10 @@ RSpec.describe "rack.hijack" do
   include_context "native WebSocket server"
 
   # Hijack needs no lanes: two single-thread ractors without them, unless
-  # a spec says otherwise.
+  # a spec says otherwise or the example runs under a worker_loop, which
+  # needs them.
   def with_hijack_server(app = HijackedEcho, **opts, &block)
-    with_ws_server(app, lanes: false, **opts, &block)
+    with_ws_server(app, lanes: server_defaults.key?(:worker_loop), **opts, &block)
   end
 
   # Both worker modes, for the examples that run in each.
@@ -318,7 +319,7 @@ RSpec.describe "rack.hijack" do
   # A /poll is a long poll with no news: its worker thread keeps the
   # socket. Any other request is answered half a second later, while its
   # app is still on its worker.
-  it "a drain lets an app that hijacked and is still on its worker answer, and answers 503 to the rest " \
+  it_in_both_loops "a drain lets an app that hijacked and is still on its worker answer, and answers 503 to the rest " \
     "without waiting for them" do
     reported = reports.port
     app = Ractor.shareable_proc do |env|
@@ -328,7 +329,7 @@ RSpec.describe "rack.hijack" do
         worker = Thread.current
         (worker.thread_variable_get(:held) || worker.thread_variable_set(:held, [])) << io
       else
-        Kino.sleep(0.5)
+        sleep 0.5
         io.write("HTTP/1.1 200 OK\r\ncontent-length: 8\r\n\r\nanswered")
         io.close
       end
@@ -364,7 +365,7 @@ RSpec.describe "rack.hijack" do
     end
   end
 
-  it "a drain closes a connection that switched protocols once requests drain, ending an app serving it on its worker" do
+  it_in_both_loops "a drain closes a connection that switched protocols once requests drain, ending an app serving it on its worker" do
     reported = reports.port
     worker_modes.product(%i[full_hijack partial_hijack streaming_body]).each do |mode, kind|
       # Switches a WebSocket handshake to the app's own protocol, as `kind`,
@@ -405,7 +406,7 @@ RSpec.describe "rack.hijack" do
     end
   end
 
-  it "refuses rack.hijack, crashing nothing, while another of the app's threads waits on the request body" do
+  it_in_both_loops "refuses rack.hijack, crashing nothing, while another of the app's threads waits on the request body" do
     reported = reports.port
     app = Ractor.shareable_proc do |env|
       input = env["rack.input"]

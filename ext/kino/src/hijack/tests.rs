@@ -329,7 +329,7 @@ async fn once_requests_drain_switched_bridges_close_and_unanswered_ones_wait_for
 #[tokio::test]
 async fn a_hijack_counts_against_its_worker_and_server_until_its_bridge_ends() {
     let (server, _running) = hijack_server(|_| {}).await;
-    server.register_worker();
+    server.register_worker().expect("a worker slot");
     let pending = send(&server, upgrade_request()).await;
     let mut ctx = take_ctx(&server).await;
     ctx.slot = Some(slot(&server, 0));

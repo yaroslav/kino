@@ -1,8 +1,9 @@
-use std::sync::atomic::Ordering::Relaxed;
+use std::sync::atomic::Ordering::{self, Relaxed};
 use std::time::Duration;
 
 use super::*;
-use crate::queue::testing::tick;
+use crate::queue::testing::{admit_next, boot, nonblock, rung, take_admitted, tick};
+use crate::queue::Room;
 use crate::request::test_ctx;
 use crate::slot::LANE_DEPTH;
 use crate::testing::{assign, slot, TestServer, SERIAL};
@@ -177,7 +178,7 @@ fn a_request_goes_to_an_awake_worker_with_room_or_the_idle_one_that_parked_last(
 }
 
 #[test]
-fn a_request_no_lane_takes_comes_back_for_a_retry_unless_every_lane_closed() {
+fn a_request_no_lane_takes_comes_back_to_wait_for_lane_room_unless_every_lane_closed() {
     // A replacement may still take what a retired lane would not.
     let cases: [(&str, &[Was], bool); 5] = [
         ("no workers", &[], false),
@@ -202,4 +203,464 @@ fn a_parked_workers_tick_takes_a_request_stuck_behind_a_slow_sibling() {
 
     assert_eq!(tick(&server, &slot(&server, 1)), "request");
     assert_eq!(server.lane_depths(), Some(vec![0, 0]));
+}
+
+#[test]
+fn a_worker_loop_worker_is_passed_over_for_an_idle_sibling_only_while_it_holds_what_it_took() {
+    use crate::queue::Worker;
+    // Each leaves the worker as `busy` says, handing back a request
+    // it keeps open.
+    type Busy = fn(&ServerInner, &Arc<WorkerSlot>, &Worker) -> Option<BoxedCtx>;
+    fn took(server: &ServerInner, slot: &Arc<WorkerSlot>) -> BoxedCtx {
+        assign(slot);
+        admit_next(server, slot)
+    }
+    // One row per case; rustfmt would split each row field by field.
+    #[rustfmt::skip]
+    let cases: [(&str, Busy, [usize; 2]); 6] = [
+        ("a loop yet to take", |_, _, _| None, [1, 0]),
+        ("its loop back after answering, as at one client",
+            |server, slot, worker| { drop(took(server, slot)); Worker::woke(worker); None }, [1, 0]),
+        ("its loop back, a long poll's fiber waiting",
+            |server, slot, worker| { let poll = took(server, slot); Worker::woke(worker); Some(poll) }, [1, 0]),
+        ("its thread away with a request it just took", |server, slot, _| Some(took(server, slot)), [0, 1]),
+        ("its job past its answer, not back in its loop yet",
+            |server, slot, _| { let job = took(server, slot); slot.answered(&job.responder); Some(job) }, [1, 0]),
+        ("its thread away in its wake hook",
+            |server, slot, _| { assert!(slot.wake()); assert_eq!(nonblock(server, slot, Room::All), "wake"); None }, [0, 1]),
+    ];
+    for (busy, make, depths) in cases {
+        let server = TestServer::worker_loop().workers(2).build();
+        let (looping, worker) = boot(&server, 0);
+        let idle = slot(&server, 1);
+        assert_eq!(nonblock(&server, &idle, Room::All), "nothing");
+        let _open = make(&server, &looping, &worker);
+
+        assert_eq!(dispatch(&server, test_ctx()), "sent");
+        assert_eq!(
+            server.lane_depths(),
+            Some(depths.to_vec()),
+            "a worker_loop worker with {busy}, its sibling idle"
+        );
+    }
+}
+
+#[test]
+fn a_crashed_worker_loop_workers_slot_goes_to_its_replacement_doorbell_and_all() {
+    let server = TestServer::worker_loop().workers(1).build();
+    let open_fds = || std::fs::read_dir("/dev/fd").expect("/dev/fd").count();
+    let before = open_fds();
+
+    // Crash after crash, each replacement taking the slot over as the
+    // pools do; a dead worker's handle goes with its heap.
+    for _ in 0..200 {
+        let (slot, worker) = boot(&server, 0);
+        assert_eq!(nonblock(&server, &slot, Room::All), "nothing");
+        slot.abort(crate::response::Cut::Crash);
+        drop(worker);
+        assert!(slot.recycle().is_some(), "a quiet crashed slot is recycled");
+    }
+
+    let grew = open_fds().saturating_sub(before);
+    assert!(
+        grew < 100,
+        "200 crashed workers left {grew} more descriptors open: a crash loop would exhaust them"
+    );
+    let (slot, worker) = boot(&server, 0);
+    assert!(
+        !rung(&worker),
+        "a replacement must not wake for a ring its predecessor never answered"
+    );
+    assert_eq!(nonblock(&server, &slot, Room::All), "nothing");
+    assert_eq!(dispatch(&server, test_ctx()), "sent");
+    assert!(
+        rung(&worker),
+        "a recycled slot's doorbell must ring for the worker that took it over"
+    );
+}
+
+#[test]
+fn a_worker_loop_worker_at_capacity_gets_no_request_and_all_at_capacity_is_overload() {
+    let server = TestServer::worker_loop().workers(3).build();
+    let (full, colder, warmer) = (slot(&server, 0), slot(&server, 1), slot(&server, 2));
+    with_capacity(&server, 1);
+    // Awake, the full worker is the one an awake lane is looked for in.
+    assign(&full);
+    let mut open = vec![admit_next(&server, &full)];
+    for worker in [&colder, &warmer] {
+        assert_eq!(nonblock(&server, worker, Room::All), "nothing", "idle");
+    }
+    assert_eq!(dispatch(&server, test_ctx()), "sent");
+    assert_eq!(server.lane_depths(), Some(vec![0, 0, 1]), "awake");
+
+    // Parked too, and last: the hottest, but for its capacity. (Its loop
+    // would take events only; a full take would steal the sibling's request.)
+    full.park.park(&server);
+    assert_eq!(dispatch(&server, test_ctx()), "sent");
+    assert_eq!(server.lane_depths(), Some(vec![0, 1, 1]), "idle");
+
+    open.extend([admit_next(&server, &colder), admit_next(&server, &warmer)]);
+    assert_eq!(
+        dispatch(&server, test_ctx()),
+        "full",
+        "every worker at capacity is overload, waiting for room until queue_timeout, not a closed server"
+    );
+}
+
+#[test]
+fn idle_worker_loop_workers_take_requests_fewest_open_first_then_hottest_first() {
+    let server = TestServer::worker_loop().workers(3).build();
+    // Parked in slot order, so slot 2 parked last; slots 1 and 2 each
+    // hold a request that waits, slot 0 none.
+    let mut waiting = Vec::new();
+    for index in 0..3 {
+        let worker = slot(&server, index);
+        if index > 0 {
+            assign(&worker);
+            waiting.push(admit_next(&server, &worker));
+        }
+        assert_eq!(nonblock(&server, &worker, Room::All), "nothing", "parked");
+    }
+
+    let expected = [
+        (vec![1, 0, 0], "the worker with no request open"),
+        (
+            vec![1, 0, 1],
+            "of those with one open, the one that parked last",
+        ),
+        (vec![1, 1, 1], "the last idle worker"),
+    ];
+    for (depths, taker) in expected {
+        assert_eq!(dispatch(&server, test_ctx()), "sent");
+        assert_eq!(server.lane_depths(), Some(depths), "{taker} takes it");
+    }
+}
+
+/// Dispatches `count` requests, each of which must find a lane, and
+/// stays in flight, as handle_request counts it.
+fn dispatch_all(server: &ServerInner, count: usize) {
+    for _ in 0..count {
+        server.counters.in_flight.fetch_add(1, Ordering::Relaxed);
+        assert_eq!(dispatch(server, test_ctx()), "sent");
+    }
+}
+
+/// Sets the capacity of each of `server`'s worker_loop workers.
+fn with_capacity(server: &ServerInner, capacity: usize) {
+    for slot in server.slots.read().iter() {
+        slot.load.capacity.store(capacity, Ordering::Relaxed);
+    }
+}
+
+#[test]
+fn a_worker_loop_lane_holds_as_many_requests_as_its_worker_has_room_for() {
+    // Before its serve sets a capacity, and with less room than a
+    // classic lane's depth, a lane holds as many as a classic one.
+    let cases = [
+        (0, 0, LANE_DEPTH),
+        (2, 0, LANE_DEPTH),
+        (16, 0, 16),
+        (16, 6, 10),
+        (16, 14, LANE_DEPTH),
+    ];
+    for (capacity, open, depth) in cases {
+        let server = TestServer::worker_loop().workers(1).build();
+        with_capacity(&server, capacity);
+        slot(&server, 0)
+            .load
+            .in_flight
+            .store(open, Ordering::Relaxed);
+
+        dispatch_all(&server, depth);
+        assert_eq!(server.lane_depths(), Some(vec![depth]));
+        assert_eq!(
+            dispatch(&server, test_ctx()),
+            "full",
+            "the lane of a worker with capacity {capacity}, {open} open, holds {depth} requests"
+        );
+    }
+}
+
+#[test]
+fn a_hot_worker_loop_lane_takes_one_while_a_sibling_idles_and_fills_as_far_as_a_classic_one_once_none_does(
+) {
+    let server = TestServer::worker_loop().workers(2).build();
+    with_capacity(&server, 16);
+    assert_eq!(
+        nonblock(&server, &slot(&server, 1), Room::All),
+        "nothing",
+        "idle"
+    );
+
+    let expected = [
+        (1, vec![1, 0], "the awake worker keeps its hot lane"),
+        (
+            1,
+            vec![1, 1],
+            "the idle worker takes the next, rather than it waiting behind the first",
+        ),
+        (
+            LANE_DEPTH - 1,
+            vec![LANE_DEPTH, 1],
+            "with no worker idle, the hot lane fills as far as a classic one",
+        ),
+    ];
+    for (count, depths, why) in expected {
+        dispatch_all(&server, count);
+        assert_eq!(server.lane_depths(), Some(depths), "{why}");
+    }
+}
+
+// --- Waiting for lane room. The test plays the worker on its own
+// task, on a paused clock: a waiting request runs only when the test
+// yields, and no timer fires meanwhile, so one that goes in went in
+// because a worker made room.
+
+/// A lanes server with one worker, a worker_loop one or a classic one,
+/// whose requests wait for lane room up to `queue_timeout_ms`: in line
+/// on a worker_loop server, retrying without one.
+fn one_worker_waiting(worker_loop: bool, queue_timeout_ms: u64) -> Arc<ServerInner> {
+    TestServer::lanes()
+        .workers(1)
+        .with(|c| {
+            c.worker_loop = worker_loop;
+            c.queue_timeout_ms = queue_timeout_ms;
+        })
+        .build()
+}
+
+/// A request for `/n`.
+fn numbered(n: usize) -> BoxedCtx {
+    let mut ctx = test_ctx();
+    ctx.uri = format!("/{n}").parse().expect("a path");
+    ctx
+}
+
+/// Lets the runtime's ready tasks run, a few rounds.
+async fn settle() {
+    for _ in 0..16 {
+        tokio::task::yield_now().await;
+    }
+}
+
+/// Fills the only lane of `server` with /0 to /3.
+async fn fill_the_lane(server: &Arc<ServerInner>) {
+    for n in 0..LANE_DEPTH {
+        assert!(enqueue(server, numbered(n)).await);
+    }
+}
+
+/// A dispatch of `/n`, once it lines up for lane room.
+async fn waiting_dispatch(server: &Arc<ServerInner>, n: usize) -> tokio::task::JoinHandle<bool> {
+    let before = server.lane_room.waiting();
+    let task = tokio::spawn({
+        let server = server.clone();
+        async move { enqueue(&server, numbered(n)).await }
+    });
+    settle().await;
+    assert_eq!(server.lane_room.waiting(), before + 1, "/{n} waits");
+    task
+}
+
+/// The path of the next request the worker takes, the way its kind of
+/// worker takes it.
+fn take_path(server: &Arc<ServerInner>) -> String {
+    let worker = slot(server, 0);
+    let ctx = match server.config.worker_loop {
+        true => admit_next(server, &worker),
+        false => take_admitted(server, &worker),
+    };
+    ctx.uri.path().to_string()
+}
+
+fn paths(numbers: impl IntoIterator<Item = usize>) -> Vec<String> {
+    numbers.into_iter().map(|n| format!("/{n}")).collect()
+}
+
+#[tokio::test(start_paused = true)]
+async fn requests_that_found_every_lane_full_go_in_as_room_appears_in_the_order_they_came() {
+    let server = one_worker_waiting(true, 60_000);
+    fill_the_lane(&server).await;
+    let mut waiting = Vec::new();
+    for n in LANE_DEPTH..LANE_DEPTH + 3 {
+        waiting.push(waiting_dispatch(&server, n).await);
+    }
+    assert_eq!(
+        server.queued(),
+        LANE_DEPTH + 3,
+        "those waiting for lane room count as queued"
+    );
+
+    // Each take lets the next in line in before the take after it.
+    let mut taken = Vec::new();
+    for _ in 0..LANE_DEPTH + 3 {
+        taken.push(take_path(&server));
+        settle().await;
+    }
+    assert_eq!(taken, paths(0..LANE_DEPTH + 3), "in the order they came");
+    for task in waiting {
+        assert!(task.await.expect("the dispatch task"));
+    }
+}
+
+#[tokio::test(start_paused = true)]
+async fn without_a_worker_loop_a_request_that_found_every_lane_full_looks_again_at_its_next_retry()
+{
+    let server = one_worker_waiting(false, 60_000);
+    fill_the_lane(&server).await;
+    let waiting = tokio::spawn({
+        let server = server.clone();
+        async move { enqueue(&server, numbered(LANE_DEPTH)).await }
+    });
+    settle().await;
+    assert_eq!(server.lane_room.waiting(), 0, "nobody lines up");
+    assert_eq!(server.queued(), LANE_DEPTH, "nor counts as queued");
+
+    assert_eq!(take_path(&server), "/0");
+    settle().await;
+    assert!(!waiting.is_finished(), "the room is not told of");
+    // The retry, LANE_RETRY on, which the runtime's timer rounds up
+    // to its next millisecond.
+    tokio::time::advance(Duration::from_millis(1)).await;
+    settle().await;
+
+    assert!(waiting.is_finished(), "the next retry finds the room");
+    assert!(waiting.await.expect("the dispatch task"));
+    let taken: Vec<String> = (0..LANE_DEPTH).map(|_| take_path(&server)).collect();
+    assert_eq!(taken, paths([1, 2, 3, LANE_DEPTH]));
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_newcomer_lines_up_behind_a_waiting_request_rather_than_take_the_room_it_was_told_of() {
+    let server = one_worker_waiting(true, 60_000);
+    fill_the_lane(&server).await;
+    let waiting = waiting_dispatch(&server, LANE_DEPTH).await;
+
+    assert_eq!(take_path(&server), "/0");
+    // Comes in before the waiting request had its look.
+    let newcomer = enqueue(&server, numbered(99));
+    assert!(
+        tokio::time::timeout(Duration::ZERO, newcomer)
+            .await
+            .is_err(),
+        "the newcomer must wait its turn"
+    );
+    settle().await;
+
+    assert!(waiting.is_finished(), "the waiting request goes in first");
+    assert!(waiting.await.expect("the dispatch task"));
+    let taken: Vec<String> = (0..LANE_DEPTH).map(|_| take_path(&server)).collect();
+    assert_eq!(taken, paths(1..=LANE_DEPTH));
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_full_worker_loop_worker_lets_a_waiting_request_in_once_a_job_ends() {
+    type Next = fn(&ServerInner, &Arc<WorkerSlot>);
+    let cases: [(&str, Next); 2] = [
+        ("parks", |server, worker| {
+            assert_eq!(
+                nonblock(server, worker, Room::All),
+                "nothing",
+                "nothing to take"
+            );
+        }),
+        ("takes its wake hook's turn", |server, worker| {
+            assert!(worker.wake());
+            assert_eq!(nonblock(server, worker, Room::All), "wake");
+        }),
+    ];
+    for (then, next) in cases {
+        let server = one_worker_waiting(true, 60_000);
+        let worker = slot(&server, 0);
+        worker.load.capacity.store(1, Ordering::Relaxed);
+        assign(&worker);
+        let job = admit_next(&server, &worker);
+        let waiting = waiting_dispatch(&server, 1).await;
+
+        drop(job); // answered, and its job ended
+        next(&server, &worker);
+        settle().await;
+
+        assert!(
+            waiting.is_finished(),
+            "the waiting request goes in once the worker's loop is back with room and {then}"
+        );
+        assert!(waiting.await.expect("the dispatch task"));
+        assert_eq!(server.lane_depths(), Some(vec![1]));
+    }
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_worker_joining_the_pool_lets_a_waiting_request_in_as_it_parks() {
+    let server = TestServer::worker_loop().workers(0).build();
+    let waiting = tokio::spawn({
+        let server = server.clone();
+        async move { enqueue(&server, numbered(1)).await }
+    });
+    settle().await;
+    assert_eq!(server.lane_room.waiting(), 1, "no worker yet");
+
+    server.register_worker().expect("a worker slot");
+    assert_eq!(nonblock(&server, &slot(&server, 0), Room::All), "nothing");
+    settle().await;
+
+    assert!(waiting.is_finished(), "the waiting request goes in");
+    assert!(waiting.await.expect("the dispatch task"));
+    assert_eq!(server.lane_depths(), Some(vec![1]));
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_waiting_request_whose_client_went_away_hands_its_turn_on() {
+    let server = one_worker_waiting(true, 60_000);
+    fill_the_lane(&server).await;
+    let gone = waiting_dispatch(&server, LANE_DEPTH).await;
+    let next = waiting_dispatch(&server, LANE_DEPTH + 1).await;
+
+    // Room is made and the first in line told, but its client goes away
+    // before it looks.
+    assert_eq!(take_path(&server), "/0");
+    gone.abort();
+    settle().await;
+
+    assert!(next.is_finished(), "the next in line goes in");
+    assert!(next.await.expect("the dispatch task"));
+    assert_eq!(server.lane_room.waiting(), 0);
+    let taken: Vec<String> = (0..LANE_DEPTH).map(|_| take_path(&server)).collect();
+    assert_eq!(taken, paths([1, 2, 3, LANE_DEPTH + 1]));
+}
+
+#[tokio::test(start_paused = true)]
+async fn closing_the_lanes_turns_every_waiting_request_away() {
+    let server = one_worker_waiting(true, 60_000);
+    fill_the_lane(&server).await;
+    let mut waiting = Vec::new();
+    for n in LANE_DEPTH..LANE_DEPTH + 3 {
+        waiting.push(waiting_dispatch(&server, n).await);
+    }
+
+    server.close_queues();
+    settle().await;
+
+    for task in waiting {
+        assert!(task.is_finished(), "turned away without a timer");
+        assert!(!task.await.expect("the dispatch task"));
+    }
+    assert_eq!(server.lane_room.waiting(), 0);
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_request_that_finds_no_lane_room_within_queue_timeout_gives_up() {
+    for worker_loop in [false, true] {
+        let server = one_worker_waiting(worker_loop, 200);
+        fill_the_lane(&server).await;
+        let started = tokio::time::Instant::now();
+
+        assert!(!enqueue(&server, numbered(LANE_DEPTH)).await);
+        assert_eq!(
+            started.elapsed(),
+            Duration::from_millis(200),
+            "worker_loop {worker_loop}"
+        );
+        assert_eq!(server.lane_room.waiting(), 0);
+    }
 }

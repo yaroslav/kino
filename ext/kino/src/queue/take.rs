@@ -1,14 +1,14 @@
 //! A worker's takes. What is ready goes first: its sockets' events and its wake, its lane, a
-//! sibling's lane. With nothing ready the worker parks (Taker::take).
+//! sibling's lane. With nothing ready a classic worker parks (Taker::take), and a worker_loop
+//! arms its doorbell and leaves the wait to the app's scheduler (Taker::nonblock).
 
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
 
-use magnus::Error;
-
 use super::{Item, Taken, TICK};
+use crate::gvl::{self, Back, Parker};
 use crate::registry::{LaneItem, ServerInner};
-use crate::slot::WorkerSlot;
+use crate::slot::{WorkerSlot, HOLDING_ITEM};
 
 /// Socket events a worker takes in a row while a request or a wake may wait;
 /// then its lane gets a look and a due wake its turn. A wake counts as a whole
@@ -35,6 +35,13 @@ impl Take {
         }
     }
 
+    fn item(&self) -> Option<&Item> {
+        match self {
+            Take::Item(item) => Some(item),
+            Take::Closed | Take::Nothing => None,
+        }
+    }
+
     /// As a wait's attempt reports it: None to wait on, Some(None) at the loop's end.
     fn found(self) -> Option<Taken> {
         match self {
@@ -51,10 +58,29 @@ impl From<Option<Item>> for Take {
     }
 }
 
-/// One bounded wait of a take: None to go around again.
-pub(super) type Attempt<'a> = &'a mut dyn FnMut() -> Option<Taken>;
-/// What the wait made of its attempts: Ok(None) once interrupted.
-pub(super) type WaitResult = Result<Option<Taken>, Error>;
+/// Whether a lane's own worker idles on it and takes what it holds within moments. A parked
+/// classic worker blocks on its lane. A parked worker_loop one waits on its doorbell, unless the
+/// wait is a tick overdue: its thread is away on a job's fiber, and rings go unanswered. A
+/// retired or crashed worker's lane is never left to it.
+fn owner_waits(owner: &WorkerSlot, now: &mut Option<u64>) -> bool {
+    if !owner.park.is_parked() || owner.life.seems_retired() {
+        return false;
+    }
+    if !owner.lane.is_worker_loop() {
+        return true;
+    }
+    let now = *now.get_or_insert_with(crate::mono::mono_us);
+    let due = owner.load.last_started();
+    now < due.saturating_add(TICK.as_micros() as u64)
+}
+
+/// What a worker_loop take has room for (Kino::Worker::Loop#take).
+#[derive(Clone, Copy)]
+pub(crate) enum Room {
+    All,
+    Events,
+    Requests,
+}
 
 /// A worker's side of the queues: its slot, and through the server its siblings' lanes or the
 /// shared queue.
@@ -159,13 +185,20 @@ impl<'a> Taker<'a> {
     }
 
     /// Requests only: a sibling's doorbell goes back to its owner, whose events stay with it.
-    fn steal(self) -> Option<Item> {
+    /// A worker that `waited` (a tick woke it, or a ring for nothing) leaves a lane to its own
+    /// idle worker, which the send woke: taking from it would move one client's run of requests
+    /// to a cold worker whenever a tick falls between a send and its take.
+    fn steal(self, waited: bool) -> Option<Item> {
         if self.slot.life.seems_retired() {
             return None;
         }
         let slots = self.server.slots.read();
+        let mut now = None;
         for other in slots.iter() {
             if Arc::ptr_eq(other, self.slot) {
+                continue;
+            }
+            if waited && owner_waits(other, &mut now) {
                 continue;
             }
             if let Some(rx) = other.lane.rx.as_ref() {
@@ -185,7 +218,17 @@ impl<'a> Taker<'a> {
     /// Inbox and wake (after the lane, once a full run owes it a look), the lane, then a
     /// steal. Closed once the lane is closed and the inbox empty.
     pub(crate) fn ready(self) -> Take {
-        let lane_rx = self.slot.lane.rx.as_ref().expect("take_ready without lane");
+        self.ready_after(false)
+    }
+
+    /// `ready`, for a worker that `waited` before this look or comes straight from its work.
+    fn ready_after(self, waited: bool) -> Take {
+        let lane_rx = self
+            .slot
+            .lane
+            .rx
+            .as_ref()
+            .expect("a lane take without a lane");
         if let Some(item) = self.own_item() {
             return Take::Item(item);
         }
@@ -205,7 +248,7 @@ impl<'a> Taker<'a> {
                 return Take::Item(item);
             }
         }
-        self.steal().into()
+        self.steal(waited).into()
     }
 
     /// After shutdown closed the lane: the rest of the inbox past the run cap, so every
@@ -221,16 +264,17 @@ impl<'a> Taker<'a> {
     pub(crate) fn tick(self) -> Take {
         Take::from(self.own_item())
             .or_else(|| self.after_timeout())
-            .or_else(|| self.steal().into())
+            .or_else(|| self.steal(true).into())
     }
 
-    /// The next item, waiting in `wait` (the GVL released; in place in tests). What is
+    /// The next item, waiting through `parker` (the GVL released; in place in tests). What is
     /// ready goes first with the GVL held, sparing two scheduler round-trips under load;
     /// a lane worker parks with its flag raised, so the dispatcher avoids it.
-    pub(super) fn take(self, wait: impl FnOnce(Attempt<'_>) -> WaitResult) -> Result<Taken, Error> {
+    /// A VM interrupt only wakes the park, or raises out of it.
+    pub(super) fn take<P: Parker>(self, parker: &mut P) -> Result<Taken, P::Error> {
         let (server, slot) = (self.server, self.slot);
         let Some(lane) = &slot.lane.rx else {
-            return self.take_shared(wait);
+            return self.take_shared(parker);
         };
         if let Some(taken) = self.ready().found() {
             slot.park.took(taken.as_ref());
@@ -241,11 +285,13 @@ impl<'a> Taker<'a> {
         // that read parked=false just before we set it: anything it sent lands
         // in the lane, and recv_timeout checks the queue before sleeping.
         slot.park.park(server);
-        let taken = wait(&mut || match lane.recv_timeout(TICK) {
+        let wait = || match lane.recv_timeout(TICK) {
             Ok(item) => self.lane_item(item).map(Some),
             Err(flume::RecvTimeoutError::Timeout) => self.tick().found(),
             Err(flume::RecvTimeoutError::Disconnected) => self.closing_item().found(),
-        });
+        };
+        let put_back = |taken| self.put_back_lane(taken);
+        let taken = gvl::park(parker, slot.life.halted(), wait, put_back);
         // Unpark before propagating any panic, or the dispatcher shuns this
         // lane for good.
         slot.park.unpark();
@@ -256,7 +302,7 @@ impl<'a> Taker<'a> {
 
     /// From the shared queue. A retired worker takes nothing new, and leaves as after_timeout
     /// says, or at close.
-    fn take_shared(self, wait: impl FnOnce(Attempt<'_>) -> WaitResult) -> Result<Taken, Error> {
+    fn take_shared<P: Parker>(self, parker: &mut P) -> Result<Taken, P::Error> {
         let (queue, life) = (&self.server.req_rx, &self.slot.life);
         let retired = || life.seems_retired();
         if !retired() {
@@ -266,7 +312,7 @@ impl<'a> Taker<'a> {
                 Err(flume::TryRecvError::Empty) => {}
             }
         }
-        let taken = wait(&mut || {
+        let wait = || {
             if !retired() {
                 return match queue.recv_timeout(TICK) {
                     Ok(ctx) => Some(Some(Item::Ctx(ctx))),
@@ -281,7 +327,121 @@ impl<'a> Taker<'a> {
                 std::thread::sleep(TICK);
                 None
             })
+        };
+        let put_back = |taken| self.put_back_shared(taken);
+        Ok(gvl::park(parker, life.halted(), wait, put_back)?.flatten())
+    }
+
+    /// A request taken as a Thread#raise came goes back at the queue's end, for whichever worker
+    /// takes next; held when the queue is closed or full, so the raise answers it at once.
+    fn put_back_shared(self, taken: Taken) -> Back<Taken> {
+        let Some(Item::Ctx(ctx)) = taken else {
+            return Back::HandedOver(taken);
+        };
+        let Some(tx) = self.server.req_tx.lock().clone() else {
+            return Back::Held(Some(Item::Ctx(ctx)));
+        };
+        match tx.try_send(ctx) {
+            Ok(()) => Back::Waits,
+            Err(refused) => Back::Held(Some(Item::Ctx(refused.into_inner()))),
+        }
+    }
+
+    /// A request taken as a Thread#raise came goes back at its lane's end for the next take (a
+    /// crash answers it with the rest of the lane), held when there is no room; a wake is due
+    /// again. A socket event is handed over as taken, so its socket's events stay in order: the
+    /// raise fires before its callback, losing only that event.
+    fn put_back_lane(self, taken: Taken) -> Back<Taken> {
+        match taken {
+            Some(Item::Ctx(ctx)) => match self.slot.send_lane(LaneItem::Request(ctx)) {
+                Ok(()) => Back::Waits,
+                Err(refused) => match refused.into_inner() {
+                    LaneItem::Request(ctx) => Back::Held(Some(Item::Ctx(ctx))),
+                    LaneItem::Bell => unreachable!("a request went in"),
+                },
+            },
+            Some(Item::Wake) if self.slot.wake() => Back::Waits,
+            Some(Item::Wake) => Back::Held(Some(Item::Wake)),
+            other => Back::HandedOver(other),
+        }
+    }
+
+    /// worker_loop's take, of what its loop has `room` for. Nothing: the doorbell is armed, and
+    /// the loop waits on it; the ticker rings it meanwhile, so this is its lane tick too.
+    /// - All: what `ready` finds, else a retired worker's exit. Parked while it waits.
+    /// - Requests (its backlog of events full): its lane's requests; the inbox waits until the
+    ///   backlog drains, pushing back on its sockets. Never Closed: the full take reports a
+    ///   closed lane, after what the inbox still holds.
+    /// - Events (every job slot busy): socket events and the wake hook, never Closed. A full
+    ///   worker is not idle.
+    pub(crate) fn nonblock(self, room: Room) -> Take {
+        // Parked: it comes from a wait on its doorbell, not from a job.
+        let waited = self.slot.park.is_parked();
+        let all = |taker: Self| taker.ready_after(waited).or_else(|| taker.after_timeout());
+        match room {
+            Room::All => self.take_with_room(all, true),
+            Room::Requests => self.take_with_room(|taker| taker.lane_request().into(), true),
+            Room::Events => self.take_with_room(|taker| taker.own_ready().into(), false),
+        }
+    }
+
+    fn doorbell(self) -> &'a crate::doorbell::Doorbell {
+        let doorbell = self.slot.lane.doorbell.as_ref();
+        doorbell.expect("a worker_loop take without a doorbell")
+    }
+
+    /// One worker_loop take: `look`, and if it finds nothing, arm and look again, as a send just
+    /// before the arm found the doorbell disarmed and did not ring. Only a worker with a job slot
+    /// free is `idle`: it prunes its in-flight list (what still counts keeps dispatch away from
+    /// a full one) and parks while it waits.
+    fn take_with_room(self, look: impl Fn(Self) -> Take, idle: bool) -> Take {
+        let (server, slot, doorbell) = (self.server, self.slot, self.doorbell());
+        let now = slot.load.back_in_loop();
+        if idle && slot.load.keep_open() {
+            server.lane_room.notify();
+        }
+        let found = look(self).or_else(|| {
+            if idle {
+                slot.park.park(server);
+            }
+            doorbell.arm();
+            look(self)
         });
-        Ok(taken?.flatten())
+        match &found {
+            Take::Nothing => {
+                slot.load.waits_on_doorbell(now);
+                return found;
+            }
+            Take::Item(_) => slot.load.hold(HOLDING_ITEM),
+            Take::Closed => slot.load.loop_ended(),
+        }
+        match idle {
+            true => slot.park.awake(doorbell),
+            false => doorbell.disarm(),
+        }
+        slot.park.took(found.item());
+        found
+    }
+
+    /// Requests alone: a doorbell found in the lane is dropped, the inbox read once the backlog
+    /// drains.
+    fn lane_request(self) -> Option<Item> {
+        let lane_rx = self.slot.lane.rx.as_ref().expect("a take without lane");
+        while let Ok(item) = lane_rx.try_recv() {
+            match item {
+                LaneItem::Request(ctx) => {
+                    self.lane_looked();
+                    return Some(Item::Ctx(ctx));
+                }
+                LaneItem::Bell => self.slot.lane.took_bell(),
+            }
+        }
+        None
+    }
+
+    /// With the lane out of play, a full run's look at it is moot: the run restarts, a due wake first.
+    fn own_ready(self) -> Option<Item> {
+        self.own_item()
+            .or_else(|| self.lane_looked().then(|| self.own_item()).flatten())
     }
 }

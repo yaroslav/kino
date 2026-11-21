@@ -4,6 +4,7 @@
 //! ractor boundaries.
 
 use std::cell::{Cell, RefCell, RefMut};
+use std::os::fd::RawFd;
 use std::sync::Arc;
 
 use bytes::Bytes;
@@ -11,9 +12,13 @@ use magnus::r_hash::ForEach;
 use magnus::value::ReprValue;
 use magnus::{Error, RArray, RHash, RString, Ruby, Value};
 
+use crate::doorbell::Doorbell;
+use crate::env_strings::{self, EnvStrings};
 use crate::gvl;
-use crate::response::{full_body, BodyFrame, Cut, Responder};
+use crate::pin::PinSlab;
+use crate::response::{full_body, BodyFrame, Cut, FrameResult, Responder};
 use crate::server::Peer;
+use crate::slot::WorkerSlot;
 
 pub struct RequestCtx {
     pub method: http::Method,
@@ -29,9 +34,9 @@ pub struct RequestCtx {
     pub body_rx: Option<flume::Receiver<Bytes>>,
     /// When a frame is bigger than read_body's max_len, the rest waits here.
     pub leftover: Cell<Option<Bytes>>,
-    /// The owning worker slot (set at admit time, queue/worker.rs); its interrupt
-    /// flag makes blocked body reads/writes interruptible like the queue pop.
-    pub slot: Option<Arc<crate::slot::WorkerSlot>>,
+    /// The owning worker slot (set at admit time, queue/worker.rs); its halted flag ends
+    /// blocked body reads/writes at the shutdown, as it ends a park.
+    pub slot: Option<Arc<WorkerSlot>>,
     /// The server's zero-copy roots: large response bodies are pinned
     /// here and ride to hyper without a copy (pin.rs).
     pub pin_slab: Arc<crate::pin::PinSlab>,
@@ -55,6 +60,63 @@ pub struct RequestCtx {
     pub hijacked: bool,
     /// Whose in-flight count a hijack leaves.
     pub server_id: u64,
+    pub waits: Waits,
+}
+
+/// Whether a wait opened the bells, how many waits are out (Request#waited), and whether the
+/// bells close once none is. Cells, so each native takes the handle's shared borrow: a blocking
+/// write_chunk holds one across its wait while another thread closes the stream.
+#[derive(Default)]
+pub struct Waits {
+    opened: Cell<bool>,
+    out: Cell<u32>,
+    closing: Cell<bool>,
+}
+
+/// One step under a fiber scheduler: done, or the descriptor to wait on before the next.
+#[derive(Debug, PartialEq, Eq)]
+pub enum Step<T> {
+    Done(T),
+    Wait(RawFd),
+}
+
+#[derive(Debug)]
+pub enum WaitError {
+    /// The response stream was not started, or already finished.
+    Closed,
+    /// Nothing written reaches anyone (client gone, stream given up): Kino::ClientGone.
+    Gone,
+    Interrupted,
+    /// No descriptor to wait on (out of file descriptors).
+    Io(std::io::Error),
+}
+
+impl Waits {
+    /// `attempt`, else `bell` armed and `attempt` once more, so a change just before the arm
+    /// still rings. The bell stays armed after a find, for other fibers on it: a stray ring costs
+    /// a look. Past the shutdown deadline (a halted slot) a wait fails as interrupted.
+    fn step<T>(
+        &self,
+        slot: Option<&WorkerSlot>,
+        bell: &Doorbell,
+        mut attempt: impl FnMut() -> Option<T>,
+    ) -> Result<Step<T>, WaitError> {
+        if let Some(done) = attempt() {
+            return Ok(Step::Done(done));
+        }
+        let fd = bell.open().map_err(WaitError::Io)?;
+        self.opened.set(true);
+        bell.arm();
+        if let Some(done) = attempt() {
+            return Ok(Step::Done(done));
+        }
+        // After the arm, as the shutdown rings after raising the flag.
+        if slot.is_some_and(|slot| slot.life.is_halted()) {
+            return Err(WaitError::Interrupted);
+        }
+        self.out.set(self.out.get() + 1);
+        Ok(Step::Wait(fd))
+    }
 }
 
 impl RequestCtx {
@@ -88,7 +150,104 @@ impl RequestCtx {
             upgrade,
             hijacked: false,
             server_id: server.id,
+            waits: Waits::default(),
         })
+    }
+
+    /// Done(None) at the body's end (or abandonment, see body_ended), when its waits close too.
+    pub fn read_nonblock(&self) -> Result<Step<Option<Bytes>>, WaitError> {
+        let Some(body_rx) = self.body_rx.as_ref() else {
+            return Ok(Step::Done(None));
+        };
+        let step =
+            self.waits.step(
+                self.slot.as_deref(),
+                &self.responder.body_bell,
+                || match body_rx.try_recv() {
+                    Ok(bytes) => Some(Some(bytes)),
+                    Err(flume::TryRecvError::Empty) => None,
+                    Err(flume::TryRecvError::Disconnected) => Some(None),
+                },
+            )?;
+        if step == Step::Done(None) {
+            self.close_waits();
+        }
+        Ok(step)
+    }
+
+    /// One data frame without blocking; `make` makes its bytes once there is room. Gone once the
+    /// client is gone or the stream was cut, as write_chunk raises, also for a write that waited.
+    pub fn write_nonblock(
+        &self,
+        make: impl FnOnce(&Arc<PinSlab>) -> Bytes,
+    ) -> Result<Step<()>, WaitError> {
+        let Some(sender) = self.responder.body_sender() else {
+            if self.responder.stream_cut() {
+                return Err(WaitError::Gone);
+            }
+            return Err(WaitError::Closed);
+        };
+        let pin_slab = &self.pin_slab;
+        let mut make = Some(make);
+        let mut frame: Option<FrameResult> = None;
+        let step = self
+            .waits
+            .step(self.slot.as_deref(), &self.responder.room_bell, || {
+                if sender.is_disconnected() {
+                    return Some(false);
+                }
+                if sender.is_full() {
+                    // As a blocking write's wait: a stream given up while
+                    // its client stalls never drains.
+                    return self.responder.stream_cut().then_some(false);
+                }
+                let next = frame.take().unwrap_or_else(|| {
+                    let make = make.take().expect("bytes made once");
+                    Ok(BodyFrame::data(make(pin_slab)))
+                });
+                match sender.try_send(next) {
+                    Ok(()) => Some(true),
+                    Err(flume::TrySendError::Disconnected(_)) => Some(false),
+                    Err(flume::TrySendError::Full(back)) => {
+                        frame = Some(back);
+                        None
+                    }
+                }
+            })?;
+        match step {
+            Step::Done(true) => Ok(Step::Done(())),
+            Step::Done(false) => Err(WaitError::Gone),
+            Step::Wait(fd) => Ok(Step::Wait(fd)),
+        }
+    }
+
+    pub fn waited(&self) {
+        self.waits.out.set(self.waits.out.get().saturating_sub(1));
+        if self.waits.closing.get() {
+            self.close_waits();
+        }
+    }
+
+    /// Now if no wait is out, else once the last is back, so no fiber waits on a closed descriptor.
+    pub fn close_waits(&self) {
+        if !self.waits.opened.get() {
+            return;
+        }
+        if self.waits.out.get() > 0 {
+            self.waits.closing.set(true);
+            return;
+        }
+        self.waits.opened.set(false);
+        self.waits.closing.set(false);
+        self.responder.close_bells();
+    }
+
+    /// Its waits close, and the worker that took it hears (WorkerSlot::answered).
+    fn answered(&self) {
+        self.close_waits();
+        if let Some(slot) = &self.slot {
+            slot.answered(&self.responder);
+        }
     }
 
     /// A plain answer: the task holding the connection for a claim ends now, not at GC.
@@ -136,16 +295,21 @@ impl Drop for RequestCtx {
     }
 }
 
-/// Block on a channel operation with the GVL released, waking on the
-/// slot's interrupt flag. `attempt` performs one bounded tick and returns
-/// Some when done; None on timeout. Ok(None) = interrupted. Every Ruby
-/// handle is created by `admit` (queue/worker.rs), which always sets the slot.
+/// Block on a channel operation with the GVL released, as the worker parks (gvl::park):
+/// `attempt` runs one bounded tick, Some when done; Ok(None) once the slot is halted. A raise
+/// comes back as Err, a chunk read or written as it came staying the app's. Every Ruby handle
+/// is created by `admit` (queue/worker.rs), which always sets the slot.
 fn block_on<T>(
-    slot: &Option<Arc<crate::slot::WorkerSlot>>,
+    slot: &Option<Arc<WorkerSlot>>,
     attempt: impl FnMut() -> Option<T>,
 ) -> Result<Option<T>, Error> {
     let slot = slot.as_ref().expect("slot set by admit");
-    gvl::interruptible(&slot.life.interrupted, attempt)
+    gvl::park(
+        &mut gvl::Released,
+        slot.life.halted(),
+        attempt,
+        gvl::Back::HandedOver,
+    )
 }
 
 fn interrupted_error(ruby: &Ruby) -> Error {
@@ -190,6 +354,33 @@ fn busy_error(ruby: &Ruby) -> Error {
     Error::new(ruby.exception_runtime_error(), format!("Kino: {BUSY}"))
 }
 
+/// ClientGone once Kino gave the stream up, else it was never started or is already finished.
+fn stream_closed_error(ruby: &Ruby, responder: &Responder) -> Error {
+    if responder.stream_cut() {
+        return client_gone_error(ruby);
+    }
+    Error::new(
+        ruby.exception_runtime_error(),
+        "Kino: response stream not started or already finished",
+    )
+}
+
+fn wait_error(ruby: &Ruby, responder: &Responder, error: WaitError) -> Error {
+    match error {
+        WaitError::Closed => stream_closed_error(ruby, responder),
+        WaitError::Gone => {
+            // Counted once, unless Kino cut it first (counted then).
+            responder.cut_stream(crate::response::Cut::ClientGone);
+            client_gone_error(ruby)
+        }
+        WaitError::Interrupted => interrupted_error(ruby),
+        WaitError::Io(e) => Error::new(
+            ruby.exception_io_error(),
+            format!("Kino: no descriptor to wait on the client with: {e}"),
+        ),
+    }
+}
+
 fn invalid_response(ruby: &Ruby, e: impl std::fmt::Display) -> Error {
     Error::new(
         ruby.exception_runtime_error(),
@@ -220,13 +411,22 @@ impl Request {
 /// only genuinely dynamic strings are allocated. Called by `admit`
 /// (queue/worker.rs) with the GVL held, before the ctx is wrapped.
 pub fn build_env(ruby: &Ruby, ctx: &RequestCtx) -> Result<RHash, Error> {
-    use crate::env_strings;
-
     let s = env_strings::get();
     // Pre-sized: a dozen static keys plus one per header lands near 30
     // entries, which a default Hash reaches only via the ar-to-st
     // migration and a rehash per doubling.
     let env = ruby.hash_new_capa(32);
+    set_request_env(ruby, env, s, ctx)?;
+    set_headers_env(ruby, env, s, ctx)?;
+    // After the headers, so an authority-derived HTTP_HOST wins over a literal host header
+    // a proxy forwarded.
+    set_server_env(ruby, env, ctx)?;
+    Ok(env)
+}
+
+/// The request line, the peer, the scheme, and the rack.* streams.
+#[inline(always)]
+fn set_request_env(ruby: &Ruby, env: RHash, s: &EnvStrings, ctx: &RequestCtx) -> Result<(), Error> {
     // Opaque -> live RString for this thread's Ruby handle.
     let live = |o: magnus::value::Opaque<RString>| ruby.get_inner(o);
 
@@ -267,7 +467,13 @@ pub fn build_env(ruby: &Ruby, ctx: &RequestCtx) -> Result<RHash, Error> {
             env.aset(live(s.rack_input), ruby.get_inner(null_input))?;
         }
     }
+    Ok(())
+}
 
+/// One HTTP_* entry per header name, its values joined.
+#[inline(always)]
+fn set_headers_env(ruby: &Ruby, env: RHash, s: &EnvStrings, ctx: &RequestCtx) -> Result<(), Error> {
+    let live = |o: magnus::value::Opaque<RString>| ruby.get_inner(o);
     for name in ctx.headers.keys() {
         let key = if *name == http::header::CONTENT_TYPE {
             live(s.content_type)
@@ -307,13 +513,16 @@ pub fn build_env(ruby: &Ruby, ctx: &RequestCtx) -> Result<RHash, Error> {
             }
         }
     }
+    Ok(())
+}
 
-    // SERVER_NAME/SERVER_PORT/HTTP_HOST, best source first: the request
-    // URI's authority (every h2 request via :authority; also h1
-    // absolute-form, where it beats Host per RFC 9112), then the Host
-    // header (HTTP/1.1 requires it), then the accepted socket's local
-    // address. Runs after the header loop so an authority-derived
-    // HTTP_HOST wins over a literal host header a proxy forwarded.
+/// SERVER_NAME/SERVER_PORT/HTTP_HOST, best source first: the request
+/// URI's authority (every h2 request via :authority; also h1
+/// absolute-form, where it beats Host per RFC 9112), then the Host
+/// header (HTTP/1.1 requires it), then the accepted socket's local
+/// address.
+#[inline(always)]
+fn set_server_env(ruby: &Ruby, env: RHash, ctx: &RequestCtx) -> Result<(), Error> {
     if let Some(authority) = ctx.uri.authority() {
         let local_port = ctx.peer.local.port();
         env_strings::set_authority_env(ruby, env, authority.as_str(), || {
@@ -348,8 +557,7 @@ pub fn build_env(ruby: &Ruby, ctx: &RequestCtx) -> Result<RHash, Error> {
             }
         }
     }
-
-    Ok(env)
+    Ok(())
 }
 
 /// Bodyless requests carry no channel at all; a present channel that is
@@ -362,6 +570,51 @@ fn body_possible(ctx: &RequestCtx) -> bool {
         .body_rx
         .as_ref()
         .is_some_and(|rx| !(rx.is_empty() && rx.is_disconnected()))
+}
+
+/// The body channel disconnected: a clean EOF, unless the forwarder
+/// abandoned the body (too large, or the client stalled).
+fn body_ended(ruby: &Ruby, ctx: &RequestCtx) -> Result<(), Error> {
+    use crate::response::BodyAbandon;
+    match ctx.responder.body_abandoned() {
+        Some(BodyAbandon::Oversize) => Err(body_too_large_error(ruby)),
+        Some(BodyAbandon::TimedOut) => Err(body_timeout_error(ruby)),
+        Some(BodyAbandon::Interrupted) => Err(interrupted_error(ruby)),
+        None => Ok(()),
+    }
+}
+
+/// `chunk`, up to `max_len` bytes (the rest waits in leftover), topped up with what arrived.
+fn body_chunk(ruby: &Ruby, ctx: &RequestCtx, mut chunk: Bytes, max_len: usize) -> RString {
+    let max_len = max_len.max(1);
+    if chunk.len() > max_len {
+        ctx.leftover.set(Some(chunk.split_off(max_len)));
+        return ruby.str_from_slice(&chunk);
+    }
+
+    // Greedy drain: what the forwarder already queued rides out in this crossing, up to max_len,
+    // so a body of small DATA frames (HTTP/2's 16 KB default) costs one GVL round-trip and one
+    // Ruby string, not one per frame. What has not come yet, EOF included, is the next read's.
+    let mut assembled: Option<RString> = None;
+    if let Some(body_rx) = ctx.body_rx.clone() {
+        let mut total = chunk.len();
+        while total < max_len {
+            let Ok(mut more) = body_rx.try_recv() else {
+                break;
+            };
+            if more.len() > max_len - total {
+                ctx.leftover.set(Some(more.split_off(max_len - total)));
+            }
+            total += more.len();
+            let out = *assembled.get_or_insert_with(|| {
+                let out = ruby.str_buf_new(max_len);
+                out.cat(&chunk[..]);
+                out
+            });
+            out.cat(&more[..]);
+        }
+    }
+    assembled.unwrap_or_else(|| ruby.str_from_slice(&chunk))
 }
 
 /// Complete response in one shot: status, the Rack headers Hash (iterated
@@ -378,18 +631,20 @@ pub fn respond_simple(
     request.decline_upgrade();
     let ctx = request.0.borrow();
     let builder = timed(&ctx, build_head(status, headers)?);
-    let bytes = body_bytes(&ctx, body);
+    let bytes = body_bytes(&ctx.pin_slab, body);
     let response = builder
         .body(full_body(bytes))
         .map_err(|e| invalid_response(ruby, e))?;
-    Ok(ctx.responder.send_response(response))
+    let sent = ctx.responder.send_response(response);
+    ctx.answered();
+    Ok(sent)
 }
 
 /// Body bytes for hyper: large bodies are pinned in place (zero-copy),
 /// everything else is copied out of the Ruby string, which may be
 /// mutated or collected the moment we return.
-fn body_bytes(ctx: &RequestCtx, body: RString) -> Bytes {
-    if let Some(bytes) = crate::pin::pinned_bytes(&ctx.pin_slab, body) {
+fn body_bytes(pin_slab: &Arc<PinSlab>, body: RString) -> Bytes {
+    if let Some(bytes) = crate::pin::pinned_bytes(pin_slab, body) {
         return bytes;
     }
     Bytes::copy_from_slice(unsafe { body.as_slice() })
@@ -450,7 +705,11 @@ impl Request {
         use std::os::fd::IntoRawFd;
 
         let taken = match self.exclusive() {
-            Some(mut ctx) => crate::hijack::take(&mut ctx, head),
+            Some(mut ctx) => {
+                let taken = crate::hijack::take(&mut ctx, head);
+                ctx.close_waits();
+                taken
+            }
             None => Err(crate::hijack::Refused::Busy),
         };
         let io = taken.map_err(|refused| {
@@ -481,11 +740,9 @@ impl Request {
         rb_self: &Request,
         max_len: usize,
     ) -> Result<Option<RString>, Error> {
-        let max_len = max_len.max(1);
-
         // Shared across the wait: other threads may abort or answer the request meanwhile.
         let ctx = rb_self.0.borrow();
-        let mut chunk = match ctx.leftover.take() {
+        let chunk = match ctx.leftover.take() {
             Some(bytes) => bytes,
             None => {
                 let Some(body_rx) = ctx.body_rx.clone() else {
@@ -500,56 +757,36 @@ impl Request {
                 })?;
                 match outcome {
                     Some(Some(bytes)) => bytes,
-                    Some(None) => {
-                        // Disconnected: a clean EOF, unless the forwarder
-                        // abandoned the body (too large, or the client stalled).
-                        use crate::response::BodyAbandon;
-                        return match ctx.responder.body_abandoned() {
-                            Some(BodyAbandon::Oversize) => Err(body_too_large_error(ruby)),
-                            Some(BodyAbandon::TimedOut) => Err(body_timeout_error(ruby)),
-                            None => Ok(None), // EOF
-                        };
-                    }
+                    Some(None) => return body_ended(ruby, &ctx).map(|()| None),
                     None => return Err(interrupted_error(ruby)),
                 }
             }
         };
+        Ok(Some(body_chunk(ruby, &ctx, chunk, max_len)))
+    }
 
-        if chunk.len() > max_len {
-            ctx.leftover.set(Some(chunk.split_off(max_len)));
-            return Ok(Some(ruby.str_from_slice(&chunk)));
-        }
-
-        // Greedy drain: whatever the forwarder has already queued rides
-        // out in this same crossing, up to max_len. A body arriving as
-        // small DATA frames (HTTP/2 caps them at 16 KB unless negotiated
-        // higher) then costs one GVL round-trip and one Ruby string, not
-        // one per frame. Non-blocking: a chunk that has not arrived yet
-        // is next call's business, as are EOF and abandonment (try_recv's
-        // Disconnected included; the recv above maps them to errors).
-        let mut assembled: Option<RString> = None;
-        if let Some(body_rx) = ctx.body_rx.clone() {
-            let mut total = chunk.len();
-            while total < max_len {
-                let Ok(mut more) = body_rx.try_recv() else {
-                    break;
-                };
-                if more.len() > max_len - total {
-                    ctx.leftover.set(Some(more.split_off(max_len - total)));
+    /// read_body for a fiber scheduler: while no chunk has come, the descriptor to wait on.
+    pub fn read_body_nonblock(
+        ruby: &Ruby,
+        rb_self: &Request,
+        max_len: usize,
+    ) -> Result<Value, Error> {
+        let ctx = rb_self.0.borrow();
+        let chunk = match ctx.leftover.take() {
+            Some(bytes) => bytes,
+            None => match ctx
+                .read_nonblock()
+                .map_err(|e| wait_error(ruby, &ctx.responder, e))?
+            {
+                Step::Done(Some(bytes)) => bytes,
+                Step::Done(None) => {
+                    body_ended(ruby, &ctx)?;
+                    return Ok(ruby.qnil().as_value());
                 }
-                total += more.len();
-                let out = *assembled.get_or_insert_with(|| {
-                    let out = ruby.str_buf_new(max_len);
-                    out.cat(&chunk[..]);
-                    out
-                });
-                out.cat(&more[..]);
-            }
-        }
-        Ok(Some(match assembled {
-            Some(out) => out,
-            None => ruby.str_from_slice(&chunk),
-        }))
+                Step::Wait(fd) => return Ok(ruby.into_value(fd)),
+            },
+        };
+        Ok(body_chunk(ruby, &ctx, chunk, max_len).as_value())
     }
 
     /// Start a streaming response: head goes out now, chunks follow via
@@ -575,15 +812,9 @@ impl Request {
     pub fn write_chunk(ruby: &Ruby, rb_self: &Request, chunk: RString) -> Result<(), Error> {
         let ctx = rb_self.0.borrow();
         let Some(sender) = ctx.responder.body_sender() else {
-            if ctx.responder.stream_cut() {
-                return Err(client_gone_error(ruby));
-            }
-            return Err(Error::new(
-                ruby.exception_runtime_error(),
-                "Kino: response stream not started or already finished",
-            ));
+            return Err(stream_closed_error(ruby, &ctx.responder));
         };
-        let bytes = body_bytes(&ctx, chunk);
+        let bytes = body_bytes(&ctx.pin_slab, chunk);
         let mut pending = Some(Ok(BodyFrame::data(bytes)));
 
         let outcome = block_on(&ctx.slot, || {
@@ -611,9 +842,39 @@ impl Request {
         }
     }
 
+    /// write_chunk for a fiber scheduler: true once on its way, else the descriptor to wait on.
+    pub fn write_chunk_nonblock(
+        ruby: &Ruby,
+        rb_self: &Request,
+        chunk: RString,
+    ) -> Result<Value, Error> {
+        let step = rb_self
+            .0
+            .borrow()
+            .write_nonblock(|pin_slab| body_bytes(pin_slab, chunk));
+        Ok(
+            match step.map_err(|e| wait_error(ruby, &rb_self.0.borrow().responder, e))? {
+                Step::Done(()) => ruby.qtrue().as_value(),
+                Step::Wait(fd) => ruby.into_value(fd),
+            },
+        )
+    }
+
+    /// A wait on a descriptor read_body_nonblock or write_chunk_nonblock handed out is over.
+    pub fn waited(_ruby: &Ruby, rb_self: &Request) {
+        rb_self.0.borrow().waited();
+    }
+
+    /// The request's job is over: its waits' descriptors close (RequestCtx::close_waits).
+    pub fn close_waits(_ruby: &Ruby, rb_self: &Request) {
+        rb_self.0.borrow().close_waits();
+    }
+
     /// Clean end of a streaming response.
     pub fn finish(_ruby: &Ruby, rb_self: &Request) -> Result<(), Error> {
-        rb_self.0.borrow().responder.finish_stream();
+        let ctx = rb_self.0.borrow();
+        ctx.responder.finish_stream();
+        ctx.answered();
         Ok(())
     }
 
@@ -624,6 +885,7 @@ impl Request {
         rb_self.decline_upgrade();
         if let Ok(ctx) = rb_self.0.try_borrow() {
             ctx.responder.give_up(Cut::Crash);
+            ctx.answered();
         }
         Ok(())
     }
@@ -682,7 +944,17 @@ pub(crate) fn split_host_port(host: &str, default_port: u16) -> (String, u16) {
 /// fires the Drop-500 backstop into a dropped receiver, which is a no-op.
 #[cfg(test)]
 pub fn test_ctx() -> crate::registry::BoxedCtx {
-    let (head_tx, _head_rx) = tokio::sync::oneshot::channel();
+    test_ctx_with_client().0
+}
+
+/// A test_ctx whose client still waits for its answer, as long as the
+/// caller keeps the returned receiver of its response head.
+#[cfg(test)]
+pub fn test_ctx_with_client() -> (
+    crate::registry::BoxedCtx,
+    tokio::sync::oneshot::Receiver<crate::response::HyperResponse>,
+) {
+    let (head_tx, head_rx) = tokio::sync::oneshot::channel();
     let (parts, ()) = http::Request::new(()).into_parts();
     let peer = Peer {
         remote: "127.0.0.1:40000".parse().expect("static addr"),
@@ -690,7 +962,8 @@ pub fn test_ctx() -> crate::registry::BoxedCtx {
     };
     let server = crate::testing::TestServer::shared_queue().build();
     let responder = Arc::new(Responder::new(head_tx));
-    RequestCtx::new(parts, peer, &server, responder, None, None)
+    let ctx = RequestCtx::new(parts, peer, &server, responder, None, None);
+    (ctx, head_rx)
 }
 
 #[cfg(test)]
@@ -724,6 +997,78 @@ mod tests {
         );
         // Empty name (":8080") falls back whole.
         assert_eq!(split_host_port(":8080", 80), (":8080".into(), 80));
+    }
+
+    #[test]
+    fn a_chunk_that_arrives_as_the_read_arms_is_read_not_waited_for() {
+        let (body_tx, body_rx) = flume::bounded(1);
+        let mut ctx = test_ctx();
+        ctx.body_rx = Some(body_rx);
+        let responder = ctx.responder.clone();
+
+        // As the forwarder sends: the chunk, then a ring, which finds the
+        // bell not armed yet.
+        ctx.responder.body_bell.before_arm(move || {
+            body_tx.send(Bytes::from_static(b"late")).expect("open");
+            responder.body_bell.ring();
+        });
+        assert_eq!(
+            ctx.read_nonblock().expect("a read"),
+            Step::Done(Some(Bytes::from_static(b"late")))
+        );
+    }
+
+    #[test]
+    fn a_wait_fails_as_interrupted_once_its_slot_is_halted_though_what_came_is_still_read() {
+        let (body_tx, body_rx) = flume::bounded::<Bytes>(1);
+        let slot = Arc::new(WorkerSlot::new(true, 1, None));
+        let mut ctx = test_ctx();
+        ctx.body_rx = Some(body_rx);
+        ctx.slot = Some(slot.clone());
+
+        slot.halt();
+        assert!(matches!(ctx.read_nonblock(), Err(WaitError::Interrupted)));
+        body_tx.send(Bytes::from_static(b"sent")).expect("open");
+        assert!(
+            matches!(ctx.read_nonblock(), Ok(Step::Done(Some(_)))),
+            "what already came is read"
+        );
+    }
+
+    #[test]
+    fn closing_waits_holds_their_descriptor_until_the_last_wait_is_back() {
+        let (body_tx, body_rx) = flume::bounded::<Bytes>(1);
+        let mut ctx = test_ctx();
+        ctx.body_rx = Some(body_rx);
+        let first = ctx.read_nonblock().expect("a read");
+        let second = ctx.read_nonblock().expect("a read");
+        let Step::Wait(fd) = first else {
+            panic!("expected to wait, got {first:?}");
+        };
+        assert_eq!(
+            second,
+            Step::Wait(fd),
+            "waits share the request's descriptor"
+        );
+
+        ctx.close_waits();
+        ctx.waited();
+        assert_eq!(
+            ctx.responder.body_bell.sockets().map(|s| s.fd()),
+            Some(fd),
+            "a wait is still out"
+        );
+        ctx.waited();
+        assert!(ctx.responder.body_bell.sockets().is_none());
+
+        assert!(
+            matches!(ctx.read_nonblock(), Ok(Step::Wait(_))),
+            "a later wait opens it again"
+        );
+        ctx.waited();
+        ctx.close_waits();
+        assert!(ctx.responder.body_bell.sockets().is_none());
+        drop(body_tx);
     }
 
     #[test]

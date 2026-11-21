@@ -8,10 +8,10 @@ use std::time::Instant;
 
 static MONO_EPOCH: OnceLock<Instant> = OnceLock::new();
 
-/// Microseconds since the first call anywhere in the process. The u128
+/// Microseconds since the first call anywhere in the process, from 1 (0 means never). The u128
 /// micros fit u64 for any realistic uptime (u64 us is ~584,000 years).
 pub fn mono_us() -> u64 {
-    MONO_EPOCH.get_or_init(Instant::now).elapsed().as_micros() as u64
+    MONO_EPOCH.get_or_init(Instant::now).elapsed().as_micros() as u64 + 1
 }
 
 #[cfg(test)]

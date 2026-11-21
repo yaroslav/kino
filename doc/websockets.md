@@ -80,6 +80,9 @@ lock.
   today, not a promise for every mode it may add: keep a socket's state
   in its handler, and reach other sockets through their handles rather
   than through one worker's globals.
+- Under a `worker_loop` they run alongside the worker's requests and
+  other sockets' callbacks instead, each socket's still in order (see
+  [worker-loop.md](worker-loop.md#websockets)).
 - A busy socket cannot hold up its worker: after eight events in a row,
   a waiting request goes next, then a due wake. Nor can it hold up the
   worker's other sockets: Kino reads at most 16 of a socket's messages
@@ -259,6 +262,9 @@ after_worker_boot Ractor.shareable_proc { |_worker_id|
   gets `{"kino.callback" => "on_wake"}` in place of the Rack env. A hook
   that wakes its own worker alternates with waiting requests, so it
   cannot starve them.
+- Under a `worker_loop` it runs alongside requests and socket
+  callbacks, never twice at once (see
+  [worker-loop.md](worker-loop.md#the-wake-hook)).
 - Without lanes Kino warns once and the hook never runs. There is no
   worker-side timer: for periodic work, start a thread that sleeps and
   calls `waker.wake`.
@@ -306,7 +312,9 @@ after_worker_boot Ractor.shareable_proc { |_worker_id|
   the worker. A request or handshake that arrives while the replacement
   starts waits for a worker, up to `queue_timeout`. A worker stuck in a
   callback or its wake hook reads as busy in `worker_status`, so
-  `quarantine_timeout` covers it.
+  `quarantine_timeout` covers it (under a `worker_loop`, by how long its
+  thread stays away from its loop: see
+  [worker-loop.md](worker-loop.md#stuck-workers-and-quarantine)).
 - The elastic pool does not retire a worker that owns open sockets, so
   with long-lived sockets a pool that grew rarely shrinks back. A socket
   that opens on a worker the pool has just decided to retire is closed
@@ -445,7 +453,8 @@ These are the server's own, at the top level:
   connections taken over by a full hijack, or switched by a 101 with a
   callable, and still open. A request leaves `in_flight` when the app
   takes it over and counts here instead.
-- `wakes` (`kino_wakes_total`): wake hook runs handed to workers.
+- `wakes` (`kino_wakes_total`): wake hook runs handed to workers (under
+  a `worker_loop`, every wake its loop takes).
 - Each `worker_status` row has `websockets_open`
   (`kino_worker_websockets_open{worker="N"}`) and `hijacked_connections`
   (`kino_worker_hijacked_connections{worker="N"}`) for its slot.

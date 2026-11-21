@@ -13,11 +13,11 @@ module Waiting
   end
 
   # Poll the block until it is truthy; past `timeout` seconds, fail naming
-  # `what`.
-  def wait_for(what = "the condition", timeout: 5, every: 0.02)
+  # `what`, and what `detail` returns then.
+  def wait_for(what = "the condition", timeout: 5, every: 0.02, detail: nil)
     deadline = monotonic + timeout
     until yield
-      raise "timed out after #{timeout}s waiting for #{what}" if monotonic > deadline
+      raise "timed out after #{timeout}s waiting for #{what}#{": #{detail.call}" if detail}" if monotonic > deadline
 
       sleep every
     end

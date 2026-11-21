@@ -99,6 +99,7 @@
 # Experimental dispatcher that gives each worker its own line. Faster
 # for quick handlers; behavior under heavy overload differs slightly.
 # Native WebSockets and Kino::Worker.on_wake hooks need it.
+# A worker_loop (below) turns it on.
 # lanes false
 
 # Log every request to stdout: an arrival line before the app runs and a
@@ -138,6 +139,16 @@
 # correlate boot and exit by that number in :ractor mode. It also fires
 # for each worker thread that crashed.
 # on_worker_exit { |worker_index, error| }
+
+# Run each worker's loop under your own fiber scheduler: called on the
+# worker thread with the worker, whose serve(concurrency:) hands your
+# scheduler each request as a job. In :ractor mode pass a
+# Ractor.shareable_proc (a do...end block is never shareable). Needs the
+# async gem; see doc/worker-loop.md in the Kino repository.
+# require "async"
+# worker_loop Ractor.shareable_proc { |worker|
+#   Sync { |task| worker.serve(concurrency: 32) { |job| task.async { job.call } } }
+# }
 
 ## WebSockets (experimental)
 #
@@ -197,7 +208,8 @@
 # process exit, since a wedged ractor cannot be safely interrupted). Off
 # unless set; set it above your slowest legitimate endpoint, and above
 # request_timeout. A WebSocket callback or wake hook counts as a request;
-# the slot's sockets close with 1011.
+# the slot's sockets close with 1011. Under a worker_loop, a worker is
+# stuck once its thread stays away from its loop that long.
 # quarantine_timeout 60
 
 # Cap on the total number of replacement events over the process

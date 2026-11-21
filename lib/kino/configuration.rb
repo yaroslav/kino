@@ -20,7 +20,7 @@ module Kino
       max_connections: nil, # nil = derive from the open-file limit
       max_body_size: 50 * 1024 * 1024, # 50 MB; nil/0 = unlimited
       batch: 1,
-      lanes: false,
+      lanes: nil, # resolved in Server: on with a worker_loop, off without
       websocket_max_message: 1_048_576, # 1 MiB
       websocket_max: nil, # nil = only max_connections bounds open sockets
       websocket_ping_interval: 30, # seconds; nil or 0 = no pings, no dead-peer drops
@@ -30,6 +30,7 @@ module Kino
       after_worker_boot: nil,
       after_request_complete: nil,
       on_worker_exit: nil,
+      worker_loop: nil,
       shutdown_timeout: 30,
       io_shards: false,
       io_threads: nil,
@@ -219,7 +220,7 @@ module Kino
       # Requests a worker may grab per queue visit (default 1).
       def batch(count) = @config.set(:batch, Integer(count))
 
-      # EXPERIMENTAL per-worker lane dispatch (default false). Native
+      # EXPERIMENTAL per-worker lane dispatch (default: on with a worker_loop, else off). Native
       # WebSockets and Kino::Worker.on_wake hooks need it.
       def lanes(enabled) = @config.set(:lanes, !!enabled)
 
@@ -260,6 +261,11 @@ module Kino
       # Called on the main thread when a worker exits, with (worker_index,
       # error_or_nil). error is the crash cause, or nil on a clean exit.
       def on_worker_exit(handler = nil, &block) = @config.set(:on_worker_exit, handler || block)
+
+      # Runs each worker's loop under the app's own fiber scheduler: called on the worker thread
+      # with a Kino::Worker::Loop, whose #serve(concurrency:) it calls inside the scheduler. Turns
+      # lanes on; must be Ractor-shareable in :ractor mode.
+      def worker_loop(handler = nil, &block) = @config.set(:worker_loop, handler || block)
 
       # Graceful-shutdown drain deadline in seconds.
       def shutdown_timeout(seconds) = @config.set(:shutdown_timeout, seconds)

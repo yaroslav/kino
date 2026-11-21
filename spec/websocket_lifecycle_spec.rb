@@ -95,10 +95,12 @@ RSpec.describe "WebSocket lifecycle" do
     end
   end
 
+  # A worker_loop runs on_shutdown and on_close on the socket's job, as
+  # any event.
   # A drain with no deadline at all: it waits for its sockets, however
   # long they take; the Timeout fails a drain that never ends.
   [{mode: :ractor}, {mode: :threaded}, {mode: :ractor, io_shards: true}].each do |opts|
-    it "drains each socket: on_shutdown, whose write goes first, a 1001 spread over a second, and on_close, " \
+    it_in_both_loops "drains each socket: on_shutdown, whose write goes first, a 1001 spread over a second, and on_close, " \
       "then returns once the clients answered (#{opts})" do
       log = Timeout.timeout(20) do
         capture_native_stderr do
@@ -162,10 +164,11 @@ RSpec.describe "WebSocket lifecycle" do
   end
 
   # Thirty sockets on one worker, whose on_close takes 50 ms. The 1001s go
-  # out over a second, faster than the worker runs on_close, so the queue
-  # closes with more than a run of closes still in its worker's inbox.
+  # out over a second, faster than the worker runs on_close (Kino.sleep
+  # holds a worker_loop's thread too), so the queue closes with more than
+  # a run of closes still in its worker's inbox.
   each_mode do |mode|
-    it "runs on_close for every socket when the drain leaves their worker behind" do
+    it_in_both_loops "runs on_close for every socket when the drain leaves their worker behind" do
       count = 30
       app = ws_app(SlowCloseSocket.new(port: reports.port, pause: 0.05))
       with_ws_server(app, mode:, workers: 1) do |port, server|
