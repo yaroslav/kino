@@ -23,15 +23,45 @@ fn branded(mut response: HyperResponse) -> HyperResponse {
 /// Idle deadline between body frames, so a silent client cannot pin a worker in read_body.
 pub(super) const BODY_READ_TIMEOUT: Duration = Duration::from_secs(30);
 
+/// A request counted in Counters::in_flight while this lives. It borrows its connection's
+/// server, keeping the server's Arc count, which every worker take moves, off the I/O threads.
+/// A Drop guard: hyper drops this future at an await when the client aborts, and a
+/// plain decrement after it would never run.
+struct InFlight<'a> {
+    server: &'a ServerInner,
+    /// A switching request's responder, which leaves the count when the app takes it over.
+    switching: Option<Arc<Responder>>,
+}
+
+impl<'a> InFlight<'a> {
+    fn enter(server: &'a ServerInner, switching: Option<Arc<Responder>>) -> Self {
+        server.counters.in_flight.fetch_add(1, Ordering::Relaxed);
+        InFlight { server, switching }
+    }
+}
+
+impl Drop for InFlight<'_> {
+    fn drop(&mut self) {
+        // A hijacked request left the count when the app took it over.
+        if self.switching.as_ref().is_none_or(|r| r.leave_in_flight()) {
+            self.server
+                .counters
+                .in_flight
+                .fetch_sub(1, Ordering::Relaxed);
+        }
+    }
+}
+
 pub(super) async fn handle_request(
-    server: Arc<ServerInner>,
+    server: &Arc<ServerInner>,
     peer: Peer,
     mut req: hyper::Request<hyper::body::Incoming>,
 ) -> Result<HyperResponse, std::convert::Infallible> {
     // A task holds a switching request's connection until the app claims it.
-    let upgrade = crate::upgrade::capture(&mut req, &server);
+    let upgrade = crate::upgrade::capture(&mut req, server);
     let (parts, body) = req.into_parts();
-    let logged = Logged::arrival(&server, &parts, &peer);
+    let head = parts.method == http::Method::HEAD;
+    let logged = Logged::arrival(server, &parts, &peer);
 
     // A declared oversize body gets a 413 before any worker runs; the forwarder caps
     // chunked or lying clients, and read_body raises.
@@ -46,35 +76,25 @@ pub(super) async fn handle_request(
     // No channel is a bodyless EOF.
     let bodyless = oversize || hyper::body::Body::is_end_stream(&body);
     let body_rx = (!bodyless).then(|| forward_body(body, &responder, max_body));
-    let ctx = RequestCtx::new(parts, peer, &server, responder, body_rx, upgrade);
+    let ctx = RequestCtx::new(parts, peer, server, responder, body_rx, upgrade);
 
-    // A Drop guard: hyper drops this future at an await when the client aborts, and a
-    // plain decrement after it would never run.
-    struct InFlight(Arc<ServerInner>, Option<Arc<Responder>>);
-    impl Drop for InFlight {
-        fn drop(&mut self) {
-            // A hijacked request left the count when the app took it over.
-            if self.1.as_ref().is_none_or(|r| r.leave_in_flight()) {
-                self.0.counters.in_flight.fetch_sub(1, Ordering::Relaxed);
-            }
-        }
-    }
-    server.counters.in_flight.fetch_add(1, Ordering::Relaxed);
-    let in_flight = InFlight(server.clone(), switching);
+    let in_flight = InFlight::enter(server, switching);
 
     // One exit, so the access log sees every outcome, 503s included.
     let response = if oversize {
         plain_response(413, "Payload Too Large\n")
-    } else if !crate::dispatch::enqueue(&server, ctx).await {
+    } else if !crate::dispatch::enqueue(server, ctx).await {
         server.counters.rejected.fetch_add(1, Ordering::Relaxed);
         plain_response(503, "Service Unavailable\n")
     } else {
-        await_head(&server, in_flight.1.as_deref(), &mut head_rx).await
+        await_head(server, in_flight.switching.as_deref(), &mut head_rx).await
     };
     if let Some(logged) = logged {
         logged.completion(&response);
     }
-    Ok(branded(response))
+    Ok(branded(crate::response::without_forbidden_body(
+        response, head,
+    )))
 }
 
 /// A request's lines in the access log.

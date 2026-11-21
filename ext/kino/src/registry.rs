@@ -114,6 +114,8 @@ pub struct ServerInner {
     pub bridges_closed: tokio::sync::watch::Sender<crate::hijack::Closed>,
     /// Counted until hyper has taken each bridge's answer; close_bridges waits for them.
     pub bridges_running: Arc<AtomicUsize>,
+    /// Where a crashed worker's requests wait for lane room; set once the I/O runtime is up.
+    pub io_runtime: std::sync::OnceLock<tokio::runtime::Handle>,
 }
 
 /// Relaxed and advisory: the control plane reads them without Ruby.
@@ -252,6 +254,7 @@ impl ServerInner {
             warned: Mutex::default(),
             bridges_closed: tokio::sync::watch::Sender::new(crate::hijack::Closed::Nothing),
             bridges_running: Arc::default(),
+            io_runtime: std::sync::OnceLock::new(),
             config,
         }
     }

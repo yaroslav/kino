@@ -3,6 +3,9 @@
 require "async"
 require "net/http"
 require "socket"
+require "timeout"
+require "tmpdir"
+require_relative "http_response"
 
 module ServerHelper
   # A worker_loop that runs each job as an Async task, `concurrency` at
@@ -58,6 +61,37 @@ module ServerHelper
     socket
   end
 
+  # Write `bytes` on a new connection to `target` (a port, or a unix socket's path), then read
+  # until the server closes it, or until `wait` seconds pass with nothing new.
+  def raw_exchange(target, bytes, wait: 1.0)
+    read = +"".b
+    socket = client_socket(target)
+    socket.write(bytes)
+    while socket.wait_readable(wait)
+      chunk = socket.read_nonblock(65_536, exception: false)
+      break if chunk.nil?
+
+      read << chunk unless chunk == :wait_readable
+    end
+    read
+  rescue Errno::ECONNRESET
+    read
+  ensure
+    socket&.close
+  end
+
+  # One response off `io` (a connection, or a StringIO of what one read), framed by its chunks or
+  # its content-length: [status line, headers (names downcased), body]. Fails unless it is all in
+  # within `within` seconds.
+  def read_response(io, within: WsClient::DEADLINE)
+    Timeout.timeout(within) do
+      status, headers = HttpResponse.head(io)
+      [status, headers, HttpResponse.body(io, headers)]
+    end
+  rescue Timeout::Error
+    raise "no complete response within #{within} s"
+  end
+
   # Run the block with RUBY_MAX_CPU set to `value` (unset when nil), then
   # restore what it was.
   def with_max_cpu(value)
@@ -80,14 +114,17 @@ module ServerHelper
     Kino::Native.retire_slot(id, slot, generation)
   end
 
-  # GET `path` from the server on `port`: the response body, or a failure
-  # naming the path if no answer comes within 5 s. Never retried, so a
-  # request the server loses fails here.
-  def get(port, path)
-    Net::HTTP.start("127.0.0.1", port, read_timeout: 5, max_retries: 0) { |http| http.get(path).body }
+  # GET `path` from the server on `port`, on a connection of its own: the response, or a failure
+  # naming the path unless it comes within `within` seconds. Never retried, so a request the
+  # server loses fails here.
+  def get_response(port, path, within: 5)
+    Net::HTTP.start("127.0.0.1", port, read_timeout: within, max_retries: 0) { |http| http.get(path) }
   rescue Net::ReadTimeout
-    raise "GET #{path} got no answer within 5s"
+    raise "GET #{path} got no answer within #{within}s"
   end
+
+  # The body of #get_response.
+  def get(port, path, **opts) = get_response(port, path, **opts).body
 
   # POST `kib` KiB to `path` as a chunked body, 1 KiB a chunk: the
   # response's status line, or nil once the server dropped the connection.

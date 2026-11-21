@@ -7,13 +7,14 @@
 //! Only one bounded chunk is slept per call: the caller (Kino.sleep in
 //! Ruby) loops, so pending VM interrupts are processed between chunks and
 //! Thread#kill / shutdown stay responsive within one tick.
+//! What one raises comes back as an error from the chunk (gvl::released).
 
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
 use magnus::{Error, Ruby};
 
-use crate::gvl::{self, Ubf};
+use crate::gvl;
 
 /// Sleep up to `seconds` (capped at one interrupt tick), GVL released.
 /// Returns the seconds actually remaining after this chunk (0.0 = done),
@@ -31,7 +32,7 @@ pub fn sleep_chunk(ruby: &Ruby, seconds: f64) -> Result<f64, Error> {
     let deadline = Instant::now() + chunk;
 
     let interrupted = AtomicBool::new(false);
-    gvl::without_gvl(
+    gvl::released(
         || {
             // std::thread::sleep retries on EINTR, so the UBF can't cut a
             // sleep short: the flag is only observed once the chunk ends.
@@ -45,7 +46,7 @@ pub fn sleep_chunk(ruby: &Ruby, seconds: f64) -> Result<f64, Error> {
                 std::thread::sleep(deadline - now);
             }
         },
-        Some(Ubf::interrupt(&interrupted)),
+        Some(&interrupted),
     )?;
 
     let remaining = requested.saturating_sub(chunk);

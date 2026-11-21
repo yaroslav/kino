@@ -303,11 +303,17 @@ server.shutdown               # graceful: drain → deadline → abort straggler
   always counts as "shareable" (classes are), even if calling it touches
   unshareable state. Force `:threaded` for those.
 
-A crash is an exception that is not a `StandardError` (which only fails
-its request). A worker that keeps crashing within a second of
-starting, before it served a request (in `after_worker_boot` too), is
-respawned after a delay doubling from 0.1 s up to 5 s; any other crash
-respawns it at once.
+A crash is an exception that is not a `StandardError` (a `StandardError`
+only fails its request, unless `Thread#raise` sends it into a worker
+waiting for its next request), or a worker thread that ends short of its
+loop's end, `Thread#kill` included. With lanes, the requests waiting for
+a crashed worker go to the other workers as new arrivals, their
+`queue_timeout` starting over, so behind workers that keep crashing a
+client can wait longer than `queue_timeout`. A worker that keeps
+crashing within a second of starting, before it served a request (in
+`after_worker_boot` too), is respawned after a delay doubling from 0.1 s
+up to 5 s; any other crash respawns it at once. More in
+[Failure handling](doc/architecture.md#failure-handling).
 
 ### Sharded I/O
 
@@ -411,11 +417,19 @@ watch `stats[:timeouts]`.
 
 Timeouts guard your app; the network intake guards itself. New
 connections past `max_connections` (default: most of `ulimit -n`) wait
-in the kernel backlog; request bodies past `max_body_size` (default
-50 MB, `nil` delegates to a fronting proxy) get a **413**; and fixed
-deadlines drop slow-header clients (15 s), stalled TLS handshakes
-(10 s), and uploads stalled mid-body (30 s). When a worker catches an
-app or delivery error,
+in the kernel's accept queue, as long a queue as the kernel allows
+([more](doc/architecture.md#backpressure-in-both-directions)); request
+bodies past `max_body_size` (default 50 MB, `nil` delegates to a
+fronting proxy) get a **413**; and fixed deadlines drop a client whose
+first bytes are not in 15 s after it connected (with HTTP/2, the whole
+preface), or whose request head is not whole 15 s after it began,
+stalled TLS handshakes (10 s), uploads stalled mid-body (30 s), and an
+HTTP/2 peer that leaves a ping unanswered (see
+[Intake deadlines](doc/architecture.md#intake-deadlines)). A client that
+ends its side of the connection once its request is sent is taken as
+gone, as nginx takes it.
+
+When a worker catches an app or delivery error,
 `on_error ->(error, env) { ErrorTracker.capture(error) }` is called
 after the client got its 500—the only place a tracker sees errors
 raised while the response was being written (in `:ractor` mode, build

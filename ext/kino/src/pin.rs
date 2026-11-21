@@ -215,7 +215,7 @@ pub fn pinned_bytes(slab: &Arc<PinSlab>, body: RString) -> Option<Bytes> {
     // rules out an embedded buffer, so ptr is a stable heap allocation.
     let (ptr, len) = unsafe {
         (
-            rb_sys::macros::RSTRING_PTR(tmp) as *const u8,
+            rb_sys::macros::RSTRING_PTR(tmp).cast::<u8>(),
             rb_sys::macros::RSTRING_LEN(tmp) as usize,
         )
     };

@@ -50,6 +50,23 @@ RSpec.describe "HTTP basics" do
     end
   end
 
+  each_mode do |mode|
+    it "takes SERVER_PORT for a Host without a port from the server it reached, of two in one process" do
+      echo_host = Ractor.shareable_proc do |env|
+        [200, {"content-type" => "text/plain"}, ["#{env["SERVER_NAME"]}:#{env["SERVER_PORT"]}"]]
+      end
+
+      with_server(echo_host, mode: mode) do |host, first|
+        with_server(echo_host, mode: mode) do |_, second|
+          answers = [first, second, first].map do |port|
+            Net::HTTP.new(host, port).get("/", {"Host" => "portless.example"}).body
+          end
+          expect(answers).to eq([first, second, first].map { "portless.example:#{it}" })
+        end
+      end
+    end
+  end
+
   it "interns low-cardinality header values as frozen strings" do
     echo = lambda do |env|
       ua = env["HTTP_USER_AGENT"]

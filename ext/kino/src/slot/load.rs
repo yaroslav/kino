@@ -1,7 +1,7 @@
 //! What a slot's worker is serving.
 
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
-use std::sync::{Arc, Weak};
+use std::sync::Arc;
 
 use parking_lot::Mutex;
 
@@ -10,13 +10,14 @@ use crate::response::Responder;
 /// Load::holding for an item that is not an admitted request: no responder lives there.
 pub const HOLDING_ITEM: usize = 1;
 
-/// What the supervisor 500s if the worker dies.
-type Current = smallvec::SmallVec<[Weak<Responder>; 8]>;
+/// What the supervisor 500s if the worker dies, or its next take if it let go of one unanswered.
+type Current = smallvec::SmallVec<[Arc<Responder>; 8]>;
 
 /// Relaxed, advisory. in_flight counts a socket callback or wake hook too (a worker_loop
 /// worker's: its open requests); last_started_us drives wedge reporting and steers dispatch
 /// off a slow item.
 #[derive(Default)]
+#[repr(align(128))]
 pub struct Load {
     /// A batch may hold several.
     pub current: Mutex<Current>,
@@ -38,21 +39,31 @@ impl Load {
         now
     }
 
-    /// A request joins what the worker serves, counted in under the list's lock, as `answered`
-    /// reads it.
+    /// A request joins what the worker serves at `now`, a clock read the caller made, counted
+    /// in under the list's lock, as `answered` reads it.
     #[inline]
-    pub fn admit(&self, responder: &Arc<Responder>) {
+    pub fn admit(&self, responder: &Arc<Responder>, now: std::time::Instant) {
         self.served.fetch_add(1, Ordering::Relaxed);
-        self.started();
+        let now = crate::mono::us_at(now);
+        self.last_started_us.store(now, Ordering::Relaxed);
         let mut current = self.current.lock();
-        current.push(Arc::downgrade(responder));
+        current.push(responder.clone());
         self.in_flight.fetch_add(1, Ordering::Relaxed);
     }
 
-    /// The worker came back for its next take: the previous batch is fully answered.
+    /// A classic worker comes back for its next take, or a worker leaves its slot: what is listed
+    /// unanswered is answered now (Responder::let_go), as nothing it started still runs.
+    pub fn let_go(&self) {
+        for responder in self.current.lock().drain(..) {
+            responder.let_go();
+        }
+    }
+
+    /// The worker came back for its next take: the previous batch is fully answered, what it
+    /// left unanswered first (let_go).
     #[inline]
     pub fn idle(&self) {
-        self.current.lock().clear();
+        self.let_go();
         self.in_flight.store(0, Ordering::Relaxed);
     }
 
@@ -68,6 +79,12 @@ impl Load {
     #[inline]
     pub fn last_started(&self) -> u64 {
         self.last_started_us.load(Ordering::Relaxed)
+    }
+
+    /// A dead worker holds nothing: no phantom busy worker in the stats.
+    pub fn clear(&self) {
+        self.in_flight.store(0, Ordering::Relaxed);
+        self.last_started_us.store(0, Ordering::Relaxed);
     }
 
     /// When its current work started (mono us); None while nothing is in flight.
@@ -162,7 +179,7 @@ impl Load {
 
     /// Under the list's lock, which admit counts a request in under too.
     fn count_open(&self, current: &mut Current) {
-        current.retain(|responder| responder.upgrade().is_some_and(|r| r.open()));
+        current.retain(|responder| responder.open());
         self.in_flight.store(current.len(), Ordering::Relaxed);
     }
 

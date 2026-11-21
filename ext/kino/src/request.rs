@@ -14,6 +14,7 @@ use magnus::{Error, RArray, RHash, RString, Ruby, Value};
 
 use crate::doorbell::Doorbell;
 use crate::env_strings::{self, EnvStrings};
+use crate::framing::Bodiless;
 use crate::gvl;
 use crate::pin::PinSlab;
 use crate::response::{full_body, BodyFrame, Cut, FrameResult, Responder};
@@ -525,20 +526,23 @@ fn set_headers_env(ruby: &Ruby, env: RHash, s: &EnvStrings, ctx: &RequestCtx) ->
 fn set_server_env(ruby: &Ruby, env: RHash, ctx: &RequestCtx) -> Result<(), Error> {
     if let Some(authority) = ctx.uri.authority() {
         let local_port = ctx.peer.local.port();
-        env_strings::set_authority_env(ruby, env, authority.as_str(), || {
-            (
-                authority.host().to_string(),
-                authority.port_u16().unwrap_or(local_port),
-            )
+        let port = authority.port_u16();
+        let key = host_key(authority.as_str().as_bytes(), port.is_some(), local_port);
+        env_strings::set_authority_env(ruby, env, &key, authority.as_str(), || {
+            (authority.host().to_string(), port.unwrap_or(local_port))
         })?;
     } else {
         match ctx.headers.get(http::header::HOST) {
             Some(host) => {
                 let local_port = ctx.peer.local.port();
+                let names_port = std::str::from_utf8(host.as_bytes())
+                    .ok()
+                    .and_then(named_port)
+                    .is_some();
                 env_strings::set_host_env(
                     ruby,
                     env,
-                    host.as_bytes(),
+                    &host_key(host.as_bytes(), names_port, local_port),
                     || match std::str::from_utf8(host.as_bytes()) {
                         Ok(h) => split_host_port(h, local_port),
                         Err(_) => (
@@ -630,14 +634,41 @@ pub fn respond_simple(
 ) -> Result<bool, Error> {
     request.decline_upgrade();
     let ctx = request.0.borrow();
-    let builder = timed(&ctx, build_head(status, headers)?);
-    let bytes = body_bytes(&ctx.pin_slab, body);
+    let mut builder = timed(&ctx, build_head(status, headers)?);
+    let bytes = if frame_by_length(&mut builder, status, &ctx.method, body.len()) {
+        body_bytes(&ctx.pin_slab, body)
+    } else {
+        Bytes::new()
+    };
     let response = builder
         .body(full_body(bytes))
         .map_err(|e| invalid_response(ruby, e))?;
     let sent = ctx.responder.send_response(response);
     ctx.answered();
     Ok(sent)
+}
+
+/// A buffered answer is framed by its body: hyper trusts a
+/// Content-Length it is given, so the app's is dropped (a wrong one would misframe what follows),
+/// as is its Transfer-Encoding (beside a length, hyper ends the connection unanswered). A HEAD
+/// sends no body (over h2 it would go as DATA) and keeps the app's first Content-Length, else its
+/// body's (`len`) unless 304; a 304 to another method, a 1xx and a 204 send none either. True
+/// when the body goes out.
+pub(crate) fn frame_by_length(
+    builder: &mut hyper::http::response::Builder,
+    status: u16,
+    method: &http::Method,
+    len: usize,
+) -> bool {
+    let bodiless = Bodiless::of(status, *method == http::Method::HEAD);
+    if let Some(headers) = builder.headers_mut() {
+        headers.remove(http::header::TRANSFER_ENCODING);
+        match bodiless {
+            None => drop(headers.remove(http::header::CONTENT_LENGTH)),
+            Some(bodiless) => bodiless.settle(headers, len),
+        }
+    }
+    bodiless.is_none()
 }
 
 /// Body bytes for hyper: large bodies are pinned in place (zero-copy),
@@ -800,10 +831,11 @@ impl Request {
         rb_self.decline_upgrade();
         let ctx = rb_self.0.borrow();
         let builder = timed(&ctx, build_head(status, headers)?);
-        let bodiless = crate::framing::bodiless(status, ctx.method == http::Method::HEAD);
-        ctx.responder
-            .send_stream_head(builder, bodiless)
-            .map_err(|e| invalid_response(ruby, e))
+        let sent = match Bodiless::of(status, ctx.method == http::Method::HEAD) {
+            Some(bodiless) => ctx.responder.send_bodiless_head(builder, bodiless),
+            None => ctx.responder.send_stream_head(builder),
+        };
+        sent.map_err(|e| invalid_response(ruby, e))
     }
 
     /// One body chunk. Blocks (GVL released) when the client is slower than
@@ -931,13 +963,35 @@ fn coerce_str(value: Value) -> Result<RString, Error> {
 }
 
 pub(crate) fn split_host_port(host: &str, default_port: u16) -> (String, u16) {
-    match host.rsplit_once(':') {
-        Some((name, port)) if !name.is_empty() => match port.parse() {
-            Ok(p) => (name.to_string(), p),
-            Err(_) => (host.to_string(), default_port),
-        },
-        _ => (host.to_string(), default_port),
+    match named_port(host) {
+        Some((name, port)) => (name.to_string(), port),
+        None => (host.to_string(), default_port),
     }
+}
+
+/// `host`'s name and port, when it ends in a colon and a port that parses.
+pub(crate) fn named_port(host: &str) -> Option<(&str, u16)> {
+    match host.rsplit_once(':') {
+        Some((name, port)) if !name.is_empty() => port.parse().ok().map(|port| (name, port)),
+        _ => None,
+    }
+}
+
+/// The host cache's key for `host` (a Host header or an authority) on a connection to
+/// `local_port`: the bytes alone when they name a port, else the bytes, a NUL and that port, as
+/// it becomes SERVER_PORT and a process may serve a host on several ports. Up to 256 bytes stay
+/// on the stack.
+pub(crate) fn host_key(
+    host: &[u8],
+    names_port: bool,
+    local_port: u16,
+) -> smallvec::SmallVec<[u8; 256]> {
+    let mut key = smallvec::SmallVec::from_slice(host);
+    if !names_port {
+        key.push(0);
+        key.extend_from_slice(&local_port.to_be_bytes());
+    }
+    key
 }
 
 /// A minimal ctx for pure-Rust tests (no Ruby involved). Dropping it

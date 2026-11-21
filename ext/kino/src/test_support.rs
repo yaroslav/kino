@@ -1,5 +1,5 @@
 //! Test-only natives proving the Phase 0 primitives: blocking channel takes
-//! under `without_gvl`, UBF interruptibility, and ractor-safe method calls.
+//! under `released`, UBF interruptibility, and ractor-safe method calls.
 //! Exposed as `Kino::Native::_test_*`; not part of the public API.
 
 use std::collections::HashMap;
@@ -82,7 +82,7 @@ pub fn take(ruby: &magnus::Ruby, id: u64) -> Result<Option<String>, magnus::Erro
 pub fn panic_in_release() -> Result<(), magnus::Error> {
     let hook = std::panic::take_hook();
     std::panic::set_hook(Box::new(|_| {}));
-    let result = gvl::without_gvl(|| panic!("intentional test panic"), None);
+    let result = gvl::released(|| panic!("intentional test panic"), None);
     std::panic::set_hook(hook);
     result
 }
@@ -107,7 +107,7 @@ pub fn env_probe(
     user_agent: String,
 ) -> Result<magnus::RHash, magnus::Error> {
     use crate::env_strings;
-    use crate::request::split_host_port;
+    use crate::request::{host_key, named_port, split_host_port};
 
     let ip: std::net::IpAddr = ip.parse().map_err(|e| {
         magnus::Error::new(ruby.exception_arg_error(), format!("bad ip {ip:?}: {e}"))
@@ -116,10 +116,14 @@ pub fn env_probe(
     env_strings::set_addr_env(ruby, env, ip)?;
     match &authority {
         Some(authority) => {
-            env_strings::set_authority_env(ruby, env, authority, || split_host_port(authority, 80))?
+            let key = host_key(authority.as_bytes(), named_port(authority).is_some(), 80);
+            env_strings::set_authority_env(ruby, env, &key, authority, || {
+                split_host_port(authority, 80)
+            })?
         }
         None => {
-            env_strings::set_host_env(ruby, env, host.as_bytes(), || split_host_port(&host, 80))?
+            let key = host_key(host.as_bytes(), named_port(&host).is_some(), 80);
+            env_strings::set_host_env(ruby, env, &key, || split_host_port(&host, 80))?
         }
     }
     let strings = env_strings::get();

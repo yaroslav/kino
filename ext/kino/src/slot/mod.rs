@@ -4,10 +4,10 @@
 //! (life.rs).
 
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::{Arc, Weak};
+use std::sync::Arc;
 
 use crate::doorbell::Doorbell;
-use crate::registry::LaneItem;
+use crate::registry::{BoxedCtx, LaneItem, ServerInner};
 use crate::response::{Cut, Responder};
 
 mod lane;
@@ -29,6 +29,9 @@ pub const WS_INBOX: usize = 1024;
 /// A held lane lock: retire, quarantine and recycle check the generation under it.
 type LaneGuard<'a> = parking_lot::MutexGuard<'a, Option<flume::Sender<LaneItem>>>;
 
+/// Park, Load, Life, the lane lock and the Arc's count sit on cache lines of their own (128
+/// bytes): dispatch locks the lane and reads Park and Load for every request while
+/// the worker writes them, and a field added anywhere moves none of them onto another's line.
 #[derive(Default)]
 pub struct WorkerSlot {
     pub lane: Lane,
@@ -187,12 +190,14 @@ impl WorkerSlot {
     }
 
     /// Hand the slot to a new worker once quiet: no socket of the last worker counts on it,
-    /// no hijacked connection is open, and it is not quarantined (its worker may come back).
+    /// no hijacked connection is open, its last worker's handle let go (Life::holder),
+    /// and it is not quarantined (its worker may come back).
     /// Slots are never removed. Returns the new generation.
     pub fn recycle(&self) -> Option<u64> {
         let lane = self.lane.tx.lock();
         let quiet = self.sockets.open() == 0
             && self.hijacked.load(Ordering::SeqCst) == 0
+            && !self.life.is_held()
             && !self.life.quarantined.load(Ordering::SeqCst);
         if !quiet {
             return None;
@@ -202,53 +207,66 @@ impl WorkerSlot {
         Some(self.generation())
     }
 
-    /// 500 or cut (for `why`) what the worker was serving, and retire the slot.
-    pub fn abort(&self, why: Cut) {
-        for weak in self.load.current.lock().drain(..) {
-            if let Some(responder) = weak.upgrade() {
-                responder.close_bells();
-                responder.give_up(why);
-            }
+    /// Retire the slot first, so dispatch does not pick the dead worker, then 500 or cut (for
+    /// `why`) what it was serving. Out come the requests that waited in its lane.
+    pub fn abort(&self, why: Cut) -> Vec<BoxedCtx> {
+        self.retire_dead();
+        for responder in self.load.current.lock().drain(..) {
+            responder.close_bells();
+            responder.give_up(why);
         }
-        self.abandon();
+        self.clear_dead()
     }
 
     /// The worker may still run, so its requests stay listed for interrupt_all_workers.
+    /// Its lane's requests get their 500 as they drop.
     pub fn abort_held(&self) {
-        for responder in self.load.current.lock().iter().filter_map(Weak::upgrade) {
+        for responder in self.load.current.lock().iter() {
             responder.give_up(Cut::Shutdown);
         }
         self.interrupt();
-        self.abandon();
+        self.retire_dead();
+        drop(self.clear_dead());
     }
 
-    fn abandon(&self) {
-        // A dead worker holds nothing: no phantom busy worker in the stats.
-        self.load.in_flight.store(0, Ordering::Relaxed);
-        self.load.last_started_us.store(0, Ordering::Relaxed);
-        // Retired under the lane lock as in retire_at, so dispatch stops; dropping what is
-        // queued fires the Drop-500 backstop. The lane stays for the slot's next worker.
+    /// Retired under the lane lock as in retire_at, so dispatch does not reach the dead worker;
+    /// the lane and a worker_loop doorbell stay for the slot's next worker.
+    fn retire_dead(&self) {
         {
             let _lane = self.lane.tx.lock();
             self.life.retired.store(true, Ordering::SeqCst);
         }
         self.lane.ring_doorbell();
         self.park.parked.store(true, Ordering::Relaxed);
-        if let Some(rx) = self.lane.rx.as_ref() {
-            while rx.try_recv().is_ok() {}
-        }
+    }
+
+    /// What the dead worker left: its sensors reset, its lane's requests out for the caller to
+    /// dispatch again or drop.
+    fn clear_dead(&self) -> Vec<BoxedCtx> {
+        self.load.clear();
+        self.lane.rx.as_ref().map_or_else(Vec::new, |rx| {
+            rx.try_iter()
+                .filter_map(|item| match item {
+                    LaneItem::Request(ctx) => Some(ctx),
+                    LaneItem::Bell => None,
+                })
+                .collect()
+        })
     }
 
     /// Abort, and close its sockets with 1011 (their handlers died with it); how many.
-    pub fn crash(&self) -> usize {
-        self.abort(Cut::Crash);
+    /// Its lane's requests go to the other workers as new arrivals would (dispatch::redispatch).
+    pub fn crash(&self, server: &ServerInner) -> usize {
+        for ctx in self.abort(Cut::Crash) {
+            crate::dispatch::redispatch(server, ctx);
+        }
         crate::ws::give_up_slot(self)
     }
 
     /// Body I/O under a fiber scheduler waits on its requests' bells, rung after the halt.
     pub fn interrupt(&self) {
         self.halt();
-        for responder in self.load.current.lock().iter().filter_map(Weak::upgrade) {
+        for responder in self.load.current.lock().iter() {
             responder.ring_bells();
         }
     }
@@ -285,10 +303,9 @@ impl WorkerSlot {
         self.park.own_run.store(0, Ordering::Relaxed);
         self.park.woke.store(false, Ordering::Relaxed);
         self.load.served.store(0, Ordering::Relaxed);
-        self.load.in_flight.store(0, Ordering::Relaxed);
+        self.load.clear();
         // Until the new worker's serve sets its own, its lane holds LANE_DEPTH.
         self.load.capacity.store(0, Ordering::Relaxed);
-        self.load.last_started_us.store(0, Ordering::Relaxed);
         self.load.holding.store(0, Ordering::Relaxed);
         self.life.drained.lock().take();
     }
@@ -331,7 +348,7 @@ mod tests {
         slot.load.served.store(5, Relaxed);
         slot.load.in_flight.store(1, Relaxed);
         slot.load.last_started_us.store(9, Relaxed);
-        slot.load.current.lock().push(std::sync::Weak::new());
+        slot.load.current.lock().push(Arc::default());
         slot.load.capacity.store(16, Relaxed);
 
         slot.retire();

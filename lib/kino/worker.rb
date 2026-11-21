@@ -92,6 +92,7 @@ module Kino
     # @private
     # The request loop, the same in both modes. At batch 1 a request costs one Hash and about one
     # FFI crossing (respond_and_take_one); batch > 1 trades fairness for fewer crossings.
+    # With no request waiting, the answer's body closes before the worker waits (take_one).
     def self.run(server_id, worker_id, app, batch_size, hooks)
       new(server_id, worker_id, app, batch_size, hooks).run
     end
@@ -113,7 +114,29 @@ module Kino
       @worker = Native.worker(@server_id, @worker_id)
       Thread.current.thread_variable_set(HANDLE, @worker)
       HookFire.fire(@hooks.after_worker_boot, "after_worker_boot", @worker_id)
-      return unless @worker
+      take_until_drained if @worker
+      ended = true
+    ensure
+      # Short of its loop's end the worker crashed, by an exception or a kill no rescue sees.
+      # Nothing waits on a dead worker: its clients get a 500 now, its sockets a 1011.
+      @worker&.crashed unless ended
+      # The worker loop is over: its wakers report false from now on.
+      @worker&.release
+      Thread.current.thread_variable_set(HANDLE, nil)
+      Thread.current.thread_variable_set(HOOK, nil)
+      Thread.current.thread_variable_set(CUSTOM_LOOP, nil)
+    end
+
+    # serve() returns this when the response did NOT ride a fused
+    # respond-and-take (streaming body or app error) and the caller must
+    # take the next request itself, or when nothing waited for a fused take.
+    NOT_FUSED = false
+    private_constant :NOT_FUSED
+
+    private
+
+    # The worker's loop, Kino's or the app's (worker_loop), until its queues close or it retires.
+    def take_until_drained
       if (custom = @hooks.worker_loop)
         served = Loop.new(self, @worker)
         Thread.current.thread_variable_set(CUSTOM_LOOP, served)
@@ -127,25 +150,7 @@ module Kino
         batch = @worker.take_batch(@batch_size)
         batch = process(batch) while batch
       end
-    rescue Exception # rubocop:disable Lint/RescueException -- a crash: clean up, and the pool replaces the worker
-      # Nothing waits on a dead worker: its clients get a 500 now, its sockets a 1011.
-      Native.abort_inflight(@server_id, @worker_id)
-      raise
-    ensure
-      # The worker loop is over: its wakers report false from now on.
-      @worker&.release
-      Thread.current.thread_variable_set(HANDLE, nil)
-      Thread.current.thread_variable_set(HOOK, nil)
-      Thread.current.thread_variable_set(CUSTOM_LOOP, nil)
     end
-
-    # serve() returns this when the response did NOT ride a fused
-    # respond-and-take (streaming body or app error) and the caller must
-    # take the next request itself. Frozen: worker ractors read it.
-    NOT_FUSED = Object.new.freeze
-    private_constant :NOT_FUSED
-
-    private
 
     # Handle one take; returns the next env (fused take) or nil.
     def handle_one(env)
@@ -212,33 +217,27 @@ module Kino
         status, headers, body = @app.call(env)
       end
       if env[RACK_HIJACK_OFFERED]
-        hijacked = serve_hijacked(request, status, headers, body, env)
-        return hijacked if hijacked
+        return NOT_FUSED if serve_hijacked(request, status, headers, body, env)
       end
       if (handler = env[RACK_UPGRADE])
         return NOT_FUSED if serve_upgrade(request, headers, body, handler, env)
       end
 
-      if body.respond_to?(:to_ary)
-        chunks = join_chunks(body.to_ary)
-        if @hooks.after_request_complete
-          # Hook set: do not fuse. Send the complete response, fire the hook
-          # after it is out, then signal the caller to take the next request
-          # separately (so the hook never waits on the next request).
-          request.send_simple(status.to_i, headers, chunks)
-          body.close if body.respond_to?(:close)
-          after_request_complete(env, status.to_i)
-          NOT_FUSED
-        else
-          # No hook: fused fast path, unchanged, zero cost.
-          result = yield(request, status.to_i, headers, chunks)
-          body.close if body.respond_to?(:close)
-          result
+      if body.respond_to?(:to_ary) && !@hooks.after_request_complete
+        # No hook: fused fast path, zero cost (an ensure runs inline). The body closes whatever the
+        # fused call raised; a failed close is reported here, and what the take brought is served.
+        begin
+          yield(request, status.to_i, headers, join_chunks(body.to_ary))
+        ensure
+          begin
+            body.close if body.respond_to?(:close)
+          rescue => e
+            Log.exception(e, env)
+            HookFire.fire(@hooks.on_error, "on_error", e, env)
+          end
         end
       else
-        deliver_streaming(request, status.to_i, headers, body, env[RACK_INPUT])
-        after_request_complete(env, status.to_i)
-        NOT_FUSED
+        deliver_unfused(request, status.to_i, headers, body, env)
       end
     rescue => e
       # Abort before the hook: the client's 500 must never wait on a
@@ -252,12 +251,26 @@ module Kino
       NOT_FUSED
     end
 
-    # What an app offered rack.hijack did with it: NOT_FUSED once it took the connection over,
-    # in full or with a callable; nil when it answers as any other request.
+    # A complete answer sent apart from the take (a hook is set, which never waits on the next
+    # request), or a streamed one.
+    def deliver_unfused(request, status, headers, body, env)
+      closing_reported(body, request, env) do
+        if body.respond_to?(:to_ary)
+          request.send_simple(status, headers, join_chunks(body.to_ary))
+        else
+          deliver_streaming(request, status, headers, body, env[RACK_INPUT])
+        end
+      end
+      after_request_complete(env, status)
+      NOT_FUSED
+    end
+
+    # What an app offered rack.hijack did with it: true once it took the connection over, in full
+    # or with a callable; nil when it answers as any other request.
     def serve_hijacked(request, status, headers, body, env)
       # Taken over with rack.hijack: the app answers on the connection, and its triple is
       # ignored (Rack 3). The body still closes: middleware cleans up there.
-      return closing(body) { NOT_FUSED } if request.hijacked?
+      return closing(body) { true } if request.hijacked?
       partial = headers&.[](RACK_HIJACK)
       if status.to_i == 101 && (partial || (!env[RACK_UPGRADE] && streaming_body?(body)))
         closing(body) { switch_hijacked(request, headers, partial || body, body, env) }
@@ -304,7 +317,7 @@ module Kino
     def hijack_partially(request, status, headers, callable, env)
       deliver_streaming(request, status.to_i, headers.except(RACK_HIJACK), callable, env[RACK_INPUT])
       after_request_complete(env, status.to_i)
-      NOT_FUSED
+      true
     end
 
     # A 101 with a callable (a partial hijack, or a Rack 3 streaming body): the callable gets
@@ -320,7 +333,7 @@ module Kino
       end
       io.close if callable.equal?(body) && !io.closed?
       after_request_complete(env, 101)
-      NOT_FUSED
+      true
     end
 
     # Runs the block, if any, then closes `body` however it ended.
@@ -328,6 +341,22 @@ module Kino
       yield if block_given?
     ensure
       body.close if body.respond_to?(:close)
+    end
+
+    # The block, then `body` closed however it ended. A failed close raises into serve's rescue
+    # after a block that returned; after one that raised, it is reported here, its 500 first.
+    def closing_reported(body, request, env)
+      yield
+      done = true
+    ensure
+      begin
+        body.close if body.respond_to?(:close)
+      rescue => e
+        raise if done
+        request.abort
+        Log.exception(e, env)
+        HookFire.fire(@hooks.on_error, "on_error", e, env)
+      end
     end
 
     def streaming_body?(body) = body.respond_to?(:call) && !body.respond_to?(:each)
@@ -338,6 +367,7 @@ module Kino
       "the hook will never run"
     private_constant :UPGRADE_WARNING, :WAKE_WARNING
 
+    # Sends the head, then what `body` streams; closing the body is its caller's (Rack).
     def deliver_streaming(request, status, headers, body, input)
       request.send_headers(status, headers)
       if streaming_body?(body)
@@ -358,10 +388,8 @@ module Kino
         # finish only on success: a body that raised must abort the
         # connection (serve's rescue), not fake a clean end of stream that
         # the client cannot tell from a complete response.
-        closing(body) do
-          body.each { |chunk| request.write_all(chunk) }
-          request.finish
-        end
+        body.each { |chunk| request.write_all(chunk) }
+        request.finish
       end
     rescue ClientGone
       # The client left mid-stream: the request is over, and nothing failed.

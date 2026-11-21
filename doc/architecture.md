@@ -143,8 +143,9 @@ and the 99th percentile falls from 56 to 3 ms.
   worker ractor by the take calls (`take_one`/`take_batch`), so its
   ownership is correct by construction.
 - **Blocking discipline:** every blocking native call releases the GVL
-  through `rb_thread_call_without_gvl` or its `_gvl2` variant (rb-sys;
-  magnus doesn't wrap them) so a blocked worker holds no VM lock. Waits
+  through `rb_thread_call_without_gvl2` (rb-sys; magnus doesn't wrap it,
+  and a lint bars every other release or pass of the GVL, which would
+  raise past Rust frames) so a blocked worker holds no VM lock. Waits
   poll an atomic interrupt flag between bounded `recv_timeout` ticks;
   the unblock function (UBF) just sets the flag. A worker waiting for
   its next request, and a request waiting on its client (a body read, a
@@ -170,6 +171,22 @@ and the 99th percentile falls from 56 to 3 ms.
   with `try_recv` while still holding the GVL—the release/reacquire pair
   (two scheduler round-trips) is skipped entirely. Under load this is the
   common case.
+- **Passing the GVL:** where worker threads share a GVL (every worker in
+  `:threaded` mode, a Ractor's `threads` past one), a worker that keeps
+  finding work would hold it until Ruby's 100 ms timer preempts it, most
+  often mid-request; under a backlog that request then waits for every
+  other worker's 100 ms (2.3 s with 8 × 3 threads), and a request handed
+  to a parked worker waits as long. So between two items a worker passes
+  the GVL, as `Thread.pass` does, once it has held it for 1 ms (2 or 5 ms
+  cost more throughput, for a longer wait); with no thread waiting, the
+  pass returns at once. A take judges the hold at its last item's start,
+  a clock read the slot already keeps (one of its own cost 1-2.5% of
+  throughput), so a worker holds the GVL for 1 ms plus an item, a batch
+  passes only before it, and a take that rides an answer takes nothing
+  when a pass is due, so the answered body closes first. A `worker_loop`
+  reads the clock, and its hold runs from its last pass: its scheduler's
+  waits go unseen, so after one it may pass at once and wait a round of
+  the line.
 - **Fused crossing:** the common complete-body response rides
   `respond_and_take_one`: answer the previous request and take the next in
   one FFI call, ~one crossing per request once the loop is warm. The env
@@ -260,6 +277,20 @@ fails as interrupted, and what already waits is rung.
 
 ## Backpressure, in both directions
 
+- The kernel's accept queue, ahead of all of Kino's own. The client
+  listener (TCP or unix) asks for the largest backlog there is, which
+  the kernel clamps, as Kino listens, to `net.core.somaxconn` on Linux
+  (4096 by default since 5.4; a container's own counts) or
+  `kern.ipc.somaxconn` on macOS (128), where Rust's standard library
+  alone would leave 128 and Linux would drop the SYNs of a connect
+  burst past it, their clients retrying a second later. While Kino is
+  not accepting (at `max_connections`, or with its accept loop held up),
+  up to that many clients finish their handshake and wait: overload
+  shows as a slow first byte rather than a slow connect, a health check
+  that only opens a TCP connection passes for longer, and the drain
+  resets every connection still in the queue. The control plane's TCP
+  listener keeps a queue of 128, so a probe of a stuck control thread
+  fails at connect.
 - Bounded request queue between tokio and Ruby. When it stays full past
   `queue_timeout`, the client gets an immediate 503 rather than waiting.
 - Request bodies stream through a bounded(8) channel: hyper is only polled
@@ -291,26 +322,37 @@ first-claimant-wins flag on the per-request `Responder`:
 1. The app, via the worker loop (normal path; `StandardError` is rescued
    in Ruby and becomes a clean 500).
 2. The crash path: a worker thread that dies of a hard crash (any
-   `Exception`) 500s its in-flight requests on its way out, via a
-   `Weak<Responder>` side table—not when GC eventually notices—and
-   closes its WebSockets with 1011. Then it is replaced on a slot from
-   the pool's bank while its siblings serve on: in `:threaded` mode by
-   the pool, in `:ractor` mode by its ractor's main thread, which asks
-   the ractor's supervisor thread (on the main ractor) for the slot. The
-   supervisor reads those reports and `Ractor#monitor`'s end notice
-   from one port (a report has a class of its own: the notice is a
-   Symbol up to Ruby 4.0 and an Array from 4.1), and respawns a ractor
-   that dies as a whole. A worker that keeps crashing within a second
-   of starting, before it served a request, is respawned with a
-   doubling delay (0.1 s up to 5 s), each thread paced by its own
-   crashes.
+   `Exception`, a `StandardError` that `Thread#raise` sends into it
+   while it waits for its next request, or its thread killed, which
+   no rescue sees but its loop's `ensure` does) 500s its in-flight
+   requests on its way out, via the
+   slot's in-flight list—not when GC eventually notices—and closes
+   its WebSockets with 1011. The requests that waited in its lane go to the
+   other workers' lanes, or, with no room in any, wait for some on the
+   I/O runtime as a new arrival does (up to `queue_timeout`, then the
+   503 a new arrival gets, counted in `rejected`). That wait starts
+   `queue_timeout` over, by design, so behind workers that keep crashing
+   a client can wait longer than `queue_timeout`. Only the threads Kino
+   kills itself, past the shutdown deadline, and those the process kills
+   as it exits, end no crash. Then it is replaced on a slot from the
+   pool's bank while its siblings serve on: in `:threaded` mode by the
+   pool, in `:ractor` mode by its ractor's main thread, which asks the
+   ractor's supervisor thread (on the main ractor) for the slot. The
+   supervisor reads those reports and `Ractor#monitor`'s end notice from
+   one port (a report has a class of its own: the notice is a Symbol up
+   to Ruby 4.0 and an Array from 4.1), and respawns a ractor that dies
+   as a whole. A worker that keeps crashing within a second of starting,
+   before it served a request, is respawned with a doubling delay (0.1 s
+   up to 5 s), each thread paced by its own crashes.
 
    A crashed worker's slot is retired under its lane lock (the
    dispatcher skips it) and goes back to the bank, which hands it to a
    later worker only once it is quiet: no socket still owed its close,
-   no hijacked connection open, not quarantined. Crashes therefore do
-   not grow the slot table, and with lanes a request that arrives while
-   the replacement starts waits for a worker. Each slot carries a
+   no hijacked connection open, its last worker's handle let go of it
+   (so a late end never touches its successor), not quarantined. Crashes
+   therefore do not grow the slot table, and with lanes a request that
+   arrives while the replacement starts waits for a worker, up to
+   `queue_timeout`. Each slot carries a
    generation that moves on whenever a worker leaves it, and a waker, a
    retirement or a quarantine names the generation it meant, so none of
    them can reach the worker that took the slot over.
@@ -358,23 +400,96 @@ blocked at exit (an event loop and a thread feeding it), or a worker
 Ractor is still stuck past the deadline. Ending such app loops in an
 `at_exit` hook avoids it.
 
+## Unix sockets
+
+A `unix://` bind, the client listener's or the control plane's, tells a
+live socket from a stale one by a connect that never waits. One that is
+answered, or on Linux turned away by a full accept queue, refuses the
+boot with "socket is in use"; one that is refused means a crashed
+server left the file, which is unlinked and bound over. A path that
+holds anything but a socket is refused, never unlinked. Shutdown removes
+the socket file.
+
+Nothing locks the path, which leaves two limits. On macOS a connect to
+a full accept queue is refused as one to a stale file is, so a second
+server booted on the path of a live one whose queue is full takes the
+path over (on Linux it is refused). And two servers booted at the same
+instant on a stale path may both bind it, the first left serving a
+socket no path names. A `pidfile` the two share refuses the second boot
+in both cases.
+
+## Intake deadlines
+
+Before hyper serves a connection, Kino waits for enough of its client's
+first bytes for hyper to choose a codec, as hyper-util's version sniff
+has no timer: it waits for good on a connection that sends nothing, or
+stops inside the 24-byte h2 preface. On TCP and unix connections that is
+a nonblocking `recv` with `MSG_PEEK` of up to 24 bytes, enough once they
+part from the preface (HTTP/1) or hold all of it (h2), or once the
+connection ends. It is due 15 s after the accept, and past that the
+connection closes unanswered (no 408), as at hyper's header timeout;
+once the drain begins it closes at once unless enough is there. Then
+hyper's own timer gives the head 15 s from when hyper starts reading it,
+so a head is whole at most 30 s after the accept. That holds with
+`http2 false` too, where the wait is what lets the drain close a fresh
+connection at once: hyper's HTTP/1 codec keeps one to its header timeout.
+
+A TLS handshake is due 10 s after the accept, and one whose client has
+sent nothing closes at the drain. Then Kino serves the codec the client
+chose by ALPN, with no sniff: for `http/1.1` the first byte is due 15 s
+after the accept; for `h2`, whose codec has no preface timer either,
+Kino reads the 24-byte preface itself within those 15 s and replays it.
+Without ALPN it reads until the bytes tell HTTP/1 from h2. With
+`http2 false` only HTTP/1 is offered. A client must speak what it
+negotiated: the codec ends one that chose h2 and sends HTTP/1, or the
+reverse, serving it nothing.
+
+A connection whose first bytes are in by the accept, as they mostly
+are, pays one peek; one whose are not pays a timer and the readiness
+wait hyper's first read would have made. Once hyper serves an h2
+connection, the pings under [HTTP/2](#http2) take over.
+
+A client that ends its side (a FIN, `shutdown(SHUT_WR)`) once its
+request is sent is taken as gone, as nginx takes one (its 499): hyper's
+HTTP/1 codecs keep half-close off, so an end read while a request is
+served closes the connection unanswered and drops the request's future,
+and a request still waiting for room in the queue or a lane leaves it.
+One already queued runs, and its answer goes nowhere; an answer written
+before hyper reads the end still goes out. A connection that ends
+before a whole request closes at once with no app call.
+
 ## HTTP/2
 
-One connection builder serves every protocol: hyper-util's auto builder
-picks h2 by ALPN on TLS connections, by the 24-byte preface sniff on
-plaintext (prior-knowledge h2c), and HTTP/1.x otherwise; `http2 false`
-pins the HTTP/1 codec and skips the sniff entirely. Streams multiplex
-into the same bounded queue as keep-alive requests, so h2 concurrency
-is bounded by workers × threads exactly as h1's is, and the bounded
-body channels give per-stream backpressure for free: while the
-forwarder blocks, hyper withholds WINDOW_UPDATE and the client stalls.
+Plaintext connections go through hyper-util's auto builder, which picks
+h2 by the 24-byte preface sniff (prior-knowledge h2c) and HTTP/1.x
+otherwise; TLS connections get the codec ALPN chose,
+or without ALPN the one the preface tells (see
+[Intake deadlines](#intake-deadlines)); `http2 false` pins the HTTP/1
+codec and skips the sniff entirely. Streams multiplex into the same
+bounded queue as keep-alive requests, so h2 concurrency is bounded by
+workers × threads exactly as h1's is, and the bounded body channels give
+per-stream backpressure for free: while the forwarder blocks, hyper
+withholds WINDOW_UPDATE and the client stalls.
+
+**Pings.** hyper's h2 side has no idle timer, so a peer that is gone (a
+phone off the network, a dropped NAT mapping) would hold its connection
+and its `max_connections` permit for good. Kino turns on hyper's
+keep-alive: a connection that has sent no request and no request body
+for 30 s gets a PING, and one that leaves it unanswered for 20 s is
+closed, its open streams with it, during a drain too. A client that
+answers keeps its connection, with or without a stream open: unlike an
+idle HTTP/1 connection, which hyper closes at its 15 s header deadline,
+an idle HTTP/2 one stays as long as its client likes, bounded by
+`max_connections` or by a fronting proxy's own idle timeout.
 
 The env bridge fills SERVER_NAME/SERVER_PORT/HTTP_HOST from the request
 URI's `:authority` (h2 requests carry no Host header), through the same
-host LRU the Host-header path uses, keyed by the authority bytes;
-SERVER_PROTOCOL is the interned "HTTP/2". h2 trailer frames are dropped
-(Rack has no trailer surface), and the h2 codec itself rejects
-connection-ish headers before they can reach the env.
+host LRU the Host-header path uses, keyed by the authority bytes and,
+when they name no port, the local port, which becomes SERVER_PORT (a
+process may serve a host on several ports); SERVER_PROTOCOL is the
+interned "HTTP/2". h2 trailer frames are dropped (Rack has no trailer
+surface), and the h2 codec itself rejects connection-ish headers before
+they can reach the env.
 
 The upload path needed one h2-shaped fix: `read_body` drains every
 already-queued chunk in a single native call (one GVL round-trip and

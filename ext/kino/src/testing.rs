@@ -295,6 +295,18 @@ pub async fn connect(server: &Arc<ServerInner>) -> SendRequest<Full<Bytes>> {
     sender
 }
 
+/// A prior-knowledge HTTP/2 client on `io`: hyper's, which answers the server's PINGs.
+pub async fn h2_client(
+    io: tokio::io::DuplexStream,
+) -> hyper::client::conn::http2::SendRequest<Full<Bytes>> {
+    let executor = hyper_util::rt::TokioExecutor::new();
+    let (sender, conn) = hyper::client::conn::http2::handshake(executor, TokioIo::new(io))
+        .await
+        .expect("h2 handshake");
+    tokio::spawn(conn);
+    sender
+}
+
 /// A client sends `request` on a connection of its own.
 pub async fn send(server: &Arc<ServerInner>, request: hyper::Request<Full<Bytes>>) -> Pending {
     let mut sender = connect(server).await;
@@ -339,4 +351,42 @@ pub async fn read_to_close(io: &mut (impl AsyncRead + Unpin + ?Sized), what: &st
         .unwrap_or_else(|_| panic!("{what}: still open after 5s"))
         .unwrap_or_else(|e| panic!("{what}: {e}"));
     bytes
+}
+
+/// A max_connections permit of a connection's own, for a test that does
+/// not count them.
+pub fn permit() -> tokio::sync::OwnedSemaphorePermit {
+    let permits = Arc::new(tokio::sync::Semaphore::new(1));
+    permits.try_acquire_owned().expect("a permit")
+}
+
+/// `scenario` on a runtime of its own, which must finish `within`, as
+/// the calling thread's clock tells: a task that spins a worker then
+/// fails the test, where the runtime's timers could stall (the other
+/// worker asleep, none driving them), and dropping it would wait on the
+/// spinning thread for good.
+pub fn on_own_runtime(
+    what: impl Display,
+    within: Duration,
+    scenario: impl std::future::Future<Output = ()> + Send + 'static,
+) {
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(2)
+        .enable_all()
+        .build()
+        .expect("a runtime");
+    let scenario = runtime.spawn(scenario);
+    let deadline = std::time::Instant::now() + within;
+    while !scenario.is_finished() && std::time::Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    if !scenario.is_finished() {
+        runtime.shutdown_background();
+        panic!("{what}: not done {within:?} on");
+    }
+    let done = runtime.block_on(scenario);
+    runtime.shutdown_background();
+    if let Err(failed) = done {
+        std::panic::resume_unwind(failed.into_panic());
+    }
 }

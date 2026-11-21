@@ -9,6 +9,9 @@ module Kino
   #
   # The :ractor-mode Pool.
   class RactorSupervisor < Pool
+    MAIN_KILLED = "the worker ractor's main thread was killed"
+    # Seconds a worker ractor's main thread, ending early, gives its threads to end (.leave).
+    LEAVE = 1.0
     # A worker thread's crash report, sent to its supervisor's port (.report_crash). The only
     # other message there is Ractor#monitor's end notice (a Symbol up to Ruby 4.0, an Array from
     # 4.1): a class of its own keeps the two apart.
@@ -80,33 +83,64 @@ module Kino
 
     # @private
     # A worker Ractor's main thread, one worker thread per slot; a crashed one waits for a new slot.
+    # True once no worker thread is left; nil when its main thread was killed.
     def self.run_worker(server_id, ids, app, batch, hooks, supervisor)
       # Crashes are the supervisor's to log; no thread here prints one.
       Thread.current.report_on_exception = false
       ended = Thread::Queue.new
+      # The worker threads, and the threads they start.
+      workers = ThreadGroup.new
+      # Up once this thread leaves: its worker threads end with it, reporting nothing.
+      over = left = false
       start = lambda do |id, position|
         Thread.new do
           Thread.current.report_on_exception = false
           Thread.current.name = "thread-#{position + 1}" if ids.size > 1
           started_at = Kino.monotonic
-          fresh = nil
+          error = fresh = nil
+          done = false
           begin
             Worker.run(server_id, id, app, batch, hooks)
+            done = true
           rescue Exception => e # rubocop:disable Lint/RescueException -- reported, then replaced
-            fresh = report_crash(supervisor, position, id, e, started_at)
+            error = e
           ensure
+            # Neither its end nor an exception: its thread was killed.
+            error ||= Error.new(KILLED) unless done || over
+            fresh = report_crash(supervisor, position, id, error, started_at) if error && !over
             replaced = begin
-              fresh && start.call(fresh, position)
+              fresh && !over && start.call(fresh, position)
             rescue ThreadError
               nil
             end
-            ended << position unless replaced
+            # A respawn counts once its thread runs (as the main thread is killed, the ractor's).
+            if replaced
+              Native.record_respawn(server_id)
+            else
+              ended << position
+            end
           end
-        end
+        end.tap { |thread| workers.add(thread) }
       end
       ids.each_with_index { |id, position| start.call(id, position) }
       ids.size.times { ended.pop }
+      left = true
+    ensure
+      over = true
+      leave(workers) unless left
     end
+
+    # The main thread ends with worker threads still running: they end first, while the ractor
+    # lives, as a teardown's ensures run after Ractor#value hands their slots on, and must not touch
+    # a Ractor::Port. One past LEAVE goes with the teardown, its handle holding its slot.
+    def self.leave(workers)
+      deadline = Kino.monotonic + LEAVE
+      workers.list.each(&:kill)
+      workers.list.each do |thread|
+        Teardown.join(thread, [deadline - Kino.monotonic, 0].max)
+      end
+    end
+    private_class_method :leave
 
     # Report a crash and return the answer; the exception crosses as a copy, its backtrace aside.
     def self.report_crash(supervisor, position, id, error, started_at)
@@ -149,29 +183,33 @@ module Kino
           ractor = spawn_worker(index, port)
           backoff.started
           tend(index, ractor, port)
-          begin
-            ractor.value
+          cause = begin
+            # A ractor whose main thread was killed ends with no value.
+            Error.new(MAIN_KILLED) unless ractor.value
+          rescue Ractor::Error => e
+            (e.respond_to?(:cause) && e.cause) ? e.cause : e
+          end
+          unless cause
             worker_exited(index, nil) # drained or retired
             exited(index, clean: true)
             break
-          rescue Ractor::Error => e
-            # The ractor died mid-flight. Anything it was serving will never
-            # be answered by Ruby: 500 those clients NOW (not when GC gets
-            # around to dropping the dead heap), then decide on respawn.
-            # Its sockets close too: their handlers died with it.
-            dead = @lock.synchronize { @slots[index] }
-            dead.each { |id| Native.abort_inflight(@server_id, id) }
-            cause = (e.respond_to?(:cause) && e.cause) ? e.cause : e
-            # A replaced worker is not respawned; a leaving one is, and the scaler retires it again.
-            respawn = recover(index, dead, cause, backoff, leaving_respawns: true) { worker_exited(index, cause) }
-            unless respawn
-              exited(index, clean: false)
-              break
-            end
-
-            Native.record_respawn(@server_id)
-            @lock.synchronize { @retiring.delete(index) }
           end
+
+          # The ractor died mid-flight. Anything it was serving will never
+          # be answered by Ruby: 500 those clients NOW (not when GC gets
+          # around to dropping the dead heap), then decide on respawn.
+          # Its sockets close too: their handlers died with it.
+          dead = @lock.synchronize { @slots[index] }
+          dead.each { |id| Native.abort_inflight(@server_id, id) }
+          # A replaced worker is not respawned; a leaving one is, and the scaler retires it again.
+          respawn = recover(index, dead, cause, backoff, leaving_respawns: true) { worker_exited(index, cause) }
+          unless respawn
+            exited(index, clean: false)
+            break
+          end
+
+          Native.record_respawn(@server_id)
+          @lock.synchronize { @retiring.delete(index) }
         end
       end
     end
@@ -205,9 +243,8 @@ module Kino
     def replace_thread(index, dead_id, cause, backoff, crashed_at, run)
       return unless recover(index, [dead_id], cause, backoff, crashed_at) { worker_exited(index, cause) }
 
-      id = claim_slot(index) { run[:over] || @retiring.key?(index) || @replaced.key?(index) }
-      Native.record_respawn(@server_id) if id
-      id
+      # The replacement counts as a respawn once it runs (run_worker).
+      claim_slot(index) { run[:over] || @retiring.key?(index) || @replaced.key?(index) }
     rescue => e
       replacement_failed(index, e)
       nil

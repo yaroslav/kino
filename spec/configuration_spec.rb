@@ -101,6 +101,22 @@ RSpec.describe Kino::Configuration do
     }.to raise_error(TypeError)
   end
 
+  it "rejects a queue_depth below 1, naming it" do
+    app = ->(_env) { [200, {}, []] }
+
+    [0, -1, "deep"].each do |depth|
+      expect { Kino::Server.new(app, queue_depth: depth) }
+        .to raise_error(ArgumentError, /queue_depth must be a positive Integer \(got #{Regexp.escape(depth.inspect)}\)/)
+    end
+    expect(described_class.new.load_file(write_config("queue_depth 1\n"))[:queue_depth]).to eq(1)
+    expect { Kino::Server.new(app, queue_depth: 1) }.not_to raise_error
+    expect { Kino::Server.new(app, config_file: write_config("queue_depth 0\n")) }
+      .to raise_error(ArgumentError, /queue_depth must be a positive Integer \(got 0\)/)
+    # So does the native layer, for an embedder that calls it directly.
+    expect { Kino::Native.server_start({bind: "127.0.0.1", port: 0, queue_depth: 0, queue_timeout_ms: 100}) }
+      .to raise_error(ArgumentError, /queue_depth must be a positive Integer \(got 0\)/)
+  end
+
   it "rejects WebSocket limits out of range, and takes nil for no websocket_max and no pings" do
     app = ->(_env) { [200, {}, []] }
     config = described_class.new.load_file(write_config("websocket_max nil\nwebsocket_ping_interval nil\n"))
@@ -117,6 +133,21 @@ RSpec.describe Kino::Configuration do
       expect { Kino::Server.new(app, websocket_ping_interval: bad) }
         .to raise_error(ArgumentError, /websocket_ping_interval must be a finite, non-negative number of seconds or nil/)
     end
+  end
+
+  it "takes a shutdown_timeout of no deadline at all, and rejects one that is negative, NaN or not a number" do
+    app = ->(_env) { [200, {}, []] }
+
+    [0, 0.5, Float::INFINITY].each do |seconds|
+      expect { Kino::Server.new(app, shutdown_timeout: seconds) }.not_to raise_error
+    end
+    [-1, Float::NAN, "soon", nil].each do |bad|
+      expect { Kino::Server.new(app, shutdown_timeout: bad) }
+        .to raise_error(ArgumentError,
+          /shutdown_timeout must be a non-negative number of seconds \(got #{Regexp.escape(bad.inspect)}\)/)
+    end
+    expect { Kino::Server.new(app, config_file: write_config("shutdown_timeout -0.5\n")) }
+      .to raise_error(ArgumentError, /shutdown_timeout must be a non-negative number of seconds \(got -0.5\)/)
   end
 
   it "warns when io_threads is set without io_shards" do

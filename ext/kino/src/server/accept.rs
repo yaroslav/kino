@@ -6,6 +6,7 @@ use std::sync::Arc;
 use std::task::{Context, Poll};
 use std::time::Duration;
 
+use bytes::Bytes;
 use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::net::{TcpListener, TcpStream, UnixListener, UnixStream};
 use tokio_util::either::Either;
@@ -23,7 +24,7 @@ pub(crate) struct Peer {
 
 /// A unix socket's peer is local (127.0.0.1) and has no port, so SERVER_PORT falls back
 /// to 80 when the Host header names none.
-const UNIX_PEER: Peer = Peer {
+pub(super) const UNIX_PEER: Peer = Peer {
     remote: SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0),
     local: SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 80),
 };
@@ -77,10 +78,43 @@ pub(crate) struct Held {
     pub(crate) shard_load: Option<Counted>,
 }
 
-/// The stream with what it holds, through hyper and past an upgrade.
+impl Held {
+    pub(crate) fn new(
+        permit: tokio::sync::OwnedSemaphorePermit,
+        shard_load: Option<Counted>,
+    ) -> Self {
+        Held {
+            _permit: permit,
+            shard_load,
+        }
+    }
+}
+
+/// The stream with what it holds, through hyper and past an upgrade: `prefix`, read off it before
+/// hyper, is read first.
 pub(super) struct ConnIo<I> {
-    pub(super) io: I,
-    pub(super) _held: Held,
+    io: I,
+    _held: Held,
+    prefix: Bytes,
+}
+
+impl<I> ConnIo<I> {
+    pub(super) fn new(io: I, held: Held, prefix: Bytes) -> Self {
+        ConnIo {
+            io,
+            _held: held,
+            prefix,
+        }
+    }
+
+    /// Only a connection whose first bytes were read before hyper (sniffed after a TLS handshake)
+    /// has a prefix, read first; later reads pay one branch.
+    #[cold]
+    fn read_prefix(&mut self, buf: &mut tokio::io::ReadBuf<'_>) -> Poll<std::io::Result<()>> {
+        let n = self.prefix.len().min(buf.remaining());
+        buf.put_slice(&self.prefix.split_to(n));
+        Poll::Ready(Ok(()))
+    }
 }
 
 impl<I: AsyncRead + Unpin> AsyncRead for ConnIo<I> {
@@ -89,7 +123,11 @@ impl<I: AsyncRead + Unpin> AsyncRead for ConnIo<I> {
         cx: &mut Context<'_>,
         buf: &mut tokio::io::ReadBuf<'_>,
     ) -> Poll<std::io::Result<()>> {
-        Pin::new(&mut self.get_mut().io).poll_read(cx, buf)
+        let this = self.get_mut();
+        if !this.prefix.is_empty() {
+            return this.read_prefix(buf);
+        }
+        Pin::new(&mut this.io).poll_read(cx, buf)
     }
 }
 
@@ -164,7 +202,7 @@ pub(crate) async fn next_accept(
             _ = shutdown_rx.changed() => return None,
             accepted = listener.accept() => match accepted {
                 Ok((conn, peer)) => {
-                    let held = Held { _permit: permit, shard_load: None };
+                    let held = Held::new(permit, None);
                     return Some(Accepted { conn, peer, held });
                 }
                 Err(error) => {

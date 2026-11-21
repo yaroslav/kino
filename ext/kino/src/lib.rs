@@ -26,9 +26,11 @@ mod registry;
 mod request;
 mod response;
 mod server;
+mod shared_gvl;
 mod slot;
 mod stats;
 mod style;
+mod symbols;
 mod test_support;
 #[cfg(test)]
 mod testing;
@@ -112,6 +114,7 @@ fn init(ruby: &Ruby) -> Result<(), Error> {
         "take_batch" => queue::Worker::take_batch, 1;
         "identity" => queue::Worker::identity, 0;
         "release" => queue::Worker::release, 0;
+        "crashed" => queue::Worker::crashed, 0;
         "drained" => queue::Worker::drained, 1;
         "ring" => queue::Worker::ring, 0;
         "ready_fd" => queue::Worker::ready_fd, 0;
@@ -171,6 +174,8 @@ fn init(ruby: &Ruby) -> Result<(), Error> {
     // Frozen env key/value cache: built once here (main ractor, GVL held),
     // shared by every worker ractor afterwards.
     env_strings::init(ruby);
+    // So are the Symbols natives tell apart or hand Ruby.
+    symbols::init(ruby);
 
     functions!(native:
         "_test_channel_create" => test_support::create, 1;

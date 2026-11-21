@@ -323,14 +323,7 @@ fn into_tokio(io: UnixStream) -> io::Result<tokio::net::UnixStream> {
 /// Straight from the socket: the runtime's readiness can trail a write by a
 /// scheduling slice. WouldBlock when nothing is there.
 fn read_now(io: &tokio::net::UnixStream, into: &mut [u8]) -> io::Result<usize> {
-    use std::io::Read;
-    let socket = socket2::SockRef::from(io);
-    loop {
-        match (&*socket).read(into) {
-            Err(error) if error.kind() == io::ErrorKind::Interrupted => {}
-            read => return read,
-        }
-    }
+    crate::server::recv_now(&socket2::SockRef::from(io), into, 0)
 }
 
 /// What the app wrote, up to AT_DRAIN_MAX (past it by less than a read).

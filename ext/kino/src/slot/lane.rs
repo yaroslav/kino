@@ -14,7 +14,7 @@ use crate::ws::WsEvent;
 /// whether a doorbell already sits in the lane and a wake is due (wakes coalesce).
 #[derive(Default)]
 pub struct Lane {
-    pub tx: Mutex<Option<flume::Sender<LaneItem>>>,
+    pub tx: LaneTx,
     pub rx: Option<flume::Receiver<LaneItem>>,
     pub ws_tx: Option<flume::Sender<WsEvent>>,
     pub ws_rx: Option<flume::Receiver<WsEvent>>,
@@ -22,6 +22,20 @@ pub struct Lane {
     pub wake_pending: AtomicBool,
     /// worker_loop only: what its worker's scheduler waits on.
     pub doorbell: Option<Doorbell>,
+}
+
+/// The dispatcher's lock on the lane, which it takes for every send: on a line of its own, apart
+/// from what the worker reads on every take.
+#[derive(Default)]
+#[repr(align(128))]
+pub struct LaneTx(Mutex<Option<flume::Sender<LaneItem>>>);
+
+impl std::ops::Deref for LaneTx {
+    type Target = Mutex<Option<flume::Sender<LaneItem>>>;
+
+    fn deref(&self) -> &Self::Target {
+        &self.0
+    }
 }
 
 impl Lane {
@@ -36,7 +50,7 @@ impl Lane {
         };
         let (ws_tx, ws_rx) = flume::bounded(inbox);
         Lane {
-            tx: Mutex::new(Some(tx)),
+            tx: LaneTx(Mutex::new(Some(tx))),
             rx: Some(rx),
             ws_tx: Some(ws_tx),
             ws_rx: Some(ws_rx),

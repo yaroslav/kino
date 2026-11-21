@@ -52,7 +52,7 @@ LOOP_APP = Ractor.shareable_proc do |env|
     body = (env["QUERY_STRING"] == "callable") ? ->(stream) { chunks.each { |chunk| stream.write(chunk) } } : chunks
     [200, {"content-length" => StreamedChunks.bytes.to_s}, body]
   when "/events"
-    query = env["QUERY_STRING"].split("&").to_h { |pair| pair.split("=", 2) }
+    query = env["QUERY_STRING"].split("&").to_h { |pair| pair.partition("=").values_at(0, 2) }
     [200, {"content-type" => "text/event-stream"}, ServerSentEvents.new(Integer(query.fetch("count", 1024)), query.key?("fail"))]
   else
     [200, {}, ["hello"]]
@@ -404,9 +404,10 @@ RSpec.describe "worker_loop" do
 
   # One request whose fiber has to wait on its client: a slow reader of
   # a 1 MiB event stream (:slow), a reader that goes away mid-stream
-  # (:gone), a reader of a stream that fails (:failing), or an upload
-  # that arrives in two halves, read whole (:upload) or answered before
-  # its end (:peek).
+  # (:gone; its stream is 4 MiB, more than the server's socket takes
+  # before it goes, where Linux starts a loopback send buffer at 2.5 MiB),
+  # a reader of a stream that fails (:failing), or an upload that arrives
+  # in two halves, read whole (:upload) or answered before its end (:peek).
   def waiting_request(port, kind)
     socket = narrow_connection(port)
     if %i[upload peek].include?(kind)
@@ -414,7 +415,8 @@ RSpec.describe "worker_loop" do
       sleep 0.02
       socket.write("half")
     else
-      socket.write("GET /events?count=256#{"&fail" if kind == :failing} HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n")
+      count = (kind == :gone) ? 1024 : 256
+      socket.write("GET /events?count=#{count}#{"&fail" if kind == :failing} HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n")
       socket.readpartial(4096)
       sleep 0.02
     end
@@ -1087,15 +1089,20 @@ RSpec.describe "worker_loop" do
 
     it "closes readiness fds when requests end", :quiet do
       reports = self.reports.port
-      waited = Ractor.shareable_proc { |_env, _status| reports << TallyingReactor.of(Fiber.current).first }
+      # Each request's waits, from after_request_complete, or from on_error
+      # for a stream that failed.
+      waited = Ractor.shareable_proc { |*| reports << TallyingReactor.of(Fiber.current).first }
       kinds = %i[slow gone failing upload peek]
 
-      start_loop_server(mode: mode, worker_loop: loop_on(TallyingReactor, 32), after_request_complete: waited) do |port, server|
+      # A request's body I/O waits on readiness fds of its own.
+      start_loop_server(mode: mode, worker_loop: loop_on(TallyingReactor, 32), after_request_complete: waited,
+        on_error: waited) do |port, server|
         batch = -> { Array.new(20) { |index| Thread.new { waiting_request(port, kinds[index % kinds.size]) } }.each(&:join) }
+        waits = ->(count) { Array.new(count) { self.reports.next(awaiting: "a request's waits") } }
         batch.call
         wait_for("the first requests done") { open_requests(server).zero? }
         baseline = open_fds
-        reports_so_far
+        waits.call(20)
 
         GC.disable
         begin
@@ -1105,7 +1112,8 @@ RSpec.describe "worker_loop" do
         ensure
           GC.enable
         end
-        expect(reports_so_far.count(&:positive?)).to be > 300
+        waiting = waits.call(500).count(&:positive?)
+        expect(waiting).to be > 400, "#{waiting} of the 500 requests waited on a readiness fd"
       end
     end
 

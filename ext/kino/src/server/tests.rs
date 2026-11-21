@@ -20,12 +20,7 @@ use crate::testing::{
 
 /// A prior-knowledge HTTP/2 client connection to `server`.
 async fn h2(server: &Arc<ServerInner>) -> SendRequest<Full<Bytes>> {
-    let io = TokioIo::new(super::testing::spawn_conn(server.clone()));
-    let (sender, conn) = hyper::client::conn::http2::handshake(TokioExecutor::new(), io)
-        .await
-        .expect("h2 handshake");
-    tokio::spawn(conn);
-    sender
+    crate::testing::h2_client(super::testing::spawn_conn(server.clone())).await
 }
 
 async fn body_of(response: hyper::Response<hyper::body::Incoming>) -> Bytes {
@@ -142,7 +137,7 @@ async fn h2_streaming_response_arrives_chunked() {
         async move {
             let ctx = take_ctx(&server).await;
             let head = hyper::Response::builder().status(200);
-            assert!(ctx.responder.send_stream_head(head, false).expect("head"));
+            assert!(ctx.responder.send_stream_head(head).expect("head"));
             let frames = ctx.responder.body_sender().expect("open stream");
             for chunk in ["alpha ", "beta ", "gamma"] {
                 let frame = Frame::data(Bytes::from_static(chunk.as_bytes()));
@@ -184,7 +179,7 @@ async fn what_a_stream_sent_before_it_was_cut_reaches_the_client_ahead_of_the_cu
             };
             let ctx = take_ctx(&server).await;
             let head = hyper::Response::builder().status(200);
-            assert!(ctx.responder.send_stream_head(head, false).expect("head"));
+            assert!(ctx.responder.send_stream_head(head).expect("head"));
             let stream = ctx.responder.body_sender().expect("an open stream");
             let mut sent = Vec::new();
             while sent.len() < chunks.saturating_mul(8) {
@@ -227,7 +222,7 @@ async fn hyper_drops_the_body_of_a_reset_h2_stream_so_the_next_send_fails() {
 
     let ctx = take_ctx(&server).await;
     let head = hyper::Response::builder().status(200);
-    ctx.responder.send_stream_head(head, false).expect("head");
+    ctx.responder.send_stream_head(head).expect("head");
     let frames = ctx.responder.body_sender().expect("open stream");
     // Dropping the response body resets the stream.
     drop(response.await.expect("joined").expect("h2 response"));
@@ -433,7 +428,7 @@ async fn reads_and_writes_that_never_wait_open_no_descriptor() {
     assert_eq!(ctx.read_nonblock().expect("a read"), Step::Done(None));
     assert!(ctx
         .responder
-        .send_stream_head(hyper::Response::builder().status(200), false)
+        .send_stream_head(hyper::Response::builder().status(200))
         .expect("head"));
     for _ in 0..4 {
         let written = ctx.write_nonblock(|_| bytes::Bytes::from_static(b"event\n"));
@@ -467,7 +462,7 @@ async fn ending_a_stream_rings_a_write_still_waiting_on_it() {
         drop(chunks);
         assert!(ctx
             .responder
-            .send_stream_head(hyper::Response::builder().status(200), false)
+            .send_stream_head(hyper::Response::builder().status(200))
             .expect("head"));
         let _body = response_to(pending).await;
 

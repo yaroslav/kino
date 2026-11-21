@@ -45,8 +45,9 @@ ring = "0.17"
 tungstenite = { version = "0.30", default-features = false }
 # EPROTO, which std has no ErrorKind for; already in the tree via tokio.
 libc = "0.2"
-# Reading what an app wrote to a hijack bridge without tokio, which std
-# lacks; already in the tree via tokio.
+# Socket calls std lacks: hijack bridge reads without tokio, a unix bind's
+# nonblocking live-socket check and the intake's recv; already in the tree
+# via tokio.
 socket2 = "0.6"
 
 # musl's loader rejects initial-exec TLS in dlopen'd libraries ("initial-exec

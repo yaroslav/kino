@@ -4,6 +4,7 @@
 mod accept;
 mod config;
 mod handle;
+mod intake;
 mod natives;
 mod serve;
 #[cfg(test)]
@@ -20,6 +21,7 @@ use crate::registry::{self, RuntimeHandle, ServerInner};
 use accept::accept_loop;
 pub(crate) use accept::{next_accept, Accepted, AsyncListener, Conn, Peer};
 pub use config::{ServerConfig, Topology};
+pub(crate) use intake::recv_now;
 pub use natives::*;
 pub(crate) use serve::serve_conn;
 #[cfg(test)]
@@ -125,6 +127,7 @@ fn start_runtime(
         let _guard = runtime.enter();
         AsyncListener::from_std(listener).map_err(|e| ("listener setup failed", e))?
     };
+    let _ = server.io_runtime.set(runtime.handle().clone());
     runtime.spawn(accept_loop(
         tokio_listener,
         acceptor,

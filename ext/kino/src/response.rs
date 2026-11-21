@@ -1,7 +1,8 @@
 //! The response half of a request's lifecycle. A `Responder` is shared
-//! between the Ruby-held `Request` handle and (via `Weak`) the worker slot,
-//! so exactly one of three parties can answer the client: the app (normal
-//! path), the supervisor (`abort_inflight` after a ractor crash), or the
+//! between the Ruby-held `Request` handle and the worker slot's in-flight
+//! list, so exactly one of three parties can answer the client: the app
+//! (normal path), Kino (`abort_inflight` after a ractor crash, or a
+//! worker's next take, `let_go`, for what it left unanswered), or the
 //! `RequestCtx` Drop backstop. The `responded` flag makes the race benign.
 //!
 //! Two response shapes: `send_response` (complete, one shot) and
@@ -22,6 +23,7 @@ use tokio::sync::oneshot;
 
 use crate::counters::{tallied, Tallied, Tally};
 use crate::doorbell::Doorbell;
+use crate::framing::{usable_length, Bodiless};
 
 pub type BodyFrame = hyper::body::Frame<Bytes>;
 pub type FrameResult = Result<BodyFrame, io::Error>;
@@ -86,6 +88,8 @@ struct HyperSink {
 #[derive(Default)]
 pub struct Responder {
     sink: HyperSink,
+    /// A stream started: whether it is still open is let_go's to look.
+    streamed: AtomicBool,
     responded: AtomicBool,
     /// The forwarder's abandonment flag rides in the one per-request shared
     /// allocation rather than its own Arc. 0 = none, else a BodyAbandon.
@@ -155,6 +159,11 @@ impl Responder {
         self.sink.head.lock().take()
     }
 
+    /// Whether the app's answer, its stream's head or Kino's own claimed the request.
+    pub fn claimed(&self) -> bool {
+        self.responded.load(Ordering::SeqCst)
+    }
+
     /// Complete response in one shot.
     pub fn send_response(&self, response: HyperResponse) -> bool {
         self.claim().is_some_and(|head| head.send(response).is_ok())
@@ -184,37 +193,75 @@ impl Responder {
         self.sink.held_101.lock().take().is_some()
     }
 
-    /// Start a streaming response from a prepared head: send it now, return
-    /// chunks later, unless `bodiless`; false when Kino answered first.
-    pub fn send_stream_head(
-        self: &Arc<Self>,
-        builder: hyper::http::response::Builder,
-        bodiless: bool,
-    ) -> Result<bool, http::Error> {
+    /// A stream's claim on the answer; None, the stream reading as cut, when Kino answered first.
+    fn claim_stream(&self) -> Option<oneshot::Sender<HyperResponse>> {
         let Some(head) = self.claim() else {
             // A request starts its stream once: an open one is its own.
             if self.sink.body.lock().is_none() {
                 self.answered_first();
             }
-            return Ok(false);
+            return None;
         };
         // Closed when a request_timeout 504 went out instead, or the request is gone.
-        if !head.is_closed() {
-            self.uncounted.store(bodiless, Ordering::Relaxed);
-            let (body, frames) = flume::bounded(STREAM_BUFFER);
-            let streamed = Streamed::new(frames, Some(self.clone()), None);
-            let response = builder.body(Either::Right(streamed))?;
-            *self.sink.body.lock() = Some(body);
-            if head.send(response).is_ok() {
-                return Ok(true);
-            }
+        if head.is_closed() {
+            self.answered_first();
+            return None;
         }
-        self.answered_first();
-        Ok(false)
+        Some(head)
     }
 
-    /// Kino answered before the stream started, or the request is gone: the stream reads
-    /// as cut, so the next write ends it, but no cut counts.
+    /// A streamed answer's head where HTTP allows no body: it goes out with an empty one, its
+    /// first Content-Length kept; one hyper would refuse keeps an unknown-length body, for hyper
+    /// to refuse. False when Kino answered first.
+    pub fn send_bodiless_head(
+        &self,
+        mut builder: hyper::http::response::Builder,
+        bodiless: Bodiless,
+    ) -> Result<bool, http::Error> {
+        let Some(head) = self.claim_stream() else {
+            return Ok(false);
+        };
+        if let Some(headers) = builder.headers_mut() {
+            bodiless.drop_forbidden_length(headers);
+        }
+        let usable = builder.headers_ref().is_none_or(usable_length);
+        let body = if usable {
+            if let Some(headers) = builder.headers_mut() {
+                bodiless.keep_length(headers, 0);
+            }
+            full_body(Bytes::new())
+        } else {
+            let (_, frames) = flume::bounded::<FrameResult>(1);
+            Either::Right(Streamed::new(frames, None, None))
+        };
+        let sent = head.send(builder.body(body)?).is_ok();
+        self.answered_first();
+        Ok(sent)
+    }
+
+    /// Start a streaming response from a prepared head: send it now, return
+    /// chunks later; false when Kino answered first.
+    pub fn send_stream_head(
+        self: &Arc<Self>,
+        builder: hyper::http::response::Builder,
+    ) -> Result<bool, http::Error> {
+        let Some(head) = self.claim_stream() else {
+            return Ok(false);
+        };
+        let (body, frames) = flume::bounded(STREAM_BUFFER);
+        let streamed = Streamed::new(frames, Some(self.clone()), None);
+        let response = builder.body(Either::Right(streamed))?;
+        self.streamed.store(true, Ordering::Relaxed);
+        *self.sink.body.lock() = Some(body);
+        if head.send(response).is_err() {
+            self.answered_first();
+            return Ok(false);
+        }
+        Ok(true)
+    }
+
+    /// Kino answered first (a 504 or a give-up's 500), the request is gone, or its head allows no
+    /// body: the stream reads as cut, so the next write ends it, but no cut counts.
     fn answered_first(&self) {
         self.uncounted.store(true, Ordering::Relaxed);
         self.sink.body.lock().take();
@@ -247,6 +294,19 @@ impl Responder {
         {
             CUT.add(why);
         }
+    }
+
+    /// The worker let go of the request (Load::let_go): one never answered gets a give-up's 500
+    /// and an open stream is cut, but a hijack or a 101 waiting for on_open is left to the app.
+    /// One answered whole costs two loads.
+    pub fn let_go(&self) {
+        if self.claimed() && !self.streamed.load(Ordering::Relaxed) {
+            return;
+        }
+        if !self.open() || self.sink.held_101.lock().is_some() {
+            return;
+        }
+        self.give_up(Cut::Crash);
     }
 
     /// The "the app will never answer" path. Before the head: canned 500.
@@ -392,6 +452,22 @@ pub fn close_connection<B>(response: &mut hyper::Response<B>) {
     );
 }
 
+/// `response` with no body where HTTP allows none (a HEAD, a 1xx, a 204, a 304), as hyper over h2
+/// would send it as DATA; a HEAD keeps its body's length, a 1xx or a 204 has none. A streamed
+/// body stays: its head decided (send_stream_head).
+pub fn without_forbidden_body(mut response: HyperResponse, head: bool) -> HyperResponse {
+    let Some(bodiless) = Bodiless::of(response.status().as_u16(), head) else {
+        return response;
+    };
+    let len = match response.body() {
+        Either::Left(full) => hyper::body::Body::size_hint(full).exact().unwrap_or(0),
+        Either::Right(_) => return response,
+    };
+    bodiless.settle(response.headers_mut(), len as usize);
+    *response.body_mut() = full_body(Bytes::new());
+    response
+}
+
 /// Canned plain-text response, built entirely on the Rust side (used for
 /// the 500/503/504 paths that never reach Ruby).
 pub fn plain_response(status: u16, message: &'static str) -> HyperResponse {
@@ -432,7 +508,7 @@ mod tests {
     ) {
         let (responder, head_rx) = pair();
         assert!(responder
-            .send_stream_head(hyper::Response::builder().status(200), false)
+            .send_stream_head(hyper::Response::builder().status(200))
             .expect("valid head"));
         (responder, head_rx)
     }
@@ -488,5 +564,46 @@ mod tests {
 
         assert_eq!(winners, 1);
         assert!(head_rx.try_recv().is_ok());
+    }
+
+    #[test]
+    fn a_let_go_cuts_a_stream_left_open_and_leaves_a_finished_one() {
+        let _serial = crate::testing::SERIAL.blocking_lock();
+        let (open, _head_rx) = streaming();
+        open.let_go();
+        assert!(open.stream_cut(), "a stream left open is cut");
+        assert!(open.body_sender().is_none(), "nothing more goes out on it");
+
+        let (finished, _head_rx) = streaming();
+        finished.finish_stream();
+        finished.let_go();
+        assert!(!finished.stream_cut(), "a finished stream is no cut");
+    }
+
+    #[test]
+    fn a_let_go_leaves_a_hijacked_request_and_a_held_101_alone() {
+        let (hijacked, mut head_rx) = pair();
+        let bridge = hijacked.hijack().expect("the claim");
+        hijacked.let_go();
+        assert!(
+            head_rx.try_recv().is_err(),
+            "the app answers on the connection"
+        );
+        drop(bridge);
+
+        let (handshake, mut head_rx) = pair();
+        let (switched, mut told) = tokio::sync::oneshot::channel();
+        handshake.hold_for_switch(switched, plain_response(101, ""));
+        handshake.let_go();
+        assert!(
+            head_rx.try_recv().is_err(),
+            "the socket's 101 waits for its on_open"
+        );
+        let held = told.try_recv();
+        assert_eq!(
+            held,
+            Err(tokio::sync::oneshot::error::TryRecvError::Empty),
+            "the 101 is held"
+        );
     }
 }
