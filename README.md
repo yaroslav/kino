@@ -908,7 +908,7 @@ For the Rust network stack, thanks to [Sean McArthur](https://github.com/seanmon
 
 ## Assisted by
 
-Claude Code (Fable 5, Opus 4.8).
+Claude Code (Fable 5.2, Opus 5.5).
 
 ## Contributing
 
