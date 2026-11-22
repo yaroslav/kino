@@ -225,7 +225,7 @@ fn a_worker_loop_worker_is_passed_over_for_an_idle_sibling_only_while_it_holds_w
             |server, slot, worker| { let poll = took(server, slot); Worker::woke(worker); Some(poll) }, [1, 0]),
         ("its thread away with a request it just took", |server, slot, _| Some(took(server, slot)), [0, 1]),
         ("its job past its answer, not back in its loop yet",
-            |server, slot, _| { let job = took(server, slot); slot.answered(&job.responder); Some(job) }, [1, 0]),
+            |server, slot, _| { let job = took(server, slot); slot.answered(&job.responder, false); Some(job) }, [1, 0]),
         ("its thread away in its wake hook",
             |server, slot, _| { assert!(slot.wake()); assert_eq!(nonblock(server, slot, Room::All), "wake"); None }, [0, 1]),
     ];
@@ -715,4 +715,40 @@ fn a_dead_workers_late_end_never_touches_the_worker_that_took_its_slot_over() {
     );
     assert_eq!(dispatch(&server, test_ctx()), "sent");
     drop((serving, taker));
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn closing_the_queues_hands_connections_no_worker_took_to_hyper() {
+    use std::io::{Read, Write};
+
+    let server = crate::inline::testing::inline_loop_server(1, 8);
+    let (client, stream, held, peer) = crate::inline::testing::accepted(1)
+        .await
+        .pop()
+        .expect("one");
+    client
+        .set_read_timeout(Some(Duration::from_secs(5)))
+        .expect("read timeout");
+    let stream = tokio_util::either::Either::Left(stream);
+    assert!(crate::inline::place(&server, stream, held, peer).is_ok());
+
+    // The drain, with a worker that never took its connection.
+    server.stop_accepting();
+    server.close_queues();
+
+    let worker = slot(&server, 0);
+    assert!(worker
+        .lane
+        .placed_rx
+        .as_ref()
+        .is_some_and(|placed| placed.is_empty()));
+    assert_eq!(worker.inline.conns.load(Ordering::Relaxed), 0);
+    // Hyper serves it now: the drain's answer, then the end.
+    (&client)
+        .write_all(b"GET / HTTP/1.1\r\nhost: x\r\nconnection: close\r\n\r\n")
+        .expect("a request");
+    let mut answer = Vec::new();
+    (&client).read_to_end(&mut answer).expect("the end");
+    let answer = String::from_utf8_lossy(&answer);
+    assert!(answer.starts_with("HTTP/1.1 503 "), "{answer}");
 }

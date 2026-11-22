@@ -221,7 +221,7 @@ module Kino
     class Loop
       # Serve the worker's requests as jobs the block starts, at most `concurrency` at a time;
       # each socket's events, and the wakes, run in order on jobs of their own. Returns once the
-      # worker is drained.
+      # worker is drained. An inline connection runs on its own job, its requests counting too.
       def serve: (concurrency: Integer) { (^() -> void job) -> void } -> nil
     end
   end

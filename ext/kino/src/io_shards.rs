@@ -8,34 +8,11 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::thread::JoinHandle;
 
-use tokio_util::either::Either;
-
 use crate::counters::Counted;
 use crate::listen::Listener;
 use crate::log::{self, Level};
-use crate::registry::{ServerInner, STATE_DRAINING};
-use crate::server::{next_accept, serve_conn, Accepted, AsyncListener, Conn};
-
-/// An accepted stream in transit from the acceptor to its shard. Tokio
-/// streams are bound to the runtime that registered them, so the handoff
-/// carries the std stream and the shard re-registers it on arrival.
-type StdConn = Either<std::net::TcpStream, std::os::unix::net::UnixStream>;
-
-/// Detach an accepted stream from the acceptor's runtime for the handoff.
-fn into_std(conn: Conn) -> std::io::Result<StdConn> {
-    Ok(match conn {
-        Either::Left(stream) => Either::Left(stream.into_std()?),
-        Either::Right(stream) => Either::Right(stream.into_std()?),
-    })
-}
-
-/// Register a handed-over stream with the calling (shard) runtime.
-fn into_tokio(conn: StdConn) -> std::io::Result<Conn> {
-    Ok(match conn {
-        Either::Left(stream) => Either::Left(tokio::net::TcpStream::from_std(stream)?),
-        Either::Right(stream) => Either::Right(tokio::net::UnixStream::from_std(stream)?),
-    })
-}
+use crate::registry::ServerInner;
+use crate::server::{next_accept, serve_conn, Accepted, AsyncListener, StdConn};
 
 /// Shard count: an explicit `io_threads` wins; the default is half the
 /// available CPUs. Framing requests is cheap next to running the app, so
@@ -255,7 +232,9 @@ async fn serve_accepted(
     acceptor: Option<tokio_rustls::TlsAcceptor>,
     server: Arc<ServerInner>,
 ) {
-    let Ok(conn) = into_tokio(conn) else {
+    // Tokio streams are bound to the runtime that registered them: the shard registers the
+    // handed-over std stream anew.
+    let Ok(conn) = conn.into_tokio() else {
         log::emit(
             Level::Warn,
             "tokio",
@@ -286,7 +265,7 @@ async fn accept_loop(
     'accept: while let Some(Accepted { conn, peer, held }) =
         next_accept(&listener, &conn_limit, &mut shutdown_rx).await
     {
-        let Ok(conn) = into_std(conn) else {
+        let Ok(conn) = StdConn::detach(conn) else {
             log::emit(
                 Level::Warn,
                 "tokio",
@@ -302,7 +281,8 @@ async fn accept_loop(
                     "tokio",
                     "all I/O shards are down; not accepting connections",
                 );
-                server.state.store(STATE_DRAINING, Ordering::Relaxed);
+                // As a drain begins: idle inline connections close, and none spins.
+                server.stop_accepting();
                 break 'accept;
             };
             loads[index].fetch_add(1, Ordering::Relaxed);
@@ -437,6 +417,45 @@ mod tests {
             .iter()
             .map(|&n| Arc::new(AtomicUsize::new(n)))
             .collect()
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn with_every_shard_down_the_acceptor_begins_the_drain_which_ends_idle_inline_connections(
+    ) {
+        use crate::inline::testing::{inline_loop_server, loopback, read_to_end};
+
+        let server = inline_loop_server(1, 8);
+        let (idle_client, mut idle) = loopback(&server);
+        assert!(matches!(idle.next(true), crate::inline::Next::Readable));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind");
+        let addr = listener.local_addr().expect("addr");
+        // Its one shard is gone: its channel's other end dropped.
+        let (shard_tx, shard_rx) = tokio::sync::mpsc::unbounded_channel();
+        drop(shard_rx);
+        let (_stop, shutdown_rx) = tokio::sync::watch::channel(false);
+        let (ready_tx, _ready) = std::sync::mpsc::sync_channel(1);
+        let accepting = tokio::spawn(accept_loop(
+            AsyncListener::Tcp(listener),
+            server.clone(),
+            8,
+            shutdown_rx,
+            vec![shard_tx],
+            loads(&[0]),
+            ready_tx,
+        ));
+
+        let _refused = std::net::TcpStream::connect(addr).expect("connect");
+        let stopped = tokio::time::timeout(std::time::Duration::from_secs(5), accepting);
+        stopped
+            .await
+            .expect("it stops accepting")
+            .expect("the loop");
+        assert!(server.is_draining());
+        // Shut by the drain, before its job looks again or any deadline.
+        assert_eq!(read_to_end(&idle_client), b"");
+        assert!(matches!(idle.next(true), crate::inline::Next::Closed));
     }
 
     #[test]

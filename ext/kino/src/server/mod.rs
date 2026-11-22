@@ -19,13 +19,16 @@ use crate::listen::Listener;
 use crate::registry::{self, RuntimeHandle, ServerInner};
 
 use accept::accept_loop;
-pub(crate) use accept::{next_accept, Accepted, AsyncListener, Conn, Peer};
+#[cfg(test)]
+pub(crate) use accept::UNIX_PEER;
+pub(crate) use accept::{next_accept, Accepted, AsyncListener, Conn, Held, Peer, StdConn};
 pub use config::{ServerConfig, Topology};
-pub(crate) use intake::recv_now;
+pub(crate) use handle::{InFlight, BODY_READ_TIMEOUT};
+pub(crate) use intake::{recv_now, HEADER_READ_TIMEOUT};
 pub use natives::*;
-pub(crate) use serve::serve_conn;
 #[cfg(test)]
 pub(crate) use serve::testing;
+pub(crate) use serve::{serve_conn, serve_handed_back};
 
 fn io_error(ruby: &Ruby, what: &str, e: std::io::Error) -> Error {
     Error::new(ruby.exception_runtime_error(), format!("{what}: {e}"))

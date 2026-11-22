@@ -41,6 +41,35 @@
   response gets a 502. A drain does not wait for hijacked
   connections. Each holds three file descriptors, so many open at once
   can run the process out of them below `max_connections`.
+- Inline connections: a `worker_loop` server serves plain HTTP/1.1
+  connections, over TCP or a unix socket, on its worker threads, with
+  nothing to configure. Each goes to a worker with room for it, whose
+  loop runs it as a job: Kino reads, parses and answers each request on
+  the worker's thread, with no hand-off between threads, no wake-up and
+  no task per request. Anything outside a strict subset of HTTP/1.1
+  (HTTP/1.0, a chunked or larger body, `Expect`, an upgrade) goes back
+  to hyper before the app sees it, with the bytes already read, and
+  TLS and HTTP/2 stay with hyper. Behind nginx, connections stay inline
+  while nginx speaks HTTP/1.1 with keep-alive, as it does by default
+  since 1.29.7. With it:
+  - A worker takes at most `concurrency` connections and serves them in
+    turn, so a slow request delays the other connections on its worker.
+  - A connection's requests run on one fiber, so fiber-local state one
+    sets is still there for the next, which behind a proxy can be
+    another client's: reset per request what you set.
+  - Inline connections keep hyper's deadlines, drain and answers, with a
+    few recorded differences: a stricter deadline for the first head,
+    headers an app should not set, and four at the drain, one of which
+    drops a kept-alive request whose head is over 16 KiB. A retiring
+    worker hands its connections to hyper, and a crashing one those
+    waiting for a request.
+  - A connection alone on an otherwise idle worker spins for up to
+    100 µs for its client's next request, with the GVL released, backing
+    off to a spin in 32 requests for a client that mostly comes later.
+  - `stats[:inline]` (nil, and null in `/stats`, on a server that serves
+    nothing inline) and `kino_inline_*` in `/metrics` count connections,
+    requests, hand-backs, cuts and spins; each `worker_status`
+    row counts its inline connections.
 - Out of file descriptors, Kino now waits 10 ms between attempts to
   accept a connection instead of retrying in a tight loop that kept a
   CPU busy.

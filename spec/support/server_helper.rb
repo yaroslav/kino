@@ -54,11 +54,62 @@ module ServerHelper
     http.start { |session| session.get(path) }
   end
 
+  # The worker_loop that a kino.rb holding `code` sets.
+  def worker_loop_from(code)
+    Dir.mktmpdir("kino-config") do |dir|
+      path = File.join(dir, "kino.rb")
+      File.write(path, code)
+      Kino::Configuration.new.load_file(path)[:worker_loop]
+    end
+  end
+
+  # The job-fiber recipe in doc/worker-loop.md: its ruby block that calls scheduler.resume(,
+  # loaded as a kino.rb.
+  def documented_job_fibers
+    doc = File.read(File.expand_path("../../doc/worker-loop.md", __dir__))
+    recipe = doc[/^```ruby\n((?:(?!^```).)*?scheduler\.resume\((?:(?!^```).)*?)^```$/m, 1]
+    expect(recipe).not_to be_nil, "doc/worker-loop.md has no ruby block that calls scheduler.resume("
+    worker_loop_from(recipe).tap do |worker_loop|
+      expect(worker_loop).not_to be_nil, "doc/worker-loop.md's ruby block that calls scheduler.resume( sets no worker_loop"
+    end
+  end
+
+  # Boot a worker_loop server (Async, 8 jobs at a time, on 2 workers of one thread), which serves
+  # plain HTTP/1.1 connections inline, and yield it once every worker's loop is up, a probe
+  # connection placed inline on each worker thread and closed again: a connection accepted before
+  # then goes through hyper instead.
+  def with_inline_server(app, mode:, **opts)
+    opts = {workers: 2, threads: 1, worker_loop: async_loop(8)}.merge(opts)
+    with_server(app, mode: mode, **opts) do |host, port, server|
+      await_inline(server, server.unix? ? server.url.delete_prefix("unix://") : port, opts[:workers] * opts[:threads])
+      yield host, port, server
+    end
+  end
+
   # A new connection to `target`: a port on 127.0.0.1, or the path of a unix socket.
   def client_socket(target)
     socket = target.is_a?(String) ? UNIXSocket.new(target) : TCPSocket.new("127.0.0.1", target)
     socket.timeout = WsClient::DEADLINE
     socket
+  end
+
+  # Returns once each of the `workers` worker threads of `server` (on `target`, a port or a unix
+  # socket's path, serving inline) has had a probe connection placed on it and closed again. A
+  # round is decided as soon as each of its probes is placed on a worker or declined to hyper: one
+  # that met a worker not serving yet is tried again a few milliseconds on, rather than waited out.
+  def await_inline(server, target, workers)
+    wait_for("every worker serving inline", every: 0.005) do
+      declined = server.stats[:inline][:declined]
+      probes = Array.new(workers) { client_socket(target) }
+      wait_for("the probes placed or declined", every: 0.001) do
+        inline = server.stats[:inline]
+        inline[:connections] + inline[:declined] - declined >= workers
+      end
+      server.stats[:worker_status].count { |row| row[:inline_connections].positive? } == workers
+    ensure
+      probes&.each(&:close)
+      wait_for("the probes to close", every: 0.001) { server.stats[:inline][:connections].zero? }
+    end
   end
 
   # Write `bytes` on a new connection to `target` (a port, or a unix socket's path), then read
@@ -80,6 +131,16 @@ module ServerHelper
     socket&.close
   end
 
+  # A connection whose receive window is small (`receive_buffer` bytes), so a response it does
+  # not read soon fills it.
+  def narrow_connection(port, receive_buffer: 16_384)
+    socket = Socket.new(:INET, :STREAM)
+    socket.timeout = WsClient::DEADLINE
+    socket.setsockopt(:SOCKET, :RCVBUF, receive_buffer)
+    socket.connect(Socket.sockaddr_in(port, "127.0.0.1"))
+    socket
+  end
+
   # One response off `io` (a connection, or a StringIO of what one read), framed by its chunks or
   # its content-length: [status line, headers (names downcased), body]. Fails unless it is all in
   # within `within` seconds.
@@ -91,6 +152,9 @@ module ServerHelper
   rescue Timeout::Error
     raise "no complete response within #{within} s"
   end
+
+  # How many descriptors this process has open, a server in it included.
+  def open_fds = Dir.children("/dev/fd").size
 
   # Run the block with RUBY_MAX_CPU set to `value` (unset when nil), then
   # restore what it was.

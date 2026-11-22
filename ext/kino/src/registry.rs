@@ -116,6 +116,8 @@ pub struct ServerInner {
     pub bridges_running: Arc<AtomicUsize>,
     /// Where a crashed worker's requests wait for lane room; set once the I/O runtime is up.
     pub io_runtime: std::sync::OnceLock<tokio::runtime::Handle>,
+    /// Inline serving (inline/); None when off (ServerConfig::inline).
+    pub inline: Option<Arc<crate::inline::InlineServer>>,
 }
 
 /// Relaxed and advisory: the control plane reads them without Ruby.
@@ -255,6 +257,11 @@ impl ServerInner {
             bridges_closed: tokio::sync::watch::Sender::new(crate::hijack::Closed::Nothing),
             bridges_running: Arc::default(),
             io_runtime: std::sync::OnceLock::new(),
+            inline: config.inline.then(|| {
+                let mut inline = crate::inline::InlineServer::default();
+                *inline.spin_on.get_mut() = config.inline_spin;
+                Arc::new(inline)
+            }),
             config,
         }
     }
@@ -274,11 +281,28 @@ impl ServerInner {
         self.req_rx.len() + lanes + self.lane_room.waiting()
     }
 
+    pub fn is_draining(&self) -> bool {
+        self.state.load(Ordering::Relaxed) == STATE_DRAINING
+    }
+
+    /// The drain begins: /ready reports it and the accept loop stops. Idle inline connections
+    /// close (inline::drain), and none spins any more.
+    pub fn stop_accepting(&self) {
+        self.state.store(STATE_DRAINING, Ordering::Relaxed);
+        let _ = self.shutdown_tx.send(true);
+        if let Some(inline) = &self.inline {
+            inline.spin_on.store(false, Ordering::Relaxed);
+            crate::inline::drain(self);
+        }
+    }
+
     /// The drain is over: every queue closes, and requests waiting for lane room find it so.
+    /// Unplaced connections go to hyper, draining, which ends them.
     pub fn close_queues(&self) {
         self.req_tx.lock().take();
         for slot in self.slots.read().iter() {
             slot.close_lane();
+            crate::inline::unplace(slot);
         }
         self.lane_room.notify();
     }
@@ -297,7 +321,8 @@ impl ServerInner {
     pub fn register_worker(&self) -> std::io::Result<usize> {
         let doorbell = self.config.worker_loop.then(Doorbell::new).transpose()?;
         let mut slots = self.slots.write();
-        let slot = WorkerSlot::new(self.config.lanes, WS_INBOX, doorbell);
+        let inline = self.inline.is_some();
+        let slot = WorkerSlot::new(self.config.lanes, WS_INBOX, doorbell, inline);
         if self.req_tx.lock().is_none() {
             slot.close_lane();
         }

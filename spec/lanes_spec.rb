@@ -66,7 +66,9 @@ RSpec.describe "lane dispatch" do
   each_mode do |mode|
     it_in_both_loops "answers each of a few clients' requests once while idle workers wake and steal" do
       app = Ractor.shareable_proc { |env| [200, {"content-type" => "text/plain"}, [env["PATH_INFO"]]] }
-      with_server(app, **server_defaults, mode:, lanes: true, workers: 4, threads: 1) do |_, port, server|
+      # Through lane dispatch: inline, a connection stays on its worker and nothing steals.
+      lane_path = server_defaults.key?(:worker_loop) ? {_inline: false} : {}
+      with_server(app, **server_defaults, **lane_path, mode:, lanes: true, workers: 4, threads: 1) do |_, port, server|
         answers = Array.new(4) do |client|
           Thread.new do
             Net::HTTP.start("127.0.0.1", port, read_timeout: 5) do |http|
@@ -112,7 +114,8 @@ RSpec.describe "lane dispatch" do
   end
 
   # One worker held by a request, 4 more in its lane and 2 waiting for
-  # room when the shutdown starts; then the worker is let go.
+  # room when the shutdown starts; then the worker is let go. A
+  # worker_loop serves nothing inline here, as this is lane dispatch.
   def drain_with_requests_waiting(mode, worker_loop)
     FileGate.closed do |gate|
       released = gate.path
@@ -120,7 +123,7 @@ RSpec.describe "lane dispatch" do
         Fiber.blocking { sleep 0.005 until File.exist?(released) } if env["PATH_INFO"] == "/hold"
         [200, {"content-type" => "text/plain"}, ["ok"]]
       end
-      opts = worker_loop ? {worker_loop: async_loop(4)} : {}
+      opts = worker_loop ? {worker_loop: async_loop(4), _inline: false} : {}
       server = Kino::Server.new(app, mode: mode, lanes: true, workers: 1, threads: 1, **opts).start
       port = server.port
       begin

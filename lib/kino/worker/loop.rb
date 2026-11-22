@@ -22,13 +22,16 @@ module Kino
         @worker = worker
         # The descriptor is the native worker's; this IO must never close it.
         @ready = IO.for_fd(worker.ready_fd, autoclose: false)
-        # 1 per request job that frees its slot; 0 when the backlog drained, a job ended while the loop
+        # Wakes for the loop: a job freed its slot, the backlog drained, a job ended while the loop
         # drains, or a socket's (or the wakes') job ended before its events were done.
         @done = Thread::Queue.new
         # Each request job's request: true while it holds a slot, false once its connection switched.
         @requests = {}.compare_by_identity
         # Each socket's events not yet done, in order, the first running; the wakes under WAKE.
         @pending = {}
+        # Each inline connection on a job, with the IO its job waits on.
+        @conns = {}.compare_by_identity
+        @running = 0
         @backlog = 0
         @waiting = @backlogged = @draining = @lost = @drained = false
       end
@@ -70,13 +73,15 @@ module Kino
         return unless @requests[request]
 
         @requests[request] = false
-        free_slot
+        free_slot(always: true)
       end
 
       # Serve this worker's requests, at most `concurrency` at a time, each as a job the block starts
       # on the thread's fiber scheduler (`task.async { job.call }` under Async) and runs until it first
       # waits, lest dispatch read the worker as idle. Each WebSocket's events, and the wakes, run in
       # order on jobs of their own. Returns once the worker is drained and every job has finished.
+      # A connection served inline runs on a job of its own, each request counting toward
+      # `concurrency`, and may step aside once after an answer (`yield`, else `kernel_sleep(0)`).
       # @param concurrency [Integer] the most requests running at once; one whose connection
       #   switched counts no more
       # @yieldparam job [#call] runs one request, a socket's events, or the wakes
@@ -91,31 +96,31 @@ module Kino
 
         @worker.capacity = concurrency
         @spawn = spawn
-        running = 0
+        @concurrency = concurrency
         loop do
-          running -= @done.pop until @done.empty?
+          @done.clear
           raise Error, JOB_LOST if @lost
-          room = running < concurrency
+          room = room?
           @backlogged = @backlog >= BACKLOG
-          if !room && @backlogged
-            # Neither fits: wait for a job or the backlog, back every TICK so the worker never reads stuck.
-            freed = @done.pop(timeout: TICK)
-            freed ? running -= freed : @worker.woke
-            next
-          end
           case (item = take(room))
           when Hash
-            running += 1
+            @running += 1
             # Kept from here on: the app may replace the env's entry.
             request = item[KINO_REQUEST]
             @requests[request] = true
             spawn.call(-> { run_request(item, request) })
+          when Native::Conn
+            @conns[item] = nil
+            spawn.call(-> { run_conn(item) })
           when Array, WAKE then queue(item)
           when nil then break
           end
         end
         @draining = true
-        @done.pop until @requests.empty? && @pending.empty?
+        # Each connection's job looks once more, so a retired worker's go to hyper: closing the IO it
+        # waits on wakes it (under a scheduler with fiber_interrupt) and leaves the descriptor open.
+        @conns.each_value { it&.close }
+        @done.pop until @requests.empty? && @pending.empty? && @conns.empty?
         raise Error, JOB_LOST if @lost
         @drained = true
         @worker.drained(Log.source)
@@ -124,29 +129,101 @@ module Kino
 
       private
 
+      # Takes what there is room for (Native::Worker#take_nonblock), else waits; false: take again.
       def take(room)
-        only = room ? (:requests if @backlogged) : :events
+        only = if room
+          :requests if @backlogged
+        else
+          @backlogged ? :connections : :events
+        end
         item = only ? @worker.take_nonblock(only) : @worker.take_nonblock
         return item unless item == false
 
-        only ? busy(only) : idle
+        case only
+        when nil then idle
+        when :connections then full
+        else busy(only)
+        end
+      end
+
+      # Neither fits: wait for a job or the backlog, back every TICK so the worker never reads stuck.
+      # A connection placed meanwhile is taken then.
+      def full
+        @worker.woke unless @done.pop(timeout: TICK)
+        false
       end
 
       # No timeout, so no scheduler timer: the ticker rings a waiting doorbell every TICK (a lane tick).
       def idle
         @ready.wait_readable
-        @worker.take_woken
+        return @worker.take_woken if room?
+
+        @worker.woke
+        false
       end
 
+      # A job that ended, the backlog drained or inline requests taking the room change what fits.
       def busy(only)
         @waiting = true
         @ready.wait_readable if @done.empty?
-        return @worker.take_woken(only) if @done.empty?
+        return @worker.take_woken(only) if @done.empty? && (only == :events || room?)
 
         @worker.woke
         false
       ensure
         @waiting = false
+      end
+
+      def room? = @running < @concurrency
+
+      # An inline connection's requests, one at a time while the worker has room; between them the
+      # job waits on the socket, which only the native side reads, writes and closes.
+      def run_conn(conn)
+        io = watch(conn)
+        loop do
+          case (got = conn.next_request(room?))
+          when Hash then run_inline(got)
+          when :yield then yield_turn
+          when :readable, :writable
+            begin
+              (got == :readable) ? io.wait_readable : io.wait_writable
+            rescue IOError
+              raise unless io.closed?
+              io = watch(conn)
+            end
+          else break
+          end
+        end
+      ensure
+        conn.close
+        @conns.delete(conn)
+        @done << 0 if @draining
+      end
+
+      # Every fiber already ready runs before the job looks again, as async-http yields after each
+      # response: the scheduler's own yield where it has one, else kernel_sleep(0).
+      def yield_turn
+        scheduler = Fiber.current_scheduler or return
+        scheduler.respond_to?(:yield) ? scheduler.yield : scheduler.kernel_sleep(0)
+      end
+
+      # The IO the loop closes to wake the job; the descriptor is the connection's, never this IO's.
+      def watch(conn)
+        fd = conn.fd
+        @conns[conn] = fd && IO.for_fd(fd, autoclose: false)
+      end
+
+      # No rescue: whatever unwinds the job, the connection's close (run_conn) answers with a 500.
+      # Worker#serve straight from the job: a method between would cost a Ruby call per request.
+      def run_inline(env)
+        @running += 1
+        request = env[KINO_REQUEST]
+        @serving.serve(env) do |_request, status, headers, chunks|
+          request.send_simple(status, headers, chunks)
+        end
+      ensure
+        request&.close_waits
+        free_slot(always: false)
       end
 
       def run_request(env, request)
@@ -160,15 +237,19 @@ module Kino
       ensure
         request.close_waits
         if @requests.delete(request)
-          free_slot
+          free_slot(always: true)
         elsif @draining
           @done << 0
         end
       end
 
-      def free_slot
-        @done << 1
-        @worker.ring if @waiting
+      # The count drops at once, for a connection's job that resumes first. The loop hears of it from a
+      # request job, or when the worker was full, which dispatch counts until its loop's next take.
+      def free_slot(always:)
+        was_full = !room?
+        @running -= 1
+        @done << 0 if always || was_full
+        @worker.ring if @waiting || was_full
       end
 
       # An event waits on its socket's job, or starts one; a wake folds into one waiting to run.

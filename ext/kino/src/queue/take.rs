@@ -75,11 +75,15 @@ fn owner_waits(owner: &WorkerSlot, now: &mut Option<u64>) -> bool {
 }
 
 /// What a worker_loop take has room for (Kino::Worker::Loop#take).
-#[derive(Clone, Copy)]
+/// A placed connection is taken whatever the room: one placed before the worker filled up sends
+/// its first request to hyper, where queue_timeout bounds its wait.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub(crate) enum Room {
     All,
     Events,
     Requests,
+    /// Room for neither: placed connections alone.
+    Connections,
 }
 
 /// A worker's side of the queues: its slot, and through the server its siblings' lanes or the
@@ -93,6 +97,13 @@ pub(crate) struct Taker<'a> {
 impl<'a> Taker<'a> {
     pub(crate) fn new(server: &'a ServerInner, slot: &'a Arc<WorkerSlot>) -> Self {
         Taker { server, slot }
+    }
+
+    /// A connection placed on the worker to serve inline, apart from its lane: no sibling's
+    /// steal meets one.
+    fn placed(self) -> Option<Item> {
+        let conn = self.slot.lane.placed_rx.as_ref()?.try_recv().ok()?;
+        Some(Item::Conn(conn))
     }
 
     /// What the worker owes its own sockets and wake hook ahead of any request: the
@@ -169,6 +180,10 @@ impl<'a> Taker<'a> {
         if !slot.life.retired() || slot.hijacked.load(Ordering::SeqCst) > 0 {
             return Take::Nothing;
         }
+        // Placed before the retirement: its own to serve (or close).
+        if let Some(conn) = self.placed() {
+            return Take::Item(conn);
+        }
         let Some(lane_rx) = slot.lane.rx.as_ref() else {
             return Take::Closed;
         };
@@ -215,8 +230,8 @@ impl<'a> Taker<'a> {
         None
     }
 
-    /// Inbox and wake (after the lane, once a full run owes it a look), the lane, then a
-    /// steal. Closed once the lane is closed and the inbox empty.
+    /// Inbox and wake (after the lane, once a full run owes it a look), a connection placed on
+    /// it, the lane, then a steal. Closed once the lane is closed and the inbox empty.
     pub(crate) fn ready(self) -> Take {
         self.ready_after(false)
     }
@@ -229,7 +244,7 @@ impl<'a> Taker<'a> {
             .rx
             .as_ref()
             .expect("a lane take without a lane");
-        if let Some(item) = self.own_item() {
+        if let Some(item) = self.own_item().or_else(|| self.placed()) {
             return Take::Item(item);
         }
         loop {
@@ -239,7 +254,11 @@ impl<'a> Taker<'a> {
                         return Take::Item(taken);
                     }
                 }
-                Err(flume::TryRecvError::Disconnected) => return self.closing_item(),
+                // Placed as the lane closed: still taken, as its send came first under the lane
+                // lock.
+                Err(flume::TryRecvError::Disconnected) => {
+                    return Take::from(self.placed()).or_else(|| self.closing_item())
+                }
                 Err(flume::TryRecvError::Empty) => break,
             }
         }
@@ -377,7 +396,13 @@ impl<'a> Taker<'a> {
             },
             Some(Item::Wake) if self.slot.wake() => Back::Waits,
             Some(Item::Wake) => Back::Held(Some(Item::Wake)),
-            other => Back::HandedOver(other),
+            other => {
+                debug_assert!(
+                    !matches!(other, Some(Item::Conn(_))),
+                    "a park took a placed connection"
+                );
+                Back::HandedOver(other)
+            }
         }
     }
 
@@ -395,8 +420,15 @@ impl<'a> Taker<'a> {
         let all = |taker: Self| taker.ready_after(waited).or_else(|| taker.after_timeout());
         match room {
             Room::All => self.take_with_room(all, true),
-            Room::Requests => self.take_with_room(|taker| taker.lane_request().into(), true),
-            Room::Events => self.take_with_room(|taker| taker.own_ready().into(), false),
+            Room::Requests => {
+                let requests = |taker: Self| taker.placed().or_else(|| taker.lane_request());
+                self.take_with_room(|taker| requests(taker).into(), true)
+            }
+            Room::Events => {
+                let events = |taker: Self| taker.own_ready().or_else(|| taker.placed());
+                self.take_with_room(|taker| events(taker).into(), false)
+            }
+            Room::Connections => self.take_placed(),
         }
     }
 
@@ -452,6 +484,19 @@ impl<'a> Taker<'a> {
             }
         }
         None
+    }
+
+    /// Room::Connections: it neither arms the doorbell nor parks the slot.
+    fn take_placed(self) -> Take {
+        let slot = self.slot;
+        let now = slot.load.back_in_loop();
+        let Some(conn) = self.placed() else {
+            slot.load.waits_on_doorbell(now);
+            return Take::Nothing;
+        };
+        slot.load.hold(HOLDING_ITEM);
+        slot.park.took(Some(&conn));
+        Take::Item(conn)
     }
 
     /// With the lane out of play, a full run's look at it is moot: the run restarts, a due wake first.

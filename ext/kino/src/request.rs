@@ -17,6 +17,7 @@ use crate::env_strings::{self, EnvStrings};
 use crate::framing::Bodiless;
 use crate::gvl;
 use crate::pin::PinSlab;
+use crate::registry::ServerInner;
 use crate::response::{full_body, BodyFrame, Cut, FrameResult, Responder};
 use crate::server::Peer;
 use crate::slot::WorkerSlot;
@@ -62,6 +63,9 @@ pub struct RequestCtx {
     /// Whose in-flight count a hijack leaves.
     pub server_id: u64,
     pub waits: Waits,
+    /// Served inline: its connection, held as long as the request is, so a write's wait on its
+    /// socket outlives its job (InlineIo::waited); its responder holds it weakly.
+    pub inline: Option<Arc<crate::inline::InlineIo>>,
 }
 
 /// Whether a wait opened the bells, how many waits are out (Request#waited), and whether the
@@ -130,15 +134,40 @@ impl RequestCtx {
         body_rx: Option<flume::Receiver<Bytes>>,
         upgrade: Option<crate::upgrade::Upgrade>,
     ) -> crate::registry::BoxedCtx {
+        let mut ctx = RequestCtx::queued(
+            server,
+            parts.method,
+            parts.uri,
+            parts.version,
+            parts.headers,
+            peer,
+            responder,
+        );
+        ctx.body_rx = body_rx;
+        ctx.upgrade = upgrade;
+        Box::new(ctx)
+    }
+
+    /// Queued now, with no body, worker or switch yet: the caller sets what its request has.
+    #[inline]
+    pub fn queued(
+        server: &ServerInner,
+        method: http::Method,
+        uri: http::Uri,
+        version: http::Version,
+        headers: http::HeaderMap,
+        peer: Peer,
+        responder: Arc<Responder>,
+    ) -> Self {
         let now = std::time::Instant::now();
-        Box::new(RequestCtx {
-            method: parts.method,
-            uri: parts.uri,
-            version: parts.version,
-            headers: parts.headers,
+        RequestCtx {
+            method,
+            uri,
+            version,
+            headers,
             peer,
             https: server.config.tls.is_some(),
-            body_rx,
+            body_rx: None,
             leftover: Cell::new(None),
             slot: None,
             pin_slab: server.pin_slab.clone(),
@@ -148,11 +177,12 @@ impl RequestCtx {
             wait: std::time::Duration::ZERO,
             admitted_at: now,
             gc: Cell::new(None),
-            upgrade,
+            upgrade: None,
             hijacked: false,
             server_id: server.id,
             waits: Waits::default(),
-        })
+            inline: None,
+        }
     }
 
     /// Done(None) at the body's end (or abandonment, see body_ended), when its waits close too.
@@ -247,7 +277,7 @@ impl RequestCtx {
     fn answered(&self) {
         self.close_waits();
         if let Some(slot) = &self.slot {
-            slot.answered(&self.responder);
+            slot.answered(&self.responder, self.inline.is_some());
         }
     }
 
@@ -625,6 +655,7 @@ fn body_chunk(ruby: &Ruby, ctx: &RequestCtx, mut chunk: Bytes, max_len: usize) -
 /// here, no intermediate array on the Ruby side), full body. Free function
 /// shared by the `send_simple` binding and the fused respond_and_take path
 /// (queue/worker.rs).
+/// An inline request's answer is written on its connection here and now.
 pub fn respond_simple(
     ruby: &Ruby,
     request: &Request,
@@ -634,6 +665,16 @@ pub fn respond_simple(
 ) -> Result<bool, Error> {
     request.decline_upgrade();
     let ctx = request.0.borrow();
+    if let Some(io) = &ctx.inline {
+        let head = inline_head(ruby, status, headers)?;
+        // No copy: the GVL is held until the write returns, which copies what the socket leaves.
+        // SAFETY: `body` is an RString on this frame's stack (the GC neither frees nor moves it),
+        // and no Ruby runs nor is the GVL released before the slice's last use, in respond.
+        let body = unsafe { body.as_slice() };
+        let sent = io.respond(&ctx.responder, head.status, &head.headers, body);
+        ctx.answered();
+        return Ok(sent);
+    }
     let mut builder = timed(&ctx, build_head(status, headers)?);
     let bytes = if frame_by_length(&mut builder, status, &ctx.method, body.len()) {
         body_bytes(&ctx.pin_slab, body)
@@ -648,7 +689,7 @@ pub fn respond_simple(
     Ok(sent)
 }
 
-/// A buffered answer is framed by its body: hyper trusts a
+/// A buffered answer is framed by its body, as the inline writer frames it: hyper trusts a
 /// Content-Length it is given, so the app's is dropped (a wrong one would misframe what follows),
 /// as is its Transfer-Encoding (beside a length, hyper ends the connection unanswered). A HEAD
 /// sends no body (over h2 it would go as DATA) and keeps the app's first Content-Length, else its
@@ -822,6 +863,7 @@ impl Request {
 
     /// Start a streaming response: head goes out now, chunks follow via
     /// write_chunk, terminated by finish. Once Kino answered, the first write ends the body.
+    /// An inline request's head is written on its connection (InlineIo::start_stream).
     pub fn send_headers(
         ruby: &Ruby,
         rb_self: &Request,
@@ -830,6 +872,10 @@ impl Request {
     ) -> Result<bool, Error> {
         rb_self.decline_upgrade();
         let ctx = rb_self.0.borrow();
+        if let Some(io) = &ctx.inline {
+            let head = inline_head(ruby, status, headers)?;
+            return Ok(io.start_stream(&ctx.responder, head.status, &head.headers));
+        }
         let builder = timed(&ctx, build_head(status, headers)?);
         let sent = match Bodiless::of(status, ctx.method == http::Method::HEAD) {
             Some(bodiless) => ctx.responder.send_bodiless_head(builder, bodiless),
@@ -839,10 +885,22 @@ impl Request {
     }
 
     /// One body chunk. Blocks (GVL released) when the client is slower than
-    /// the app: this is the outbound backpressure. Raises ClientGone once the
     /// client is gone or Kino gave the stream up.
-    pub fn write_chunk(ruby: &Ruby, rb_self: &Request, chunk: RString) -> Result<(), Error> {
+    /// False once the chunk is on its way. An inline write waits a TICK at most for its socket,
+    /// then returns true to be made again, so a pending Thread#raise reaches the thread in Ruby.
+    pub fn write_chunk(ruby: &Ruby, rb_self: &Request, chunk: RString) -> Result<bool, Error> {
         let ctx = rb_self.0.borrow();
+        if let Some(io) = &ctx.inline {
+            let Step::Wait(fd) = write_inline(ruby, &ctx, io, chunk)? else {
+                return Ok(false);
+            };
+            let unread = std::sync::atomic::AtomicBool::new(false);
+            let wait = || crate::inline::await_writable(fd, crate::queue::TICK);
+            let waited = gvl::Parker::release(&mut gvl::Released, &unread, wait);
+            io.waited();
+            waited?;
+            return Ok(true);
+        }
         let Some(sender) = ctx.responder.body_sender() else {
             return Err(stream_closed_error(ruby, &ctx.responder));
         };
@@ -864,7 +922,7 @@ impl Request {
             }
         })?;
         match outcome {
-            Some(true) => Ok(()),
+            Some(true) => Ok(false),
             // Gone, or given up (and counted then).
             Some(false) => {
                 ctx.responder.cut_stream(crate::response::Cut::ClientGone);
@@ -875,11 +933,26 @@ impl Request {
     }
 
     /// write_chunk for a fiber scheduler: true once on its way, else the descriptor to wait on.
+    /// An inline request's is [:writable, fd].
     pub fn write_chunk_nonblock(
         ruby: &Ruby,
         rb_self: &Request,
         chunk: RString,
     ) -> Result<Value, Error> {
+        {
+            let ctx = rb_self.0.borrow();
+            if let Some(io) = &ctx.inline {
+                return Ok(match write_inline(ruby, &ctx, io, chunk)? {
+                    Step::Done(()) => ruby.qtrue().as_value(),
+                    Step::Wait(fd) => ruby
+                        .ary_new_from_values(&[
+                            crate::symbols::get().writable.value(),
+                            ruby.into_value(fd),
+                        ])
+                        .as_value(),
+                });
+            }
+        }
         let step = rb_self
             .0
             .borrow()
@@ -895,6 +968,14 @@ impl Request {
     /// A wait on a descriptor read_body_nonblock or write_chunk_nonblock handed out is over.
     pub fn waited(_ruby: &Ruby, rb_self: &Request) {
         rb_self.0.borrow().waited();
+    }
+
+    /// The [:writable, fd] wait write_chunk_nonblock handed out is over: the descriptor may
+    /// close.
+    pub fn waited_writable(_ruby: &Ruby, rb_self: &Request) {
+        if let Some(io) = &rb_self.0.borrow().inline {
+            io.waited();
+        }
     }
 
     /// The request's job is over: its waits' descriptors close (RequestCtx::close_waits).
@@ -920,6 +1001,38 @@ impl Request {
             ctx.answered();
         }
         Ok(())
+    }
+}
+
+/// The status and headers an inline answer is encoded from (inline/encode.rs).
+#[inline]
+fn inline_head(ruby: &Ruby, status: u16, headers: RHash) -> Result<http::response::Parts, Error> {
+    let response = build_head(status, headers)?.body(());
+    Ok(response
+        .map_err(|e| invalid_response(ruby, e))?
+        .into_parts()
+        .0)
+}
+
+/// One chunk of an inline request's stream, written now with the GVL held, or the socket to wait
+/// on first (InlineIo::write_chunk); ClientGone once nothing reaches the client.
+fn write_inline(
+    ruby: &Ruby,
+    ctx: &RequestCtx,
+    io: &crate::inline::InlineIo,
+    chunk: RString,
+) -> Result<Step<()>, Error> {
+    use crate::inline::Wrote;
+
+    // SAFETY: `chunk` is an RString on this frame's stack (the GC neither frees nor moves it),
+    // and no Ruby runs nor is the GVL released before write_chunk, which copies what the socket
+    // does not take.
+    let data = unsafe { chunk.as_slice() };
+    match io.write_chunk(&ctx.responder, data) {
+        Wrote::Done => Ok(Step::Done(())),
+        Wrote::Wait(fd) => Ok(Step::Wait(fd)),
+        Wrote::Gone => Err(wait_error(ruby, &ctx.responder, WaitError::Gone)),
+        Wrote::Closed => Err(stream_closed_error(ruby, &ctx.responder)),
     }
 }
 
@@ -1075,7 +1188,7 @@ mod tests {
     #[test]
     fn a_wait_fails_as_interrupted_once_its_slot_is_halted_though_what_came_is_still_read() {
         let (body_tx, body_rx) = flume::bounded::<Bytes>(1);
-        let slot = Arc::new(WorkerSlot::new(true, 1, None));
+        let slot = Arc::new(WorkerSlot::new(true, 1, None, false));
         let mut ctx = test_ctx();
         ctx.body_rx = Some(body_rx);
         ctx.slot = Some(slot.clone());

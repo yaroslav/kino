@@ -2,7 +2,7 @@
 
 # Worker threads that share a GVL (every worker in :threaded mode, a
 # Ractor's threads) take turns with it. A worker handed a request while
-# it waited (by the shared queue or its lane)
+# it waited (by the shared queue, or on a connection it serves inline)
 # has to win the GVL back to run it, while a worker already running keeps
 # taking the requests queued for it without ever waiting. The handed
 # request must not wait for those to run dry: a worker passes the GVL
@@ -59,6 +59,11 @@ RSpec.describe "fairness among worker threads sharing a GVL" do
 
   it_in_both_loops "runs a request handed to a waiting worker before the running worker drains the burst" do
     expect_both_started_early(start_order(**server_defaults))
+  end
+
+  # Inline, its connections' requests decide it; here its loop's takes do.
+  it "does the same under a worker_loop whose requests come through its lane" do
+    expect_both_started_early(start_order(worker_loop: async_loop(8), _inline: false))
   end
 
   it "does the same for two threads of one Ractor" do

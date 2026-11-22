@@ -15,6 +15,7 @@ pub fn kind(take: &Take) -> &'static str {
         Take::Item(Item::Ctx(_)) => "request",
         Take::Item(Item::Ws(_)) => "event",
         Take::Item(Item::Wake) => "wake",
+        Take::Item(Item::Conn(_)) => "connection",
         Take::Closed => "the end",
         Take::Nothing => "nothing",
     }

@@ -11,7 +11,7 @@ use super::codec::accept_key;
 use super::socket::{Abort, Out};
 use super::stats::{Cause, Refusal, WsCount, CLOSED, COUNTS, HANDSHAKES_REFUSED, OPEN};
 use super::{unregister, Conn, Limits, CONNS, NEXT_ID};
-use crate::framing::tokens;
+use crate::framing;
 use crate::registry::ServerInner;
 use crate::request::RequestCtx;
 use crate::slot::WorkerSlot;
@@ -101,15 +101,14 @@ impl Drop for Registration {
 
 /// RFC 6455 4.2.1: an HTTP/1.1 GET upgrading to version 13, with a key.
 fn is_upgrade<B>(req: &hyper::Request<B>) -> bool {
-    let has_token = |name, token: &str| {
-        let lists = |v: &str| tokens(v).any(|t| t.eq_ignore_ascii_case(token));
+    let has_token = |name, token: &[u8]| {
         let mut values = req.headers().get_all(name).iter();
-        values.any(|v| v.to_str().is_ok_and(lists))
+        values.any(|v| v.to_str().is_ok() && framing::has_token(v.as_bytes(), token))
     };
     req.method() == http::Method::GET
         && req.version() == http::Version::HTTP_11
-        && has_token(http::header::UPGRADE, "websocket")
-        && has_token(http::header::CONNECTION, "upgrade")
+        && has_token(http::header::UPGRADE, b"websocket")
+        && has_token(http::header::CONNECTION, b"upgrade")
         && req.headers().contains_key(http::header::SEC_WEBSOCKET_KEY)
         && req
             .headers()

@@ -15,7 +15,7 @@ pub fn available_parallelism(_ruby: &Ruby) -> Result<usize, Error> {
     Ok(count())
 }
 
-fn count() -> usize {
+pub(crate) fn count() -> usize {
     std::thread::available_parallelism().map_or(1, |n| n.get())
 }
 

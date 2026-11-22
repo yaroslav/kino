@@ -99,10 +99,13 @@ fn send_hot_first(
 
     // Only an empty lane: a burst into an idle server must spread, not queue behind one hot
     // worker. A crashed worker's slot stays parked and retired until it is recycled.
+    // A worker_loop worker's inline request runs while its loop stays parked: holding one, it is
+    // not idle.
     let find_hottest = || {
         slots
             .iter()
             .filter(|slot| slot.park.is_parked())
+            .filter(|slot| !slot.load.is_holding())
             .filter(|slot| !slot.life.seems_retired())
             .filter(|slot| eligible(slot) && !slot.load.at_capacity())
             .filter(|slot| slot.lane.open_and_empty())

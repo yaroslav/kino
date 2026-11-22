@@ -4,6 +4,7 @@
 //! (normal path), Kino (`abort_inflight` after a ractor crash, or a
 //! worker's next take, `let_go`, for what it left unanswered), or the
 //! `RequestCtx` Drop backstop. The `responded` flag makes the race benign.
+//! An inline request is answered on its own socket (Sink::Inline), under its connection's lock.
 //!
 //! Two response shapes: `send_response` (complete, one shot) and
 //! `send_stream_head` + a bounded frame channel (streaming bodies). The
@@ -13,7 +14,7 @@
 use std::io;
 use std::pin::Pin;
 use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Weak};
 use std::task::{Context, Poll};
 
 use bytes::Bytes;
@@ -85,10 +86,25 @@ struct HyperSink {
     held_101: Mutex<Option<(oneshot::Sender<()>, Box<HyperResponse>)>>,
 }
 
+/// Where a request's answer goes: hyper's connection, or the one it was read on inline.
+enum Sink {
+    Hyper(HyperSink),
+    Inline(Weak<crate::inline::InlineIo>),
+}
+
+impl Default for Sink {
+    fn default() -> Self {
+        Sink::Hyper(HyperSink::default())
+    }
+}
+
+/// How a request's answer reaches its connection.
 #[derive(Default)]
 pub struct Responder {
-    sink: HyperSink,
-    /// A stream started: whether it is still open is let_go's to look.
+    sink: Sink,
+    /// An inline stream is going out, from its head until its end.
+    streaming: AtomicBool,
+    /// A stream started, inline or not: whether it is still open is let_go's to look.
     streamed: AtomicBool,
     responded: AtomicBool,
     /// The forwarder's abandonment flag rides in the one per-request shared
@@ -111,11 +127,25 @@ impl Responder {
     pub fn new(head_tx: oneshot::Sender<HyperResponse>) -> Self {
         let head = Mutex::new(Some(head_tx));
         Responder {
-            sink: HyperSink {
+            sink: Sink::Hyper(HyperSink {
                 head,
                 ..HyperSink::default()
-            },
+            }),
             ..Responder::default()
+        }
+    }
+
+    pub fn inline(io: Weak<crate::inline::InlineIo>) -> Self {
+        Responder {
+            sink: Sink::Inline(io),
+            ..Responder::default()
+        }
+    }
+
+    fn hyper(&self) -> Option<&HyperSink> {
+        match &self.sink {
+            Sink::Hyper(hyper) => Some(hyper),
+            Sink::Inline(_) => None,
         }
     }
 
@@ -148,15 +178,31 @@ impl Responder {
     /// The app still owes its answer, or the rest of a stream that was not cut.
     pub fn open(&self) -> bool {
         !self.responded.load(Ordering::SeqCst)
-            || (!self.stream_cut() && self.sink.body.lock().is_some())
+            || (!self.stream_cut()
+                && (self.streaming.load(Ordering::SeqCst)
+                    || self.hyper().is_some_and(|h| h.body.lock().is_some())))
+    }
+
+    pub(crate) fn set_streaming(&self, streaming: bool) {
+        if streaming {
+            self.streamed.store(true, Ordering::Relaxed);
+        }
+        self.streaming.store(streaming, Ordering::SeqCst);
     }
 
     /// Claim the right to respond. First caller wins; everyone else gets None.
+    /// An inline request's is claimed on its connection instead (claim_inline).
     fn claim(&self) -> Option<oneshot::Sender<HyperResponse>> {
+        let hyper = self.hyper()?;
         if self.responded.swap(true, Ordering::SeqCst) {
             return None;
         }
-        self.sink.head.lock().take()
+        hyper.head.lock().take()
+    }
+
+    /// Under the connection's lock. First caller wins.
+    pub fn claim_inline(&self) -> bool {
+        !self.responded.swap(true, Ordering::SeqCst)
     }
 
     /// Whether the app's answer, its stream's head or Kino's own claimed the request.
@@ -173,12 +219,18 @@ impl Responder {
     /// when anything else answers. hyper keeps a connection open for an upgrade after any
     /// answer but a 101, so the socket must not wait on hyper.
     pub fn hold_for_switch(&self, switched: oneshot::Sender<()>, response: HyperResponse) {
-        *self.sink.held_101.lock() = Some((switched, Box::new(response)));
+        debug_assert!(self.hyper().is_some(), "inline serves no protocol switch");
+        if let Some(hyper) = self.hyper() {
+            *hyper.held_101.lock() = Some((switched, Box::new(response)));
+        }
     }
 
     /// False when nothing is held, or something else answered first (a 500, a 504).
     pub fn switch(&self) -> bool {
-        let mut held = self.sink.held_101.lock();
+        let Some(hyper) = self.hyper() else {
+            return false;
+        };
+        let mut held = hyper.held_101.lock();
         let Some((switched, response)) = held.take() else {
             return false;
         };
@@ -190,14 +242,16 @@ impl Responder {
     }
 
     pub fn cancel_switch(&self) -> bool {
-        self.sink.held_101.lock().take().is_some()
+        self.hyper()
+            .is_some_and(|h| h.held_101.lock().take().is_some())
     }
 
-    /// A stream's claim on the answer; None, the stream reading as cut, when Kino answered first.
-    fn claim_stream(&self) -> Option<oneshot::Sender<HyperResponse>> {
-        let Some(head) = self.claim() else {
+    /// A stream's claim on the answer, with hyper's sink; None, the stream reading as cut, when
+    /// Kino answered first.
+    fn claim_stream(&self) -> Option<(&HyperSink, oneshot::Sender<HyperResponse>)> {
+        let (Some(hyper), Some(head)) = (self.hyper(), self.claim()) else {
             // A request starts its stream once: an open one is its own.
-            if self.sink.body.lock().is_none() {
+            if self.hyper().is_none_or(|h| h.body.lock().is_none()) {
                 self.answered_first();
             }
             return None;
@@ -207,7 +261,7 @@ impl Responder {
             self.answered_first();
             return None;
         }
-        Some(head)
+        Some((hyper, head))
     }
 
     /// A streamed answer's head where HTTP allows no body: it goes out with an empty one, its
@@ -218,7 +272,7 @@ impl Responder {
         mut builder: hyper::http::response::Builder,
         bodiless: Bodiless,
     ) -> Result<bool, http::Error> {
-        let Some(head) = self.claim_stream() else {
+        let Some((_, head)) = self.claim_stream() else {
             return Ok(false);
         };
         if let Some(headers) = builder.headers_mut() {
@@ -245,14 +299,14 @@ impl Responder {
         self: &Arc<Self>,
         builder: hyper::http::response::Builder,
     ) -> Result<bool, http::Error> {
-        let Some(head) = self.claim_stream() else {
+        let Some((hyper, head)) = self.claim_stream() else {
             return Ok(false);
         };
         let (body, frames) = flume::bounded(STREAM_BUFFER);
         let streamed = Streamed::new(frames, Some(self.clone()), None);
         let response = builder.body(Either::Right(streamed))?;
         self.streamed.store(true, Ordering::Relaxed);
-        *self.sink.body.lock() = Some(body);
+        *hyper.body.lock() = Some(body);
         if head.send(response).is_err() {
             self.answered_first();
             return Ok(false);
@@ -262,9 +316,11 @@ impl Responder {
 
     /// Kino answered first (a 504 or a give-up's 500), the request is gone, or its head allows no
     /// body: the stream reads as cut, so the next write ends it, but no cut counts.
-    fn answered_first(&self) {
+    pub(crate) fn answered_first(&self) {
         self.uncounted.store(true, Ordering::Relaxed);
-        self.sink.body.lock().take();
+        if let Some(hyper) = self.hyper() {
+            hyper.body.lock().take();
+        }
         self.stream_cut.store(true, Ordering::SeqCst);
     }
 
@@ -276,7 +332,7 @@ impl Responder {
     /// Clone of the live frame sender, if a stream is open. The clone lets
     /// `write_chunk` block on a full channel without holding the lock.
     pub fn body_sender(&self) -> Option<flume::Sender<FrameResult>> {
-        self.sink.body.lock().clone()
+        self.hyper().and_then(|hyper| hyper.body.lock().clone())
     }
 
     pub fn stream_cut(&self) -> bool {
@@ -285,8 +341,17 @@ impl Responder {
 
     /// Clean end of stream: dropping the sender ends the hyper body.
     pub fn finish_stream(&self) {
-        self.sink.body.lock().take();
-        self.room_bell.ring();
+        match &self.sink {
+            Sink::Hyper(hyper) => {
+                hyper.body.lock().take();
+                self.room_bell.ring();
+            }
+            Sink::Inline(io) => {
+                if let Some(io) = io.upgrade() {
+                    io.finish_stream(self);
+                }
+            }
+        }
     }
 
     pub fn cut_stream(&self, why: Cut) {
@@ -303,7 +368,7 @@ impl Responder {
         if self.claimed() && !self.streamed.load(Ordering::Relaxed) {
             return;
         }
-        if !self.open() || self.sink.held_101.lock().is_some() {
+        if !self.open() || self.hyper().is_some_and(|h| h.held_101.lock().is_some()) {
             return;
         }
         self.give_up(Cut::Crash);
@@ -313,7 +378,18 @@ impl Responder {
     /// Mid-stream: error frame, which makes hyper abort the connection
     /// rather than fake a clean end. Never touches the Ruby API: callable
     /// from Drop, tokio threads, and the supervisor. Never waits either.
+    /// An inline request's goes out on its connection (InlineIo::give_up), else is only claimed.
     pub fn give_up(&self, why: Cut) {
+        let hyper = match &self.sink {
+            Sink::Hyper(hyper) => hyper,
+            Sink::Inline(io) => {
+                match io.upgrade() {
+                    Some(io) => io.give_up(self, why),
+                    None => _ = self.claim_inline(),
+                }
+                return;
+            }
+        };
         if let Some(tx) = self.claim() {
             let mut response = plain_response(500, "Internal Server Error\n");
             if self.cancel_switch() {
@@ -322,7 +398,7 @@ impl Responder {
             let _ = tx.send(response);
             return;
         }
-        if let Some(body_tx) = self.sink.body.lock().take() {
+        if let Some(body_tx) = hyper.body.lock().take() {
             // Flagged before the send: without room for the frame, hyper fails it once drained.
             self.cut_stream(why);
             let _ = body_tx.try_send(Err(abandoned()));

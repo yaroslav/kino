@@ -42,6 +42,11 @@ pub struct ServerConfig {
     pub shared_gvl: bool,
     /// False pins every connection to HTTP/1.
     pub http2: bool,
+    /// Serve plain HTTP/1.1 connections on worker_loop workers' threads (inline/), as resolved.
+    pub inline: bool,
+    /// An inline connection alone on its worker may spin at its socket (inline/spin.rs); Ruby
+    /// turns it off on a process that may use one CPU.
+    pub inline_spin: bool,
     pub log_requests: bool,
     pub topology: Topology,
     pub ws: Arc<crate::ws::Limits>,
@@ -81,6 +86,8 @@ impl TryFrom<RHash> for ServerConfig {
             shared_gvl: false,
             // Default true guards embedders calling the native layer directly.
             http2: optional(hash, "http2")?.unwrap_or(true),
+            inline: optional(hash, "inline")?.unwrap_or(true),
+            inline_spin: optional(hash, "inline_spin")?.unwrap_or(false),
             log_requests: optional(hash, "log_requests")?.unwrap_or(false),
             topology: Topology {
                 mode: optional(hash, "mode")?.unwrap_or_else(|| "threaded".to_string()),
@@ -117,6 +124,8 @@ impl TryFrom<RHash> for ServerConfig {
         let topology = &mut config.topology;
         topology.max_workers = topology.max_workers.max(topology.workers);
         config.shared_gvl = topology.mode == "threaded" || topology.threads > 1;
+        // TLS serves through hyper alone.
+        config.inline &= config.worker_loop && config.tls.is_none();
         Ok(config)
     }
 }

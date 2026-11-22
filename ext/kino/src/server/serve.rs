@@ -1,5 +1,6 @@
 //! Serving an accepted connection: the TLS handshake, the client's first bytes in time
-//! (intake.rs), then hyper until it ends or drains.
+//! (intake.rs), then hyper until it ends or drains; or inline on a worker (inline/), with hyper
+//! again for what it hands back.
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -12,10 +13,10 @@ use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::net::TcpStream;
 use tokio_util::either::Either;
 
-use super::accept::{Accepted, Conn, ConnIo, Peer};
+use super::accept::{Accepted, Conn, ConnIo, Held, Peer, StdConn};
 use super::handle::handle_request;
 use super::intake::{
-    drain_signal, first_bytes, preface, Began, Intake, H2_PING_EVERY, H2_PING_TIMEOUT,
+    drain_signal, first_bytes, preface, took_first, Began, Intake, H2_PING_EVERY, H2_PING_TIMEOUT,
     HEADER_READ_TIMEOUT,
 };
 use crate::registry::ServerInner;
@@ -39,16 +40,20 @@ async fn serve_conn_by(
 ) {
     let (stream, acceptor) = match (conn, acceptor) {
         (Either::Left(stream), Some(acceptor)) => (stream, acceptor),
+        // A plain one is served inline from here on, unless no worker has room for it.
         // TLS over a unix socket is refused at bind time.
         (conn, _) => {
-            let accepted = Accepted { conn, peer, held };
-            return serve(accepted, intake.first_byte, server).await;
+            if let Err((conn, held)) = crate::inline::place(&server, conn, held, peer) {
+                let accepted = Accepted { conn, peer, held };
+                serve(accepted, None, intake.first_byte, server).await;
+            }
+            return;
         }
     };
     // Failed or stalled handshakes (scans, plain HTTP, slowloris) just drop the connection.
     // The timeout bounds a stall, and the drain closes one whose handshake has not begun.
     let accepted = tokio::time::Instant::now();
-    let began = first_bytes(Either::Left(&stream), intake.handshake, &server);
+    let began = first_bytes(Either::Left(&stream), &[], intake.handshake, &server);
     if began.await.is_none() {
         return;
     }
@@ -79,7 +84,7 @@ async fn tls_protocol(
         // What came with the handshake's last flight is read already. Else the peek sees
         // records, whose first byte (a content type, 0x14 to 0x18) never starts the h2 preface.
         if session.wants_read() {
-            first_bytes(Either::Left(tcp), left(), server).await?;
+            first_bytes(Either::Left(tcp), &[], left(), server).await?;
         }
         return Some((Protocol::Http1, Bytes::new()));
     }
@@ -92,18 +97,49 @@ async fn tls_protocol(
     Some((protocol, prefix))
 }
 
-/// A plain connection served by hyper once its client began, by `within` (first_bytes).
-async fn serve(accepted: Accepted, within: Duration, server: Arc<ServerInner>) {
+/// A plain connection served by hyper once its client began, by `within` (first_bytes): fresh, or
+/// handed back with `read` read, which hyper reads first.
+async fn serve(
+    accepted: Accepted,
+    read: Option<Bytes>,
+    within: Duration,
+    server: Arc<ServerInner>,
+) {
     let plain = match &accepted.conn {
         Either::Left(stream) => Either::Left(stream),
         Either::Right(stream) => Either::Right(stream),
     };
-    if first_bytes(plain, within, &server).await.is_none() {
+    let first = read.as_deref().unwrap_or_default();
+    if first_bytes(plain.clone(), first, within, &server)
+        .await
+        .is_none()
+    {
         return;
     }
+    let prefix = read.map_or_else(Bytes::new, |read| took_first(plain, read));
     let Accepted { conn, peer, held } = accepted;
-    let io = ConnIo::<Io>::new(Either::Right(conn), held, Bytes::new());
+    let io = ConnIo::<Io>::new(Either::Right(conn), held, prefix);
     serve_connection(io, Protocol::of(&server), server, peer).await;
+}
+
+/// An inline connection handed back: hyper serves it on its accepting runtime (`origin`), reading
+/// `read` first; its client has `within`, what is left of its header time.
+pub(crate) fn serve_handed_back(
+    origin: &crate::inline::Origin,
+    stream: StdConn,
+    read: Bytes,
+    held: Held,
+    within: Duration,
+) {
+    let (server, peer) = (origin.server.clone(), origin.peer);
+    origin.home.spawn(async move {
+        // Registered with the runtime that polls it.
+        let Ok(conn) = stream.into_tokio() else {
+            return;
+        };
+        let accepted = Accepted { conn, peer, held };
+        serve(accepted, Some(read), within, server).await;
+    });
 }
 
 /// SETTINGS_MAX_CONCURRENT_STREAMS from slot capacity, not hyper's flat 200 (zeros keep that).
@@ -189,8 +225,8 @@ async fn serve_connection<I>(
     macro_rules! serve_until_drained {
         ($conn:expr) => {{
             let mut conn = std::pin::pin!($conn);
-            // The connection first: one with a request to read is served before a drain that
-            // began meanwhile closes it.
+            // The connection first: a handed-back one with a request read is served before a
+            // drain that began meanwhile closes it, as inline it would have been.
             tokio::select! {
                 biased;
                 _ = conn.as_mut() => {}

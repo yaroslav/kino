@@ -38,6 +38,9 @@ impl<O> Counted<O> {
             n: 1,
         }
     }
+    pub(crate) fn owner(&self) -> &Arc<O> {
+        &self.owner
+    }
 }
 
 impl<O> Drop for Counted<O> {

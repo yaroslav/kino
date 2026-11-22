@@ -1,12 +1,14 @@
 //! Accepting connections: the listeners, what a connection holds, and the accept loop's backoff.
 
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+use std::os::fd::{AsRawFd, RawFd};
 use std::pin::Pin;
 use std::sync::Arc;
 use std::task::{Context, Poll};
 use std::time::Duration;
 
 use bytes::Bytes;
+use socket2::Socket;
 use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::net::{TcpListener, TcpStream, UnixListener, UnixStream};
 use tokio_util::either::Either;
@@ -24,7 +26,7 @@ pub(crate) struct Peer {
 
 /// A unix socket's peer is local (127.0.0.1) and has no port, so SERVER_PORT falls back
 /// to 80 when the Host header names none.
-pub(super) const UNIX_PEER: Peer = Peer {
+pub(crate) const UNIX_PEER: Peer = Peer {
     remote: SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0),
     local: SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 80),
 };
@@ -37,6 +39,54 @@ pub(crate) enum AsyncListener {
 
 /// An accepted stream, before the protocol layer sees it.
 pub(crate) type Conn = Either<TcpStream, UnixStream>;
+
+/// An accepted connection off any runtime, nonblocking: bound for an I/O shard or a worker.
+pub(crate) struct StdConn {
+    pub(crate) socket: Socket,
+    pub(crate) unix: bool,
+}
+
+impl StdConn {
+    /// Off the runtime that registered `conn`, to which a tokio stream is bound.
+    pub(crate) fn detach(conn: Conn) -> std::io::Result<StdConn> {
+        let unix = matches!(conn, Either::Right(_));
+        let socket = match conn {
+            Either::Left(stream) => stream.into_std()?.into(),
+            Either::Right(stream) => stream.into_std()?.into(),
+        };
+        Ok(StdConn { socket, unix })
+    }
+
+    pub(crate) fn into_tokio(self) -> std::io::Result<Conn> {
+        Ok(if self.unix {
+            Either::Right(UnixStream::from_std(self.socket.into())?)
+        } else {
+            Either::Left(TcpStream::from_std(self.socket.into())?)
+        })
+    }
+
+    /// What the client sent and nothing read yet, left there (recv_now).
+    pub(crate) fn peek(&self, buf: &mut [u8]) -> std::io::Result<usize> {
+        super::intake::recv_now(&self.socket, buf, libc::MSG_PEEK)
+    }
+
+    /// send(2), for what an inline answer's first write left (WriteBuf::flush); on Linux TCP with
+    /// MSG_NOSIGNAL, as std's sends, so a closed peer is EPIPE, not SIGPIPE. That first write
+    /// (WriteBuf::write, a sendmsg) sets no flag.
+    pub(crate) fn send(&self, buf: &[u8]) -> std::io::Result<usize> {
+        #[cfg(target_os = "linux")]
+        let flags = if self.unix { 0 } else { libc::MSG_NOSIGNAL };
+        #[cfg(not(target_os = "linux"))]
+        let flags = 0;
+        self.socket.send_with_flags(buf, flags)
+    }
+}
+
+impl AsRawFd for StdConn {
+    fn as_raw_fd(&self) -> RawFd {
+        self.socket.as_raw_fd()
+    }
+}
 
 pub(crate) struct Accepted<C = Conn> {
     pub conn: C,
@@ -107,8 +157,8 @@ impl<I> ConnIo<I> {
         }
     }
 
-    /// Only a connection whose first bytes were read before hyper (sniffed after a TLS handshake)
-    /// has a prefix, read first; later reads pay one branch.
+    /// Only a connection whose first bytes were read before hyper (handed back, or sniffed after
+    /// a TLS handshake) has a prefix, read first; later reads pay one branch.
     #[cold]
     fn read_prefix(&mut self, buf: &mut tokio::io::ReadBuf<'_>) -> Poll<std::io::Result<()>> {
         let n = self.prefix.len().min(buf.remaining());

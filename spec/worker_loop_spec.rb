@@ -370,16 +370,6 @@ RSpec.describe "worker_loop" do
   # Requests the workers have taken and not yet answered.
   def open_requests(server) = server.stats[:worker_status].sum { |worker| worker[:in_flight] }
 
-  # A connection whose receive window is small, so a response it does
-  # not read soon fills it.
-  def narrow_connection(port)
-    socket = Socket.new(:INET, :STREAM)
-    socket.timeout = WsClient::DEADLINE
-    socket.setsockopt(:SOCKET, :RCVBUF, 16_384)
-    socket.connect(Socket.sockaddr_in(port, "127.0.0.1"))
-    socket
-  end
-
   # Seconds of CPU this process (in these specs, mostly the server's
   # threads) used while the spec slept `seconds`.
   def cpu_during(seconds)
@@ -388,19 +378,8 @@ RSpec.describe "worker_loop" do
     Process.clock_gettime(Process::CLOCK_PROCESS_CPUTIME_ID) - before
   end
 
-  def open_fds = Dir.children("/dev/fd").size
-
   # The body of an HTTP/1.1 response read to the end.
   def response_body_of(response) = response.split("\r\n\r\n", 2).last
-
-  # The worker_loop that a kino.rb holding `code` sets.
-  def worker_loop_from(code)
-    Dir.mktmpdir("kino-config") do |dir|
-      path = File.join(dir, "kino.rb")
-      File.write(path, code)
-      Kino::Configuration.new.load_file(path)[:worker_loop]
-    end
-  end
 
   # One request whose fiber has to wait on its client: a slow reader of
   # a 1 MiB event stream (:slow), a reader that goes away mid-stream
@@ -473,10 +452,7 @@ RSpec.describe "worker_loop" do
           end
         end
 
-        doc = File.read(File.expand_path("../doc/worker-loop.md", __dir__))
-        recipe = doc[/^```ruby\n((?:(?!^```).)*?scheduler\.resume\((?:(?!^```).)*?)^```$/m, 1]
-        expect(recipe).not_to be_nil, "doc/worker-loop.md has no ruby block that calls scheduler.resume("
-        with_loop_sockets(app, mode, worker_loop: worker_loop_from(recipe)) do |port, server|
+        with_loop_sockets(app, mode, worker_loop: documented_job_fibers) do |port, server|
           expect(get(port, "/stray")).to eq("pushed")
           fibers = []
           took = timed { 33.times { fibers << get(port, "/fiber") } }
@@ -498,9 +474,14 @@ RSpec.describe "worker_loop" do
       end
     end
 
+    # Lane dispatch to worker_loop workers, which still serves TLS and
+    # what inline connections hand back: these servers
+    # serve nothing inline (see inline_io_spec.rb for placement), but
+    # where an example says so.
+
     # The lane holds four, more than the two slots.
     it "keeps to its concurrency" do
-      start_loop_server(mode: mode, concurrency: 2) do |port|
+      start_loop_server(mode: mode, concurrency: 2, _inline: false) do |port|
         expect(timed { concurrently(4) { get(port, "/sleep") } }).to be >= 0.2
       end
     end
@@ -514,7 +495,7 @@ RSpec.describe "worker_loop" do
         end
       end
 
-      start_loop_server(app, mode: mode, concurrency: 1) do |port|
+      start_loop_server(app, mode: mode, concurrency: 1, _inline: false) do |port|
         bound = within_half_a_tick(port)
         3.times { self.reports.next(awaiting: "the fast requests") }
         gaps = Array.new(3) do
@@ -535,7 +516,7 @@ RSpec.describe "worker_loop" do
 
     it "lets an idle sibling take what waits behind a full worker at its next tick" do
       # Its worker stays full while dispatch counts only open requests.
-      start_loop_server(mode: mode, concurrency: 2, threads: 2, after_request_complete: LINGERING) do |port|
+      start_loop_server(mode: mode, concurrency: 2, threads: 2, after_request_complete: LINGERING, _inline: false) do |port|
         2.times { expect(get(port, "/linger")).to eq("hello") }
 
         # At the sibling's tick (every 50 ms), long before a job of the
@@ -553,7 +534,7 @@ RSpec.describe "worker_loop" do
           worker.serve(concurrency: 1) { |job| task.async { job.call } }
         end
       end
-      start_loop_server(mode: mode, workers: 2, worker_loop: serving, after_request_complete: LINGERING) do |port|
+      start_loop_server(mode: mode, workers: 2, worker_loop: serving, after_request_complete: LINGERING, _inline: false) do |port|
         2.times { expect(self.reports.next(awaiting: "a worker serving")).to eq(:serving) }
         bound = within_half_a_tick(port)
         expect(get(port, "/linger")).to eq("hello")
@@ -570,28 +551,29 @@ RSpec.describe "worker_loop" do
       end
     end
 
-    {"Enumerable" => "/stream", "Rack 3 streaming" => "/stream?callable"}.each do |kind, path|
-      it "streams to a slow reader without blocking the worker (#{kind} body)" do
-        start_loop_server(mode: mode) do |port|
-          reader = narrow_connection(port)
-          reader.write("GET #{path} HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n")
-          received = reader.readpartial(65_536)
-          sleep 0.05 # the stream fills what the reader leaves unread
+    # Through hyper, whose writes wait as fibers; inline_io_spec has the
+    # inline ones.
+    it "streams to a slow reader without blocking the worker (Rack 3 streaming body)" do
+      start_loop_server(mode: mode, _inline: false) do |port|
+        reader = narrow_connection(port)
+        reader.write("GET /stream?callable HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n")
+        received = reader.readpartial(65_536)
+        sleep 0.05 # the stream fills what the reader leaves unread
 
-          latencies = Array.new(3) { timed { expect(get(port, "/hello")).to eq("hello") }.tap { received << reader.readpartial(65_536) } }
-          # A worker blocked on the stalled stream would answer none of them.
-          expect(latencies.max).to be < 1, "beside a stalled stream, requests took #{latencies.map { |t| t.round(2) }} s"
+        latencies = Array.new(3) { timed { expect(get(port, "/hello")).to eq("hello") }.tap { received << reader.readpartial(65_536) } }
+        # A worker blocked on the stalled stream would answer none of them.
+        expect(latencies.max).to be < 1, "beside a stalled stream, requests took #{latencies.map { |t| t.round(2) }} s"
 
-          received << reader.read
-          expect(received.split("\r\n\r\n", 2).last.bytesize).to eq(StreamedChunks.bytes)
-        ensure
-          reader&.close
-        end
+        received << reader.read
+        expect(received.split("\r\n\r\n", 2).last.bytesize).to eq(StreamedChunks.bytes)
+      ensure
+        reader&.close
       end
     end
 
+    # Through hyper, where the stream's write waits as a fiber.
     it "ends a stream whose client went away" do
-      start_loop_server(mode: mode, concurrency: 1, queue_timeout: 1) do |port|
+      start_loop_server(mode: mode, concurrency: 1, queue_timeout: 1, _inline: false) do |port|
         reader = narrow_connection(port)
         reader.write("GET /stream HTTP/1.1\r\nHost: x\r\n\r\n")
         reader.readpartial(65_536)
@@ -965,7 +947,7 @@ RSpec.describe "worker_loop" do
 
     it "crashes a worker whose socket's job ended before its events ran", :quiet do
       with_loop_sockets(loop_app_with_sockets(StallingSocket.new(port: reports.port)), mode,
-        worker_loop: stopping_second_job(0.05), on_worker_exit: on_worker_exit) do |port|
+        worker_loop: stopping_second_job(0.05), on_worker_exit: on_worker_exit, _inline: false) do |port|
         connect(port).send_text("hold")
 
         expect_crash("a worker_loop job ended before its socket events or wakes were done")
@@ -975,7 +957,7 @@ RSpec.describe "worker_loop" do
     it "reports a socket's job that ended before its on_close ran while the worker drained", :quiet do
       app = loop_app_with_sockets(SlowClosingSocket.new(port: reports.port, pause: 0.2))
 
-      with_loop_sockets(app, mode, worker_loop: stopping_second_job(0.1), on_worker_exit: on_worker_exit) do |port, server|
+      with_loop_sockets(app, mode, worker_loop: stopping_second_job(0.1), on_worker_exit: on_worker_exit, _inline: false) do |port, server|
         client = connect(port)
         shutdown = Thread.new { server.shutdown }
         client.await_close
@@ -1004,7 +986,7 @@ RSpec.describe "worker_loop" do
         end
       end
       with_loop_sockets(app, mode, worker_loop: refusing, on_worker_exit: on_worker_exit,
-        request_timeout: 0.1, shutdown_timeout: 2) do |port, server|
+        request_timeout: 0.1, shutdown_timeout: 2, _inline: false) do |port, server|
         expect(refusal(port)&.status).to eq(504)
 
         expect_crash("a worker_loop job ended before its socket events or wakes were done")
@@ -1070,8 +1052,11 @@ RSpec.describe "worker_loop" do
       end
       pieces = Array.new(32) { |index| format("%04d", index) * 256 }
 
-      start_loop_server(app, mode: mode, worker_loop: loop_on(TallyingReactor, 8)) do |port|
-        client = client_socket(port)
+      # Through hyper, which hands the body over as it comes; inline,
+      # it is read whole before the app runs.
+      start_loop_server(app, mode: mode, worker_loop: loop_on(TallyingReactor, 8), _inline: false) do |port|
+        client = TCPSocket.new("127.0.0.1", port)
+        client.timeout = WsClient::DEADLINE
         client.write("POST /echo HTTP/1.1\r\nHost: x\r\nContent-Length: #{pieces.sum(&:bytesize)}\r\nConnection: close\r\n\r\n")
         pieces.each do |piece|
           sleep 0.01
@@ -1087,33 +1072,79 @@ RSpec.describe "worker_loop" do
       end
     end
 
-    it "closes readiness fds when requests end", :quiet do
+    it "closes readiness fds when requests end" do
       reports = self.reports.port
       # Each request's waits, from after_request_complete, or from on_error
       # for a stream that failed.
       waited = Ractor.shareable_proc { |*| reports << TallyingReactor.of(Fiber.current).first }
       kinds = %i[slow gone failing upload peek]
 
-      # A request's body I/O waits on readiness fds of its own.
-      start_loop_server(mode: mode, worker_loop: loop_on(TallyingReactor, 32), after_request_complete: waited,
-        on_error: waited) do |port, server|
-        batch = -> { Array.new(20) { |index| Thread.new { waiting_request(port, kinds[index % kinds.size]) } }.each(&:join) }
-        waits = ->(count) { Array.new(count) { self.reports.next(awaiting: "a request's waits") } }
-        batch.call
-        wait_for("the first requests done") { open_requests(server).zero? }
-        baseline = open_fds
-        waits.call(20)
+      capture_native_stderr do
+        # Served through hyper, where a request's body I/O waits on
+        # readiness fds of its own. An inline request waits on its
+        # connection's socket instead, if at all: it reads its body whole
+        # before the app runs, and a send buffer that takes its whole
+        # stream (Linux starts a loopback one at 2.5 MiB) never makes it
+        # wait.
+        start_loop_server(mode: mode, worker_loop: loop_on(TallyingReactor, 32), after_request_complete: waited,
+          on_error: waited, _inline: false) do |port, server|
+          batch = -> { Array.new(20) { |index| Thread.new { waiting_request(port, kinds[index % kinds.size]) } }.each(&:join) }
+          waits = ->(count) { Array.new(count) { self.reports.next(awaiting: "a request's waits") } }
+          batch.call
+          wait_for("the first requests done") { open_requests(server).zero? }
+          baseline = open_fds
+          waits.call(20)
 
-        GC.disable
-        begin
-          25.times { batch.call }
-          wait_for("every request done") { open_requests(server).zero? }
-          wait_for("the readiness fds of 500 requests closed (#{open_fds - baseline} open)", timeout: 2) { open_fds <= baseline + 2 }
-        ensure
-          GC.enable
+          GC.disable
+          begin
+            25.times { batch.call }
+            wait_for("every request done") { open_requests(server).zero? }
+            wait_for("the readiness fds of 500 requests closed (#{open_fds - baseline} open)", timeout: 2) { open_fds <= baseline + 2 }
+          ensure
+            GC.enable
+          end
+          waiting = waits.call(500).count(&:positive?)
+          expect(waiting).to be > 400, "#{waiting} of the 500 requests waited on a readiness fd"
         end
-        waiting = waits.call(500).count(&:positive?)
-        expect(waiting).to be > 400, "#{waiting} of the 500 requests waited on a readiness fd"
+      end
+    end
+
+    # The fiber and the thread share the connection's socket.
+    it "lets a fiber write while a thread of the same request is blocked writing, until the client leaves (served inline)" do
+      reports = self.reports.port
+      app = Ractor.shareable_proc do |env|
+        next LOOP_APP.call(env) unless env["PATH_INFO"] == "/both"
+
+        body = lambda do |stream|
+          writer = Thread.new do
+            200.times { stream.write("x" * 65_536) }
+          rescue IOError
+            nil # the stream closed under it
+          end
+          sleep 0.3 # a fiber wait, while the thread blocks on the client
+          begin
+            stream.write("from the fiber")
+          rescue IOError => e
+            reports << e.class.name # its write waited for the client, who left
+          end
+          writer.join
+        end
+        [200, {}, body]
+      end
+
+      start_loop_server(app, mode: mode) do |port, server|
+        await_inline(server, port, 1)
+        client = narrow_connection(port)
+        client.write("GET /both HTTP/1.1\r\nHost: x\r\n\r\n")
+        client.readpartial(4096)
+        sleep 0.5
+        client.close
+
+        expect(self.reports.next(awaiting: "the fiber's write")).to eq("Kino::ClientGone")
+        expect(server.stats.dig(:inline, :requests)).to eq(1), "the request went another way: #{server.stats[:inline].inspect}"
+        expect(get(port, "/hello")).to eq("hello")
+      ensure
+        client&.close
       end
     end
 
@@ -1148,8 +1179,10 @@ RSpec.describe "worker_loop" do
       end
 
       start_loop_server(app, mode: mode, worker_loop: async_loop(4, returned: reports)) do |port, server|
-        client = client_socket(port)
-        client.write("POST /upload HTTP/1.1\r\nHost: x\r\nContent-Length: 8\r\n\r\nhalf")
+        client = TCPSocket.new("127.0.0.1", port)
+        client.timeout = WsClient::DEADLINE
+        # Chunked: a body short enough to read whole before the app runs (inline) never waits.
+        client.write("POST /upload HTTP/1.1\r\nHost: x\r\nTransfer-Encoding: chunked\r\n\r\n4\r\nhalf\r\n")
         wait_for("the upload in the worker") { open_requests(server) == 1 }
 
         expect(timed { server.shutdown(timeout: 0.2) }).to be < 1

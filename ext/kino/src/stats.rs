@@ -29,6 +29,7 @@ pub struct WorkerStat {
     pub sockets: usize,
     /// Connections its requests handed over through rack.hijack, still open.
     pub hijacked: usize,
+    pub inline_conns: usize,
     /// Which worker the slot is on (WorkerSlot::generation).
     pub generation: u64,
 }
@@ -59,6 +60,7 @@ pub fn collect_worker_status(server: &ServerInner) -> Vec<WorkerStat> {
                 retired: slot.life.seems_retired(),
                 sockets: slot.sockets.open(),
                 hijacked: slot.hijacked.load(Ordering::Relaxed),
+                inline_conns: slot.inline.conns.load(Ordering::Relaxed),
                 generation: slot.generation(),
             }
         })
@@ -92,14 +94,50 @@ pub struct Snapshot {
     pub responses_cut: [(&'static str, u64); crate::response::Cut::ALL.len()],
     /// Process-wide, like the topics a publish reaches.
     pub websockets: WsSnapshot,
+    /// None when the server serves nothing inline.
+    pub inline: Option<InlineSnapshot>,
+}
+
+/// A server's inline serving: its connections now, and totals of the requests served, the
+/// connections declined at accept, handed back to hyper or cut off, and the spins.
+pub struct InlineSnapshot {
+    pub connections: usize,
+    pub requests: u64,
+    pub declined: u64,
+    pub handbacks: u64,
+    pub closed: u64,
+    pub spins: u64,
+}
+
+impl InlineSnapshot {
+    /// None when `server` serves nothing inline; its connections now are its worker rows'.
+    fn take(server: &ServerInner, workers: &[WorkerStat]) -> Option<Self> {
+        let inline = server.inline.as_ref()?;
+        let (mut requests, mut closed, mut spins) = (0, 0, 0);
+        for seats in server.slots.read().iter().map(|slot| &slot.inline) {
+            requests += seats.requests.load(Ordering::Relaxed);
+            closed += seats.closed.load(Ordering::Relaxed);
+            spins += seats.spins.load(Ordering::Relaxed);
+        }
+        Some(InlineSnapshot {
+            connections: workers.iter().map(|w| w.inline_conns).sum(),
+            requests,
+            declined: inline.declined(),
+            handbacks: inline.handbacks(),
+            closed,
+            spins,
+        })
+    }
 }
 
 /// One stat's value; a name is a fixed identifier, a Symbol in Ruby.
+/// Nil is a section the server lacks: null in JSON, nil in Ruby.
 enum Stat<'a> {
     Count(u64),
     Flag(bool),
     Seconds(f64),
     Name(&'a str),
+    Nil,
 }
 
 /// What `nest` opens: a Map keeps its entries' keys, a List drops them.
@@ -130,6 +168,7 @@ impl Snapshot {
         let worker_status = collect_worker_status(server);
         let quarantined_count = worker_status.iter().filter(|w| w.quarantined).count();
         let hijacked_connections = worker_status.iter().map(|w| w.hijacked).sum();
+        let inline = InlineSnapshot::take(server, &worker_status);
         let c = &server.counters;
         Snapshot {
             topology: server.config.topology.clone(),
@@ -152,6 +191,7 @@ impl Snapshot {
             hijacked_connections,
             responses_cut: crate::response::responses_cut(),
             websockets: crate::ws::snapshot(),
+            inline,
         }
     }
 
@@ -221,6 +261,19 @@ impl Snapshot {
             e.nest("handshakes_refused", Map, |e| e.counts(refused));
             e.nest("closed", Map, |e| e.counts(Cause::named(ws.closed)));
         });
+        match &self.inline {
+            Some(inline) => e.nest("inline", Map, |e| {
+                e.counts([
+                    ("connections", inline.connections as u64),
+                    ("requests", inline.requests),
+                    ("declined", inline.declined),
+                    ("handbacks", inline.handbacks),
+                    ("closed", inline.closed),
+                    ("spins", inline.spins),
+                ]);
+            }),
+            None => e.stat("inline", Stat::Nil),
+        }
         if let Some(depths) = &self.lane_depths {
             let depths = depths.iter().map(|&depth| (ITEM, depth as u64));
             e.nest("lane_depths", List, |e| e.counts(depths));
@@ -239,6 +292,7 @@ impl Snapshot {
                     e.counts([
                         ("websockets_open", w.sockets as u64),
                         ("hijacked_connections", w.hijacked as u64),
+                        ("inline_connections", w.inline_conns as u64),
                     ]);
                 });
             }
@@ -345,7 +399,7 @@ impl Snapshot {
         });
         // A table: rustfmt would give each row's name, help and samples a line each.
         #[rustfmt::skip]
-        let (head, tail) = ([
+        let (head, workers, tail) = ([
             ("kino_ready", "1 when serving, 0 while booting or draining.",
                 One(u64::from(self.state == STATE_READY))),
             ("kino_responses_cut_total",
@@ -372,6 +426,7 @@ impl Snapshot {
             ("kino_worker_hijacked_connections",
                 "Connections each dispatch slot's requests handed over through rack.hijack, still open.",
                 self.per_worker(|w| w.hijacked as u64)),
+        ], [
             ("kino_quarantined_workers", "Dispatch slots abandoned as wedged.",
                 One(self.quarantined_count as u64)),
             ("kino_quarantine_replacements_total", "Replacement workers spawned after a wedge.",
@@ -380,8 +435,39 @@ impl Snapshot {
                 "Seconds requests waited in the queue before a worker admitted them.",
                 Samples::Histogram(&self.queue_histogram)),
         ]);
-        let stats = plain.chain(head).chain(sockets);
-        stats.chain(lane).chain(tail).collect()
+        let inline = self.inline.as_ref().map(|inline| self.inline_rows(inline));
+        let inline = inline.into_iter().flatten();
+        let stats = plain.chain(head).chain(sockets).chain(lane).chain(workers);
+        stats.chain(inline).chain(tail).collect()
+    }
+
+    /// The inline serving's series: only a server that serves inline has any.
+    fn inline_rows(
+        &self,
+        inline: &InlineSnapshot,
+    ) -> [(&'static str, &'static str, Samples<'_>); 7] {
+        use Samples::One;
+        // A table, as metric_rows's.
+        #[rustfmt::skip]
+        let rows = [
+            ("kino_inline_connections", "Connections served inline on the workers' threads now.",
+                One(inline.connections as u64)),
+            ("kino_inline_requests_total", "Requests served inline.", One(inline.requests)),
+            ("kino_inline_declined_total",
+                "Plain TCP and unix-socket connections left with hyper at accept, as no worker could take them (or none served yet).",
+                One(inline.declined)),
+            ("kino_inline_handbacks_total", "Inline connections handed back to hyper.",
+                One(inline.handbacks)),
+            ("kino_inline_closed_total", "Inline connections Kino cut off.",
+                One(inline.closed)),
+            ("kino_inline_spins_total",
+                "Spins of an inline connection alone on its worker for its next request, before its job waits on the socket.",
+                One(inline.spins)),
+            ("kino_worker_inline_connections",
+                "Connections each dispatch slot's worker serves inline now.",
+                self.per_worker(|w| w.inline_conns as u64)),
+        ];
+        rows
     }
 }
 
@@ -453,6 +539,7 @@ impl Emit for Json {
             Stat::Flag(on) => self.put(key, on),
             Stat::Seconds(seconds) => self.put(key, seconds),
             Stat::Name(name) => self.put(key, format_args!("\"{name}\"")),
+            Stat::Nil => self.put(key, "null"),
         }
     }
 
@@ -505,6 +592,7 @@ impl Emit for RubyHash<'_> {
             Stat::Flag(on) => ruby.into_value(on),
             Stat::Seconds(seconds) => ruby.into_value(seconds),
             Stat::Name(name) => ruby.to_symbol(name).as_value(),
+            Stat::Nil => ruby.qnil().as_value(),
         };
         self.put(key, value);
     }
@@ -551,6 +639,7 @@ mod tests {
             retired,
             sockets,
             hijacked,
+            inline_conns: 0,
             generation: 0,
         };
         let mut buckets = [0; crate::registry::QUEUE_BOUNDS_US.len()];
@@ -596,6 +685,7 @@ mod tests {
                 closed: std::array::from_fn(|n| 100 + n as u64),
                 handshakes_refused: [11, 14, 15],
             },
+            inline: None,
         }
     }
 
@@ -613,11 +703,13 @@ mod tests {
             r#""handshakes_refused":{"websocket_max":11,"draining":14,"worker_closing":15},"#,
             r#""closed":{"normal":100,"going_away":101,"protocol":102,"too_big":103,"slow":104,"#,
             r#""dead_peer":105,"client_gone":106,"crash":107,"handshake_failed":108}},"#,
-            r#""lane_depths":[2,0],"worker_status":["#,
+            r#""inline":null,"lane_depths":[2,0],"worker_status":["#,
             r#"{"index":0,"served":10,"in_flight":1,"busy_ms":4,"quarantined":false,"#,
-            r#""retired":false,"websockets_open":2,"hijacked_connections":0},"#,
+            r#""retired":false,"websockets_open":2,"hijacked_connections":0,"#,
+            r#""inline_connections":0},"#,
             r#"{"index":1,"served":7,"in_flight":0,"busy_ms":0,"quarantined":false,"#,
-            r#""retired":true,"websockets_open":0,"hijacked_connections":3}],"#,
+            r#""retired":true,"websockets_open":0,"hijacked_connections":3,"#,
+            r#""inline_connections":0}],"#,
             r#""queue_time":{"count":5,"sum_seconds":1.5},"quarantined":1,"state":"ready","#,
         );
         let version = env!("CARGO_PKG_VERSION");
@@ -796,5 +888,62 @@ mod tests {
                 "a worker_loop worker whose thread left its loop {left}, {AWAY:?} past any wait, read {read} ms busy"
             );
         }
+    }
+
+    /// A server serving inline: 3 connections now, 10 requests served,
+    /// 2 connections declined, 4 handed back and 1 cut off; 7 spins
+    /// for a next request.
+    fn inline_snapshot() -> InlineSnapshot {
+        InlineSnapshot {
+            connections: 3,
+            requests: 10,
+            declined: 2,
+            handbacks: 4,
+            closed: 1,
+            spins: 7,
+        }
+    }
+
+    #[test]
+    fn inline_serving_is_reported_in_metrics_and_json_only_by_a_server_that_serves_inline() {
+        let mut s = snapshot();
+        s.worker_status[1].inline_conns = 2;
+        s.inline = Some(inline_snapshot());
+        let text = s.metrics();
+        for (name, kind, value) in [
+            ("kino_inline_connections", "gauge", 3),
+            ("kino_inline_requests_total", "counter", 10),
+            ("kino_inline_declined_total", "counter", 2),
+            ("kino_inline_handbacks_total", "counter", 4),
+            ("kino_inline_closed_total", "counter", 1),
+            ("kino_inline_spins_total", "counter", 7),
+        ] {
+            let sample = format!("# TYPE {name} {kind}\n{name} {value}\n");
+            assert!(
+                text.contains(&sample),
+                "expected {name} as a {kind} of {value} in:\n{text}"
+            );
+        }
+        for sample in [
+            "# TYPE kino_worker_inline_connections gauge\n",
+            "kino_worker_inline_connections{worker=\"0\"} 0\n",
+            "kino_worker_inline_connections{worker=\"1\"} 2\n",
+        ] {
+            assert!(text.contains(sample), "expected {sample:?} in:\n{text}");
+        }
+        let json = s.json();
+        let inline = concat!(
+            r#""inline":{"connections":3,"requests":10,"declined":2,"handbacks":4,"#,
+            r#""closed":1,"spins":7}"#
+        );
+        assert!(json.contains(inline), "expected {inline} in {json}");
+
+        // None of it from a server that serves nothing inline.
+        let text = snapshot().metrics();
+        assert!(
+            !text.contains("kino_inline_") && !text.contains("kino_worker_inline_"),
+            "inline series without inline serving:\n{text}"
+        );
+        assert!(snapshot().json().contains(r#""inline":null"#));
     }
 }

@@ -83,7 +83,7 @@ impl QueuedSocket {
             queue,
             ..Limits::default()
         };
-        Self::with_limits(Arc::new(WorkerSlot::new(true, 1, None)), limits)
+        Self::with_limits(Arc::new(WorkerSlot::new(true, 1, None, false)), limits)
     }
 
     /// A socket the worker on `owner` accepted, with these budgets.
