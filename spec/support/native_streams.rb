@@ -31,4 +31,10 @@ end
 
 RSpec.configure do |config|
   config.include NativeStreams
+  # `:quiet` examples make the server log failures: their native stderr is captured, and
+  # shown only when the example fails.
+  config.around(:example, :quiet) do |example|
+    log = capture_native_stderr { example.run }
+    warn log if example.exception
+  end
 end

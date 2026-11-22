@@ -67,81 +67,20 @@ module Kino
       @app = app
       @bind = settings[:bind]
       @requested_port = settings[:port]
-      @on_error = validate_hook(settings[:on_error], :on_error)
-      @after_worker_boot = validate_hook(settings[:after_worker_boot], :after_worker_boot)
-      @after_request_complete = validate_hook(settings[:after_request_complete], :after_request_complete)
-      @after_boot = validate_hook(settings[:after_boot], :after_boot)
-      @on_worker_exit = validate_hook(settings[:on_worker_exit], :on_worker_exit)
-      @mode = resolve_mode(settings[:mode])
-      @workers = Integer(settings[:workers] || default_workers)
-      # The pool ceiling; equal to the floor for a fixed pool.
-      @max_workers = settings[:max_workers].nil? ? @workers : Integer(settings[:max_workers])
-      if @max_workers < @workers
-        raise ArgumentError, "max_workers (#{@max_workers}) must be at least workers (#{@workers})"
-      end
-      @scale_down_after = settings[:scale_down_after].nil? ? 30.0 : Float(settings[:scale_down_after])
-      raise ArgumentError, "scale_down_after must be positive" unless @scale_down_after.positive?
-      if !settings[:scale_down_after].nil? && !elastic?
-        Log.warn("scale_down_after has no effect unless max_workers is above workers")
-      end
-      @worker_hooks = WorkerHooks.new(
-        on_error: @on_error,
-        after_worker_boot: @after_worker_boot,
-        after_request_complete: @after_request_complete,
-        # The access log's GC and allocation figures come from the VM's
-        # process-wide counters, so they are measured only where one
-        # request at a time can own them: the GVL serializes :threaded
-        # mode, and a single ractor (a pool that can never grow past one)
-        # has nothing to race.
-        access_timing: !!settings[:log_requests] && (@mode == :threaded || @max_workers == 1)
-      )
-      # Default threads per mode: 1 in :ractor (threads inside a ractor
-      # share its lock; a measured +17% on fast handlers; raise `workers`
-      # for I/O concurrency instead), 3 in :threaded (threads ARE the
-      # concurrency there).
-      @threads = Integer(settings[:threads] || ((@mode == :ractor) ? 1 : 3))
-      @queue_depth = Integer(settings[:queue_depth])
-      @queue_timeout_ms = (Float(settings[:queue_timeout]) * 1000).round
-      @request_timeout_ms = settings[:request_timeout] ? (Float(settings[:request_timeout]) * 1000).round : 0
-      @max_connections = settings[:max_connections] ? Integer(settings[:max_connections]) : default_max_connections
-      @max_body_size = Integer(settings[:max_body_size] || 0)
-      @batch = [Integer(settings[:batch]), 1].max
-      @lanes = !!settings[:lanes]
-      @log_requests = !!settings[:log_requests]
-      @shutdown_timeout = settings[:shutdown_timeout]
-      @io_shards = !!settings[:io_shards]
-      @io_threads = Integer(settings[:io_threads]) unless settings[:io_threads].nil?
-      if @io_threads && @io_threads < 1
-        raise ArgumentError, "io_threads must be >= 1"
-      end
-      Log.warn("io_threads has no effect unless io_shards is true") if @io_threads && !@io_shards
-      @tokio_threads = settings[:tokio_threads]
-      @tls = validate_tls(settings[:tls])
-      if @tls && unix?
-        raise ArgumentError, "TLS is not supported on a unix socket bind; terminate TLS at the proxy in front"
-      end
-      @http2 = settings.fetch(:http2, true) ? true : false
-      @pidfile = settings[:pidfile]
-      @control_bind = settings[:control_bind]&.to_s
-      @control_token = settings[:control_token]&.to_s
-      # An empty token (e.g. control_token ENV["KINO_CONTROL_TOKEN"] with the
-      # var unset) must not half-disable auth: treat it as auth off, not as
-      # "require a zero-length Bearer token".
-      @control_token = nil if @control_token && @control_token.empty?
-      @quarantine_timeout_ms = settings[:quarantine_timeout] ? (Float(settings[:quarantine_timeout]) * 1000).round : nil
-      @quarantine_max =
-        if settings[:quarantine_max]
-          Integer(settings[:quarantine_max])
-        elsif @mode == :ractor
-          @workers
-        else
-          @workers * @threads
-        end
-      @supervisor = nil
-      @threaded_pool = nil
+      configure_pool(settings)
+      configure_limits(settings)
+      configure_io(settings)
+      configure_quarantine(settings)
+      @pool = nil
       @quarantine_monitor = nil
       @pool_scaler = nil
       @started = false
+      # Under @lifecycle: @stopping while a shutdown runs, @shutdown_error
+      # from the last one that failed; @shutdown_ended signals each end.
+      @lifecycle = Mutex.new
+      @shutdown_ended = ConditionVariable.new
+      @stopping = false
+      @shutdown_error = nil
     end
 
     # Bind, boot the native front-end, and spawn the worker pool.
@@ -167,8 +106,9 @@ module Kino
           io_threads: @io_threads,
           tokio_threads: @tokio_threads,
           tls_cert: @tls&.fetch(:cert), tls_key: @tls&.fetch(:key),
-          http2: @http2,
-          lanes: @lanes, log_requests: @log_requests,
+          http2: @http2, lanes: @lanes, log_requests: @log_requests,
+          websocket_max_message: @websocket_max_message, websocket_max: @websocket_max,
+          websocket_ping_interval_ms: @websocket_ping_interval_ms,
           mode: @mode.to_s, workers: @workers, max_workers: @max_workers,
           threads: @threads, batch: @batch,
           control_bind: @control_bind, control_token: @control_token
@@ -180,75 +120,68 @@ module Kino
       # GC anchor for zero-copy response buffers: held for the server's
       # lifetime so in-flight buffers survive even a worker ractor crash.
       @pin_keeper = Native.pin_keeper(@id)
-      if @mode == :ractor
-        warn_scheduler_cap
-        @supervisor = RactorSupervisor.new(@id, @app, workers: @workers, threads: @threads,
-          batch: @batch, hooks: @worker_hooks, on_worker_exit: @on_worker_exit).start
-      else
-        @threaded_pool = ThreadedPool.new(@id, @app, threads: @threads, batch: @batch,
-          hooks: @worker_hooks, on_worker_exit: @on_worker_exit).start(@workers)
-      end
+      warn_scheduler_cap if @mode == :ractor
+      @pool = ((@mode == :ractor) ? RactorSupervisor : ThreadedPool).new(@id, @app, workers: @workers,
+        threads: @threads, batch: @batch, hooks: @worker_hooks, on_worker_exit: @on_worker_exit).start
       start_quarantine_monitor if @quarantine_timeout_ms
       start_pool_scaler if elastic?
       Native.control_ready(@id)
       HookFire.fire(@after_boot, "after_boot")
-      @started = true
+      @lifecycle.synchronize do
+        @shutdown_error = nil
+        @started = true
+      end
       self
     end
 
-    # Graceful shutdown: stop accepting, drain in-flight work up to the
-    # deadline, then escalate: abort remaining clients (500), interrupt
+    # Graceful shutdown: stop accepting, close WebSockets (1001, after on_shutdown), drain
+    # in-flight work up to the deadline, then escalate: abort remaining clients (500), interrupt
     # blocked workers, kill stragglers; and tear down the runtime. Always
-    # returns by ~deadline + a small epsilon; idempotent.
+    # returns by ~deadline + a small epsilon; idempotent. One runs at a
+    # time: a call made during another waits for it to end, then returns
+    # as #wait does, or shuts down itself if the server still serves. A
+    # failure before it stops accepting leaves the server serving; a later
+    # one leaves it stopped. Either way the error is raised here and by
+    # #wait.
     #
     # @param timeout [Numeric, nil] drain deadline in seconds (default:
     #   the configured shutdown_timeout)
     # @return [nil]
     def shutdown(timeout: nil)
       return unless @started
+      return wait unless claim_shutdown
 
-      @pool_scaler&.stop
-      @quarantine_monitor&.stop
-      deadline = monotonic_now + (timeout || @shutdown_timeout)
-      Native.stop_accepting(@id)
-
-      # Drain: wait for queued + in-flight to reach zero, bounded by deadline.
-      until monotonic_now >= deadline
-        queued, in_flight = Native.queue_stats(@id)
-        break if queued.zero? && in_flight.zero?
-
-        sleep 0.01
+      stopped_accepting = false
+      failure = nil
+      begin
+        # First, so that a bad timeout raises before anything has stopped.
+        deadline = Kino.monotonic + (timeout || @shutdown_timeout)
+        @pool_scaler&.stop
+        @quarantine_monitor&.stop
+        Native.stop_accepting(@id)
+        stopped_accepting = true
+        drain(deadline)
+        stop_workers(deadline)
+        tear_down
+      rescue Exception => failure # rubocop:disable Lint/RescueException -- recorded for #wait, then re-raised
+        raise
+      ensure
+        end_shutdown(failure, stopped: stopped_accepting)
       end
-
-      # Idle workers see the closed queue and exit their loops.
-      Native.close_queue(@id)
-      join_workers(deadline)
-
-      unless workers_done?
-        # Past the deadline with stuck handlers: free the clients first,
-        # then try to unblock and reap the workers.
-        Native.abort_all_inflight(@id)
-        Native.interrupt_all_workers(@id)
-        join_workers(monotonic_now + 0.2)
-        kill_stragglers
-      end
-
-      Native.shutdown_runtime(@id, 1_000)
-      # The control thread reports "draining" for the whole drain and stops
-      # only now, once there is nothing left to report.
-      Native.control_stop(@id)
-      # The runtime is gone, so hyper has dropped every pinned buffer;
-      # the keeper (and the strings it marked) may now be collected.
-      @pin_keeper = nil
-      @started = false
-      remove_pidfile if @pidfile
       nil
     end
 
-    # Block until every worker has exited (i.e. until shutdown).
+    # Block until a #shutdown, from a signal or any thread, has ended; at
+    # once when the server is not running.
+    #
     # @return [void]
+    # @raise [Exception] what the shutdown raised, when it failed
     def wait
-      pool.join
+      failure = @lifecycle.synchronize do
+        @shutdown_ended.wait(@lifecycle) while @started && !@shutdown_error
+        @shutdown_error
+      end
+      raise failure if failure
     end
 
     # Production entry point: build the server and {#run} it. The `kino`
@@ -270,6 +203,7 @@ module Kino
     # The Rack handler calls this on a server it built itself.
     #
     # @return [self] after shutdown
+    # @raise [Exception] what a failed shutdown raised
     def run(credits: true, on_ready: nil)
       # Startup output must land immediately even when stdout is a pipe or
       # file (process supervisors, `kino > server.log`, `rails server`
@@ -304,56 +238,167 @@ module Kino
           signaled = true
           Log.warn("draining (signal again to force exit)")
           # Trap context forbids mutexes; do the real work on a thread.
-          Thread.new { server.shutdown }
+          # Its error is reported once: #wait raises it on the main thread.
+          Thread.new do
+            Thread.current.report_on_exception = false
+            server.shutdown
+          end
         end
       end
     end
 
     # Live snapshot. Counters come from the native layer (one relaxed
     # atomic per request); config echo makes the line self-describing.
+    # Keys in /stats's order; :responses_cut and :websockets cover the whole process.
     #
-    # @return [Hash{Symbol => Object}] mode, lanes, workers, threads,
-    #   batch, respawns; plus queued, in_flight, served, rejected,
-    #   timeouts, worker_status, quarantined, queue_time (and lane_depths in
-    #   lanes mode) once started
+    # @return [Hash{Symbol => Object}] while it serves, every /stats key but state
+    #   and version; otherwise the config echo: mode, lanes, workers, threads, batch,
+    #   respawns, max_workers, active_workers, scale_ups and scale_downs
     def stats
-      base = {
-        mode: @mode, lanes: @lanes, workers: @workers, max_workers: @max_workers,
-        threads: @threads, batch: @batch, respawns: 0,
-        active_workers: @workers, scale_ups: 0, scale_downs: 0
+      (@started && Native.stats(@id)) || {
+        mode: @mode, lanes: @lanes, workers: @workers, threads: @threads, batch: @batch, respawns: 0,
+        max_workers: @max_workers, active_workers: @workers, scale_ups: 0, scale_downs: 0
       }
-      return base unless @started
-
-      queued, in_flight, served, rejected, timeouts, respawns, lane_depths = Native.server_stats(@id)
-      base.merge!(queued:, in_flight:, served:, rejected:, timeouts:, respawns:)
-      base[:lane_depths] = lane_depths if lane_depths
-      active_workers, _max_workers, scale_ups, scale_downs = Native.pool_stats(@id)
-      base.merge!(active_workers:, scale_ups:, scale_downs:)
-      rows = Native.worker_stats(@id)
-      base[:worker_status] = rows.map do |index, served, in_flight, busy_ms, quarantined, retired|
-        {index:, served:, in_flight:, busy_ms:, quarantined:, retired:}
-      end
-      base[:quarantined] = rows.count { |row| row[4] }
-      count, sum_seconds = Native.queue_time(@id)
-      base[:queue_time] = {count:, sum_seconds:}
-      base
     end
 
     private
 
-    # The worker pool this mode runs: the ractor supervisor, or the
-    # threaded pool. Both spawn, retire, replace and join workers behind
-    # the same methods.
-    def pool
-      @supervisor || @threaded_pool
+    # Say goodbye to the sockets, then wait for queued and in-flight work, up to `deadline`.
+    def drain(deadline)
+      # Each socket's on_shutdown, then its 1001, spread over at most a second and half of what
+      # is left of the drain. Seconds as they are: a deadline may be infinite.
+      Native.ws_leave_all(@id, deadline - Kino.monotonic)
+
+      # Drain: wait for queued + in-flight to reach zero, bounded by deadline.
+      # A socket counts until its on_close is with its worker; hijacked connections close below.
+      until Kino.monotonic >= deadline
+        queued, in_flight, sockets = Native.queue_stats(@id)
+        break if queued.zero? && in_flight.zero? && sockets.zero?
+
+        sleep 0.01
+      end
     end
 
-    # Both pools are quarantine replacers: replace(worker_id) spawns a
+    # Close the queues and join the pool; past `deadline`, free the clients and reap the workers.
+    def stop_workers(deadline)
+      # Idle workers see the closed queue and exit their loops.
+      # Switched hijacked connections close too, so an app serving one sees EOF.
+      Native.close_queue(@id)
+      @pool.shutdown([deadline - Kino.monotonic, 0].max)
+
+      unless @pool.done?
+        # Past the deadline with stuck handlers: free the clients first,
+        # then try to unblock and reap the workers.
+        Native.abort_all_inflight(@id)
+        Native.interrupt_all_workers(@id)
+        @pool.shutdown(0.2)
+        @pool.kill_stragglers
+      end
+    end
+
+    def tear_down
+      # Only now the other hijacked requests: an unanswered long poll gets a 503.
+      Native.close_bridges(@id)
+      Native.shutdown_runtime(@id, 1_000)
+      # The control thread reports "draining" for the whole drain and stops
+      # only now, once there is nothing left to report.
+      Native.control_stop(@id)
+      # The runtime is gone, so hyper has dropped every pinned buffer;
+      # the keeper (and the strings it marked) may now be collected.
+      @pin_keeper = nil
+      remove_pidfile if @pidfile
+    end
+
+    # The pool's shape: hooks, mode, workers and their ceiling, lanes, threads.
+    def configure_pool(settings)
+      worker_hooks = WORKER_HOOKS.to_h { |name| [name, validate_hook(settings[name], name)] }
+      @after_boot = validate_hook(settings[:after_boot], :after_boot)
+      @on_worker_exit = validate_hook(settings[:on_worker_exit], :on_worker_exit)
+      @mode = resolve_mode(settings[:mode], worker_hooks)
+      @workers = Integer(settings[:workers] || default_workers)
+      # The pool ceiling; equal to the floor for a fixed pool.
+      @max_workers = settings[:max_workers].nil? ? @workers : Integer(settings[:max_workers])
+      if @max_workers < @workers
+        raise ArgumentError, "max_workers (#{@max_workers}) must be at least workers (#{@workers})"
+      end
+      @scale_down_after = settings[:scale_down_after].nil? ? 30.0 : Float(settings[:scale_down_after])
+      raise ArgumentError, "scale_down_after must be positive" unless @scale_down_after.positive?
+      if !settings[:scale_down_after].nil? && !elastic?
+        Log.warn("scale_down_after has no effect unless max_workers is above workers")
+      end
+      @lanes = !!settings[:lanes]
+      @worker_hooks = WorkerHooks.new(
+        **worker_hooks,
+        # The access log's GC and allocation figures come from the VM's
+        # process-wide counters, so they are measured only where one
+        # request at a time can own them: the GVL serializes :threaded
+        # mode, and a single ractor (a pool that can never grow past one)
+        # has nothing to race.
+        access_timing: !!settings[:log_requests] && (@mode == :threaded || @max_workers == 1)
+      )
+      # Default threads per mode: 1 in :ractor (threads inside a ractor
+      # share its lock; a measured +17% on fast handlers; raise `workers`
+      # for I/O concurrency instead), 3 in :threaded (threads ARE the
+      # concurrency there).
+      @threads = Integer(settings[:threads] || ((@mode == :ractor) ? 1 : 3))
+    end
+
+    # Queue, timeouts and sizes, the WebSocket budgets, and logging.
+    def configure_limits(settings)
+      @queue_depth = Integer(settings[:queue_depth])
+      @queue_timeout_ms = (Float(settings[:queue_timeout]) * 1000).round
+      @request_timeout_ms = settings[:request_timeout] ? (Float(settings[:request_timeout]) * 1000).round : 0
+      @max_connections = settings[:max_connections] ? Integer(settings[:max_connections]) : default_max_connections
+      @max_body_size = Integer(settings[:max_body_size] || 0)
+      @batch = [Integer(settings[:batch]), 1].max
+      @websocket_max_message = positive_integer(settings[:websocket_max_message], :websocket_max_message)
+      @websocket_max = settings[:websocket_max] && positive_integer(settings[:websocket_max], :websocket_max)
+      @websocket_ping_interval_ms = milliseconds(settings[:websocket_ping_interval], :websocket_ping_interval)
+      @log_requests = !!settings[:log_requests]
+      @shutdown_timeout = settings[:shutdown_timeout]
+    end
+
+    # The I/O runtime, TLS, HTTP/2, the pidfile and the control plane.
+    def configure_io(settings)
+      @io_shards = !!settings[:io_shards]
+      @io_threads = Integer(settings[:io_threads]) unless settings[:io_threads].nil?
+      if @io_threads && @io_threads < 1
+        raise ArgumentError, "io_threads must be >= 1"
+      end
+      Log.warn("io_threads has no effect unless io_shards is true") if @io_threads && !@io_shards
+      @tokio_threads = settings[:tokio_threads]
+      @tls = validate_tls(settings[:tls])
+      if @tls && unix?
+        raise ArgumentError, "TLS is not supported on a unix socket bind; terminate TLS at the proxy in front"
+      end
+      @http2 = settings.fetch(:http2, true) ? true : false
+      @pidfile = settings[:pidfile]
+      @control_bind = settings[:control_bind]&.to_s
+      @control_token = settings[:control_token]&.to_s
+      # An empty token (e.g. control_token ENV["KINO_CONTROL_TOKEN"] with the
+      # var unset) must not half-disable auth: treat it as auth off, not as
+      # "require a zero-length Bearer token".
+      @control_token = nil if @control_token && @control_token.empty?
+    end
+
+    def configure_quarantine(settings)
+      @quarantine_timeout_ms = settings[:quarantine_timeout] ? (Float(settings[:quarantine_timeout]) * 1000).round : nil
+      @quarantine_max =
+        if settings[:quarantine_max]
+          Integer(settings[:quarantine_max])
+        elsif @mode == :ractor
+          @workers
+        else
+          @workers * @threads
+        end
+    end
+
+    # Both pools are quarantine replacers: replace(worker_id, generation) spawns a
     # replacement worker, then quarantines the wedged slot.
     def start_quarantine_monitor
       @quarantine_monitor = QuarantineMonitor.new(
         server_id: @id, timeout_ms: @quarantine_timeout_ms,
-        max: @quarantine_max, replacer: pool
+        max: @quarantine_max, replacer: @pool
       ).start
     end
 
@@ -377,7 +422,7 @@ module Kino
 
     def start_pool_scaler
       @pool_scaler = PoolScaler.new(
-        server_id: @id, pool: pool, floor: @workers, ceiling: @max_workers,
+        server_id: @id, pool: @pool, floor: @workers, ceiling: @max_workers,
         scale_down_after: @scale_down_after
       ).start
     end
@@ -391,6 +436,23 @@ module Kino
       {cert: String(tls[:cert]), key: String(tls[:key])}
     end
 
+    def positive_integer(value, name)
+      number = Integer(value, exception: false)
+      return number if number&.positive?
+
+      raise ArgumentError, "#{name} must be a positive Integer (got #{value.inspect})"
+    end
+
+    # Seconds as whole milliseconds: nil and 0 mean off (0); anything above zero is at least 1.
+    def milliseconds(value, name)
+      seconds = value.nil? ? 0.0 : Float(value, exception: false)
+      unless seconds&.finite? && !seconds.negative?
+        raise ArgumentError, "#{name} must be a finite, non-negative number of seconds or nil (got #{value.inspect})"
+      end
+
+      seconds.zero? ? 0 : [(seconds * 1000).round, 1].max
+    end
+
     def validate_hook(handler, name)
       return nil if handler.nil?
       unless handler.respond_to?(:call)
@@ -398,10 +460,6 @@ module Kino
       end
 
       handler
-    end
-
-    def monotonic_now
-      Process.clock_gettime(Process::CLOCK_MONOTONIC)
     end
 
     # A pool that can grow: the ceiling is above the floor.
@@ -482,16 +540,25 @@ module Kino
       nil
     end
 
-    def join_workers(deadline)
-      pool.shutdown([deadline - monotonic_now, 0].max)
+    # Wait out a shutdown under way, then claim the next; false once stopped.
+    def claim_shutdown
+      @lifecycle.synchronize do
+        @shutdown_ended.wait(@lifecycle) while @stopping
+        next false unless @started
+
+        @stopping = true
+        @shutdown_error = nil
+        true
+      end
     end
 
-    def workers_done?
-      pool.done?
-    end
-
-    def kill_stragglers
-      pool.kill_stragglers
+    def end_shutdown(failure, stopped:)
+      @lifecycle.synchronize do
+        @stopping = false
+        @started = false if stopped
+        @shutdown_error = failure
+        @shutdown_ended.broadcast
+      end
     end
 
     # Policy (mode resolution): when is an app safe for ractor
@@ -500,7 +567,7 @@ module Kino
     # :ractor with an unshareable app is an error, and we never
     # make_shareable the user's app behind their back (deep-freezing
     # someone's object graph is not a server's call to make).
-    def resolve_mode(requested)
+    def resolve_mode(requested, worker_hooks)
       case requested
       when :threaded
         :threaded
@@ -511,7 +578,7 @@ module Kino
             "Ractor.shareable_proc endpoints); try Ractor.make_shareable(app) " \
             "or mode: :threaded"
         end
-        if (name = unshareable_worker_hook_name)
+        if (name = unshareable_hook_name(worker_hooks))
           raise Error,
             "mode: :ractor requires a Ractor-shareable #{name} hook " \
             "(build it with Ractor.shareable_proc, or use mode: :threaded)"
@@ -521,7 +588,7 @@ module Kino
         if !Ractor.shareable?(@app)
           Log.warn("app is not Ractor-shareable; falling back to mode: :threaded")
           :threaded
-        elsif (name = unshareable_worker_hook_name)
+        elsif (name = unshareable_hook_name(worker_hooks))
           Log.warn("#{name} hook is not Ractor-shareable; falling back to mode: :threaded")
           :threaded
         else
@@ -532,21 +599,12 @@ module Kino
       end
     end
 
-    # The hooks that ride into worker context (a ractor in :ractor mode)
-    # and so must be Ractor-shareable there. after_boot and on_worker_exit
-    # run on the main thread and are exempt.
-    def worker_context_hooks
-      [[:on_error, @on_error], [:after_worker_boot, @after_worker_boot],
-        [:after_request_complete, @after_request_complete]]
-    end
-
-    # The name of the first worker-context hook that is set but not
+    # The name of the first of `hooks` (name => hook) that is set but not
     # Ractor-shareable, or nil if all set ones are. Used by both the
     # :ractor raise and the :auto warn/fallback branches, so "first
     # offender" is defined once.
-    def unshareable_worker_hook_name
-      bad = worker_context_hooks.find { |_name, hook| !(hook.nil? || Ractor.shareable?(hook)) }
-      bad&.first
+    def unshareable_hook_name(hooks)
+      hooks.find { |_name, hook| !(hook.nil? || Ractor.shareable?(hook)) }&.first
     end
   end
 end

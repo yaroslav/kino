@@ -4,49 +4,37 @@
 //! the least-loaded shard. Each shard then owns that connection for its
 //! lifetime, avoiding the shared Tokio worker pool on hot HTTP paths.
 
-use std::net::SocketAddr;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::thread::JoinHandle;
 
+use tokio_util::either::Either;
+
+use crate::counters::Counted;
 use crate::listen::Listener;
 use crate::log::{self, Level};
 use crate::registry::{ServerInner, STATE_DRAINING};
-use crate::server::{serve_conn, AsyncListener, Conn};
+use crate::server::{next_accept, serve_conn, Accepted, AsyncListener, Conn};
 
-/// A connection in transit from the acceptor to its shard. Tokio streams
-/// are bound to the runtime that registered them, so the handoff carries
-/// the std stream and the shard re-registers it on arrival.
-enum StdConn {
-    Tcp(std::net::TcpStream),
-    Unix(std::os::unix::net::UnixStream),
-}
-
-impl StdConn {
-    /// Register with the calling (shard) runtime.
-    fn into_tokio(self) -> std::io::Result<Conn> {
-        Ok(match self {
-            StdConn::Tcp(stream) => Conn::Tcp(tokio::net::TcpStream::from_std(stream)?),
-            StdConn::Unix(stream) => Conn::Unix(tokio::net::UnixStream::from_std(stream)?),
-        })
-    }
-}
+/// An accepted stream in transit from the acceptor to its shard. Tokio
+/// streams are bound to the runtime that registered them, so the handoff
+/// carries the std stream and the shard re-registers it on arrival.
+type StdConn = Either<std::net::TcpStream, std::os::unix::net::UnixStream>;
 
 /// Detach an accepted stream from the acceptor's runtime for the handoff.
 fn into_std(conn: Conn) -> std::io::Result<StdConn> {
     Ok(match conn {
-        Conn::Tcp(stream) => StdConn::Tcp(stream.into_std()?),
-        Conn::Unix(stream) => StdConn::Unix(stream.into_std()?),
+        Either::Left(stream) => Either::Left(stream.into_std()?),
+        Either::Right(stream) => Either::Right(stream.into_std()?),
     })
 }
 
-/// One accepted connection en route to a shard: the detached stream, the
-/// addresses hyper reports, and the slot it holds against max_connections.
-struct Accepted {
-    conn: StdConn,
-    remote_addr: SocketAddr,
-    local_addr: SocketAddr,
-    permit: tokio::sync::OwnedSemaphorePermit,
+/// Register a handed-over stream with the calling (shard) runtime.
+fn into_tokio(conn: StdConn) -> std::io::Result<Conn> {
+    Ok(match conn {
+        Either::Left(stream) => Either::Left(tokio::net::TcpStream::from_std(stream)?),
+        Either::Right(stream) => Either::Right(tokio::net::UnixStream::from_std(stream)?),
+    })
 }
 
 /// Shard count: an explicit `io_threads` wins; the default is half the
@@ -129,20 +117,29 @@ fn join_all(handles: Vec<JoinHandle<()>>) {
     }
 }
 
-fn current_thread_runtime() -> std::io::Result<tokio::runtime::Runtime> {
-    tokio::runtime::Builder::new_current_thread()
-        .enable_all()
-        .build()
-}
+/// What an I/O thread reports once its runtime is up, or what kept it
+/// from coming up.
+type Ready = std::sync::mpsc::SyncSender<std::io::Result<()>>;
 
-/// Wait for a just spawned I/O thread to report its runtime up, so a
-/// startup failure becomes the boot error Ruby sees instead of a silently
-/// dead thread.
-fn await_ready(
-    handle: JoinHandle<()>,
-    ready_rx: std::sync::mpsc::Receiver<std::io::Result<()>>,
+/// Spawn thread `name` (the `what` thread) on a current-thread runtime of its own, running
+/// `run`, and wait for it to report ready, so a startup failure becomes Ruby's boot error.
+fn spawn_io_thread(
+    name: String,
     what: &str,
+    run: impl FnOnce(tokio::runtime::Runtime, Ready) + Send + 'static,
 ) -> std::io::Result<JoinHandle<()>> {
+    let (ready_tx, ready_rx) = std::sync::mpsc::sync_channel(1);
+    let handle = std::thread::Builder::new().name(name).spawn(move || {
+        match tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+        {
+            Ok(runtime) => run(runtime, ready_tx),
+            Err(error) => {
+                let _ = ready_tx.send(Err(error));
+            }
+        }
+    })?;
     match ready_rx.recv() {
         Ok(Ok(())) => Ok(handle),
         Ok(Err(error)) => {
@@ -157,27 +154,21 @@ fn await_ready(
 
 fn spawn_shard(
     index: usize,
-    rx: tokio::sync::mpsc::UnboundedReceiver<Accepted>,
+    rx: tokio::sync::mpsc::UnboundedReceiver<Accepted<StdConn>>,
     acceptor: Option<tokio_rustls::TlsAcceptor>,
     server: Arc<ServerInner>,
     load: Arc<AtomicUsize>,
     mut shutdown_rx: tokio::sync::watch::Receiver<bool>,
 ) -> std::io::Result<JoinHandle<()>> {
-    let (ready_tx, ready_rx) = std::sync::mpsc::sync_channel(1);
-    let handle = std::thread::Builder::new()
-        .name(format!("kino-io-{index}"))
-        .spawn(move || {
-            let runtime = match current_thread_runtime() {
-                Ok(runtime) => runtime,
-                Err(error) => {
-                    let _ = ready_tx.send(Err(error));
-                    return;
-                }
-            };
+    spawn_io_thread(
+        format!("kino-io-{index}"),
+        "shard",
+        move |runtime, ready_tx| {
+            // Shards run until final teardown, unlike the acceptor.
             let _ = ready_tx.send(Ok(()));
             runtime.block_on(shard_loop(rx, acceptor, server, load, &mut shutdown_rx));
-        })?;
-    await_ready(handle, ready_rx, "shard")
+        },
+    )
 }
 
 fn spawn_acceptor(
@@ -185,20 +176,13 @@ fn spawn_acceptor(
     server: Arc<ServerInner>,
     max_connections: usize,
     shutdown_rx: tokio::sync::watch::Receiver<bool>,
-    shard_txs: Vec<tokio::sync::mpsc::UnboundedSender<Accepted>>,
+    shard_txs: Vec<tokio::sync::mpsc::UnboundedSender<Accepted<StdConn>>>,
     loads: Vec<Arc<AtomicUsize>>,
 ) -> std::io::Result<JoinHandle<()>> {
-    let (ready_tx, ready_rx) = std::sync::mpsc::sync_channel(1);
-    let handle = std::thread::Builder::new()
-        .name("kino-accept".to_string())
-        .spawn(move || {
-            let runtime = match current_thread_runtime() {
-                Ok(runtime) => runtime,
-                Err(error) => {
-                    let _ = ready_tx.send(Err(error));
-                    return;
-                }
-            };
+    spawn_io_thread(
+        "kino-accept".to_string(),
+        "accept",
+        move |runtime, ready_tx| {
             runtime.block_on(async move {
                 // Registration must happen on this runtime; a failure is
                 // routed through the same ready channel as a build error.
@@ -220,16 +204,15 @@ fn spawn_acceptor(
                 )
                 .await;
             });
-        })?;
-    await_ready(handle, ready_rx, "accept")
+        },
+    )
 }
 
 /// Serve handed-over connections until the acceptor is gone, then let the
-/// remaining ones finish. The final teardown signal cuts either phase
-/// short: dropping the runtime cancels connection tasks at their next
-/// await point.
+/// remaining ones run until the final teardown signal: dropping the
+/// runtime cancels connection tasks at their next await point.
 async fn shard_loop(
-    mut rx: tokio::sync::mpsc::UnboundedReceiver<Accepted>,
+    mut rx: tokio::sync::mpsc::UnboundedReceiver<Accepted<StdConn>>,
     acceptor: Option<tokio_rustls::TlsAcceptor>,
     server: Arc<ServerInner>,
     load: Arc<AtomicUsize>,
@@ -243,117 +226,74 @@ async fn shard_loop(
                 let Some(accepted) = accepted else { break };
                 let acceptor = acceptor.clone();
                 let server = server.clone();
-                let guard = LoadGuard(load.clone());
-                connections.spawn(async move {
-                    let _guard = guard;
-                    serve_accepted(accepted, acceptor, server).await;
-                });
+                // The acceptor counted it.
+                let load = Counted::adopt(load.clone(), 1);
+                connections.spawn(serve_accepted(accepted, load, acceptor, server));
             }
             // Reap closed connections so the set stays small.
             Some(_) = connections.join_next(), if !connections.is_empty() => {}
         }
     }
-    // The acceptor is gone: drain. Every join is one connection closing.
-    while !connections.is_empty() {
-        tokio::select! {
-            _ = shutdown_rx.changed() => return,
-            _ = connections.join_next() => {}
-        }
-    }
-}
-
-/// Keeps the shard's connection count honest whichever way the task ends:
-/// return, panic, or cancellation at teardown. A plain decrement after the
-/// await would never run on the last two.
-struct LoadGuard(Arc<AtomicUsize>);
-
-impl Drop for LoadGuard {
-    fn drop(&mut self) {
-        self.0.fetch_sub(1, Ordering::Relaxed);
-    }
+    // The acceptor is gone. Upgraded connections (hijacked bridges, native
+    // WebSockets) run in tasks outside the set, so the runtime stays up
+    // until teardown even once every connection in it has closed.
+    let _ = shutdown_rx.changed().await;
+    drop(connections);
 }
 
 /// The shard's half of the handoff: re-register the stream on this
 /// runtime, then run the shared connection pipeline (TLS handshake,
 /// protocol layer) exactly as the default runtime would.
 async fn serve_accepted(
-    accepted: Accepted,
+    Accepted {
+        conn,
+        peer,
+        mut held,
+    }: Accepted<StdConn>,
+    load: Counted,
     acceptor: Option<tokio_rustls::TlsAcceptor>,
     server: Arc<ServerInner>,
 ) {
-    // Held for the connection's lifetime; dropping it frees a slot.
-    let _permit = accepted.permit;
-    let conn = match accepted.conn.into_tokio() {
-        Ok(conn) => conn,
-        Err(_) => {
-            log::emit(
-                Level::Warn,
-                "tokio",
-                "failed to register a stream on an I/O shard",
-            );
-            return;
-        }
+    let Ok(conn) = into_tokio(conn) else {
+        log::emit(
+            Level::Warn,
+            "tokio",
+            "failed to register a stream on an I/O shard",
+        );
+        return;
     };
-    serve_conn(
-        conn,
-        acceptor,
-        server,
-        accepted.remote_addr,
-        accepted.local_addr,
-    )
-    .await;
+    held.shard_load = Some(load);
+    serve_conn(Accepted { conn, peer, held }, acceptor, server).await;
 }
 
-/// The sharded accept loop. Same backpressure as the default loop: the
-/// permit is acquired before accept, so past max_connections the excess
-/// waits in the kernel backlog instead of being accepted and dropped.
-/// A shard whose channel is gone is marked dead and routed around; with
-/// no shard left the loop stops accepting and flips the server to
-/// draining, so the control plane stops reporting ready.
+/// The sharded accept loop, with the default loop's backpressure
+/// (next_accept). A shard whose channel is gone is marked dead and
+/// routed around; with no shard left the loop stops accepting and flips
+/// the server to draining, so the control plane stops reporting ready.
 async fn accept_loop(
     listener: AsyncListener,
     server: Arc<ServerInner>,
     max_connections: usize,
     mut shutdown_rx: tokio::sync::watch::Receiver<bool>,
-    shard_txs: Vec<tokio::sync::mpsc::UnboundedSender<Accepted>>,
+    shard_txs: Vec<tokio::sync::mpsc::UnboundedSender<Accepted<StdConn>>>,
     loads: Vec<Arc<AtomicUsize>>,
-    ready_tx: std::sync::mpsc::SyncSender<std::io::Result<()>>,
+    ready_tx: Ready,
 ) {
     let conn_limit = Arc::new(tokio::sync::Semaphore::new(max_connections));
     let mut live = vec![true; shard_txs.len()];
     let _ = ready_tx.send(Ok(()));
-    'accept: loop {
-        let permit = tokio::select! {
-            _ = shutdown_rx.changed() => break,
-            permit = conn_limit.clone().acquire_owned() => match permit {
-                Ok(permit) => permit,
-                Err(_) => break,
-            },
+    'accept: while let Some(Accepted { conn, peer, held }) =
+        next_accept(&listener, &conn_limit, &mut shutdown_rx).await
+    {
+        let Ok(conn) = into_std(conn) else {
+            log::emit(
+                Level::Warn,
+                "tokio",
+                "failed to detach an accepted stream; connection dropped",
+            );
+            continue;
         };
-        let (conn, remote_addr, local_addr) = tokio::select! {
-            _ = shutdown_rx.changed() => break,
-            accepted = listener.accept() => match accepted {
-                Ok(accepted) => accepted,
-                Err(_) => continue,
-            },
-        };
-        let conn = match into_std(conn) {
-            Ok(conn) => conn,
-            Err(_) => {
-                log::emit(
-                    Level::Warn,
-                    "tokio",
-                    "failed to detach an accepted stream; connection dropped",
-                );
-                continue;
-            }
-        };
-        let mut accepted = Accepted {
-            conn,
-            remote_addr,
-            local_addr,
-            permit,
-        };
+        let mut accepted = Accepted { conn, peer, held };
         loop {
             let Some(index) = least_loaded(&loads, &live) else {
                 log::emit(
@@ -390,7 +330,106 @@ fn least_loaded(loads: &[Arc<AtomicUsize>], live: &[bool]) -> Option<usize> {
 
 #[cfg(test)]
 mod tests {
-    use super::{default_thread_count, least_loaded, thread_count, Arc, AtomicUsize};
+    use super::*;
+    use crate::testing::{upgrade_request, SWITCHED};
+    use hyper_util::rt::TokioIo;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    /// A client connects to `port`, and the app (the test, playing the
+    /// worker) takes the connection over and switches it to another
+    /// protocol; once a byte went through, returns both ends.
+    async fn upgraded(
+        server: &ServerInner,
+        port: u16,
+    ) -> (TokioIo<hyper::upgrade::Upgraded>, tokio::net::UnixStream) {
+        let tcp = tokio::net::TcpStream::connect(("127.0.0.1", port))
+            .await
+            .expect("connect");
+        let (mut sender, conn) = hyper::client::conn::http1::handshake(TokioIo::new(tcp))
+            .await
+            .expect("h1 handshake");
+        tokio::spawn(conn.with_upgrades());
+        let pending = tokio::spawn(async move { sender.send_request(upgrade_request()).await });
+        let mut ctx = server.req_rx.recv_async().await.expect("the request");
+        let app = crate::hijack::take(&mut ctx, None).expect("an Upgrade request can be hijacked");
+        app.set_nonblocking(true).expect("nonblocking app end");
+        let mut app = tokio::net::UnixStream::from_std(app).expect("app end registered");
+        app.write_all(SWITCHED).await.expect("app write");
+        let response = pending.await.expect("join").expect("the 101");
+        assert_eq!(response.status(), 101);
+        let mut client = TokioIo::new(hyper::upgrade::on(response).await.expect("client upgrade"));
+        client.write_all(b"x").await.expect("client write");
+        app.read_u8().await.expect("the byte through the bridge");
+        (client, app)
+    }
+
+    fn counts(loads: &[Arc<AtomicUsize>]) -> Vec<usize> {
+        loads
+            .iter()
+            .map(|load| load.load(Ordering::Relaxed))
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn sequential_upgraded_connections_spread_across_shards() {
+        // Runs one at a time with the socket and bridge tests, as they do.
+        let _serial = crate::testing::SERIAL.lock().await;
+        let server = crate::testing::TestServer::shared_queue().build();
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+        listener
+            .set_nonblocking(true)
+            .expect("nonblocking listener");
+        let port = listener.local_addr().expect("local addr").port();
+        let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+        let loads = vec![Arc::new(AtomicUsize::new(0)), Arc::new(AtomicUsize::new(0))];
+        let mut handles = Vec::new();
+        let mut shard_txs = Vec::new();
+        for (index, load) in loads.iter().enumerate() {
+            let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+            let shard = spawn_shard(
+                index,
+                rx,
+                None,
+                server.clone(),
+                load.clone(),
+                shutdown_rx.clone(),
+            );
+            handles.push(shard.expect("shard"));
+            shard_txs.push(tx);
+        }
+        let listener = Listener::Tcp(listener);
+        let acceptor = spawn_acceptor(
+            listener,
+            server.clone(),
+            16,
+            shutdown_rx,
+            shard_txs,
+            loads.clone(),
+        );
+        handles.push(acceptor.expect("acceptor"));
+
+        let first = upgraded(&server, port).await;
+        let second = upgraded(&server, port).await;
+
+        assert_eq!(
+            counts(&loads),
+            [1, 1],
+            "two open upgraded connections must count on different shards"
+        );
+        drop((first, second));
+        let still = std::fmt::from_fn(|f| {
+            write!(
+                f,
+                "closed upgraded connections to stop counting (shard loads {:?})",
+                counts(&loads)
+            )
+        });
+        crate::testing::until(still, || counts(&loads) == [0, 0]).await;
+        shutdown_tx.send(true).expect("shards listening");
+        tokio::task::spawn_blocking(|| join_all(handles))
+            .await
+            .expect("join");
+    }
 
     fn loads(counts: &[usize]) -> Vec<Arc<AtomicUsize>> {
         counts

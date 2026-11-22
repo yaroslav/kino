@@ -7,10 +7,6 @@ require "rack"
 # plaintext, and the h2-specific Rack env contract (SERVER_PROTOCOL,
 # HTTP_HOST/SERVER_NAME/SERVER_PORT from the :authority pseudo-header).
 RSpec.describe "HTTP/2" do
-  def tls_opts
-    {tls: {cert: TlsFixture.cert_pem, key: TlsFixture.key_pem}}
-  end
-
   # An h2-over-TLS client; kino's test cert is self-signed.
   def h2_tls_client
     HTTPX.with(ssl: {verify_mode: OpenSSL::SSL::VERIFY_NONE})
@@ -32,7 +28,7 @@ RSpec.describe "HTTP/2" do
   end
 
   it "negotiates h2 over TLS and fills the env from :authority" do
-    with_server(echo_env, **tls_opts) do |host, port|
+    with_server(echo_env, **TlsFixture.options) do |host, port|
       response = h2_tls_client.get("https://#{host}:#{port}/")
 
       expect(response.version).to eq("2.0")
@@ -155,7 +151,7 @@ RSpec.describe "HTTP/2" do
 
   describe "http2 false" do
     it "negotiates down to HTTP/1.1 over TLS" do
-      with_server(echo_env, http2: false, **tls_opts) do |host, port|
+      with_server(echo_env, http2: false, **TlsFixture.options) do |host, port|
         response = h2_tls_client.get("https://#{host}:#{port}/")
 
         expect(response.version).to eq("1.1")

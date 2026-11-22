@@ -1,0 +1,224 @@
+//! One request through hyper: body forwarding, the queue, the answer and the access log.
+
+use std::sync::atomic::Ordering;
+use std::sync::Arc;
+use std::time::Duration;
+
+use http_body_util::BodyExt;
+
+use super::accept::Peer;
+use crate::framing::content_length;
+use crate::registry::ServerInner;
+use crate::request::RequestCtx;
+use crate::response::{plain_response, HyperResponse, Responder};
+
+fn branded(mut response: HyperResponse) -> HyperResponse {
+    response
+        .headers_mut()
+        .entry(http::header::SERVER)
+        .or_insert(http::HeaderValue::from_static("Kino"));
+    response
+}
+
+/// Idle deadline between body frames, so a silent client cannot pin a worker in read_body.
+const BODY_READ_TIMEOUT: Duration = Duration::from_secs(30);
+
+pub(super) async fn handle_request(
+    server: Arc<ServerInner>,
+    peer: Peer,
+    mut req: hyper::Request<hyper::body::Incoming>,
+) -> Result<HyperResponse, std::convert::Infallible> {
+    // A task holds a switching request's connection until the app claims it.
+    let upgrade = crate::upgrade::capture(&mut req, &server);
+    let (parts, body) = req.into_parts();
+    let logged = Logged::arrival(&server, &parts, &peer);
+
+    // A declared oversize body gets a 413 before any worker runs; the forwarder caps
+    // chunked or lying clients, and read_body raises.
+    let max_body = server.config.max_body_size as u64;
+    let oversize = max_body > 0 && content_length(&parts.headers).is_some_and(|len| len > max_body);
+
+    let (head_tx, mut head_rx) = tokio::sync::oneshot::channel();
+    let responder = Arc::new(Responder::new(head_tx));
+    // A request that asks to switch can be hijacked: it keeps its responder for the request
+    // timeout and the in-flight count.
+    let switching = upgrade.is_some().then(|| responder.clone());
+    // No channel is a bodyless EOF.
+    let bodyless = oversize || hyper::body::Body::is_end_stream(&body);
+    let body_rx = (!bodyless).then(|| forward_body(body, &responder, max_body));
+    let ctx = RequestCtx::new(parts, peer, &server, responder, body_rx, upgrade);
+
+    // A Drop guard: hyper drops this future at an await when the client aborts, and a
+    // plain decrement after it would never run.
+    struct InFlight(Arc<ServerInner>, Option<Arc<Responder>>);
+    impl Drop for InFlight {
+        fn drop(&mut self) {
+            // A hijacked request left the count when the app took it over.
+            if self.1.as_ref().is_none_or(|r| r.leave_in_flight()) {
+                self.0.counters.in_flight.fetch_sub(1, Ordering::Relaxed);
+            }
+        }
+    }
+    server.counters.in_flight.fetch_add(1, Ordering::Relaxed);
+    let in_flight = InFlight(server.clone(), switching);
+
+    // One exit, so the access log sees every outcome, 503s included.
+    let response = if oversize {
+        plain_response(413, "Payload Too Large\n")
+    } else if !crate::dispatch::enqueue(&server, ctx).await {
+        server.counters.rejected.fetch_add(1, Ordering::Relaxed);
+        plain_response(503, "Service Unavailable\n")
+    } else {
+        await_head(&server, in_flight.1.as_deref(), &mut head_rx).await
+    };
+    if let Some(logged) = logged {
+        logged.completion(&response);
+    }
+    Ok(branded(response))
+}
+
+/// A request's lines in the access log.
+struct Logged<'a> {
+    log: &'a crate::logsink::Sink,
+    start: std::time::Instant,
+    method: String,
+    target: String,
+}
+
+impl<'a> Logged<'a> {
+    /// Only when logging. The arrival line goes out before the app sees the request, so a
+    /// hang shows as an arrow with no answer.
+    fn arrival(
+        server: &'a ServerInner,
+        parts: &http::request::Parts,
+        peer: &Peer,
+    ) -> Option<Logged<'a>> {
+        let log = server.access_log.as_ref()?;
+        let target = match parts.uri.query() {
+            Some(q) => format!("{}?{}", parts.uri.path(), q),
+            None => parts.uri.path().to_string(),
+        };
+        let method = parts.method.to_string();
+        log.write_line(crate::access_log::arrival(
+            &method,
+            &target,
+            peer.remote.ip(),
+        ));
+        let start = std::time::Instant::now();
+        Some(Logged {
+            log,
+            start,
+            method,
+            target,
+        })
+    }
+
+    /// A 503 or 504 never reached a worker and carries no timing.
+    fn completion(self, response: &HyperResponse) {
+        let timing = response
+            .extensions()
+            .get::<crate::access_log::Timing>()
+            .copied();
+        self.log.write_line(crate::access_log::completion(
+            response.status().as_u16(),
+            &self.method,
+            &self.target,
+            self.start.elapsed(),
+            timing,
+        ));
+    }
+}
+
+/// The request's body, forwarded by a task of its own through a bounded channel, so hyper is
+/// polled only as fast as Ruby reads.
+fn forward_body(
+    mut body: hyper::body::Incoming,
+    responder: &Arc<Responder>,
+    max_body: u64,
+) -> flume::Receiver<bytes::Bytes> {
+    let (body_tx, body_rx) = flume::bounded::<bytes::Bytes>(8);
+    let responder = responder.clone();
+    tokio::spawn(async move {
+        let mut total: u64 = 0;
+        loop {
+            // Only the client's silence trips this; a slow app blocks send_async, untimed.
+            let frame = match tokio::time::timeout(BODY_READ_TIMEOUT, body.frame()).await {
+                Ok(Some(Ok(frame))) => frame,
+                Ok(Some(Err(_))) | Ok(None) => break, // body error or clean EOF
+                Err(_) => {
+                    responder.abandon_body(crate::response::BodyAbandon::TimedOut);
+                    break;
+                }
+            };
+            // Non-data frames (h2 trailers) are dropped: Rack has no trailer surface.
+            if let Ok(data) = frame.into_data() {
+                total += data.len() as u64;
+                if max_body > 0 && total > max_body {
+                    // Past the cap: dropping the sender unblocks read_body, which raises.
+                    responder.abandon_body(crate::response::BodyAbandon::Oversize);
+                    break;
+                }
+                if body_tx.send_async(data).await.is_err() {
+                    break; // request handle dropped; stop pulling
+                }
+            }
+        }
+    });
+    body_rx
+}
+
+/// The head must arrive in time or the client gets a 504; the worker runs on, and its late
+/// answer goes nowhere (the first claim won). A CPU-stuck handler keeps its slot.
+async fn await_head(
+    server: &ServerInner,
+    switching: Option<&Responder>,
+    head_rx: &mut tokio::sync::oneshot::Receiver<HyperResponse>,
+) -> HyperResponse {
+    let dropped = |_| plain_response(500, "Internal Server Error\n");
+    if server.config.request_timeout_ms == 0 {
+        return head_rx.await.unwrap_or_else(dropped);
+    }
+    let deadline = Duration::from_millis(server.config.request_timeout_ms);
+    match tokio::time::timeout(deadline, &mut *head_rx).await {
+        Ok(result) => result.unwrap_or_else(dropped),
+        Err(_elapsed) => timed_out(server, switching, head_rx),
+    }
+}
+
+/// A 504. For a request that asked to switch (`switching`, its responder) it closes the
+/// connection, and a held 101 is given up unless it went out as the deadline passed.
+fn timed_out(
+    server: &ServerInner,
+    switching: Option<&Responder>,
+    head_rx: &mut tokio::sync::oneshot::Receiver<HyperResponse>,
+) -> HyperResponse {
+    if let Some(responder) = switching {
+        if !responder.cancel_switch() {
+            if let Ok(response) = head_rx.try_recv() {
+                return response;
+            }
+        }
+    }
+    server.counters.timeouts.fetch_add(1, Ordering::Relaxed);
+    let mut response = plain_response(504, "Gateway Timeout\n");
+    if switching.is_some() {
+        crate::response::close_connection(&mut response);
+    }
+    response
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn branded_adds_the_server_header_unless_the_app_set_one() {
+        let response = branded(plain_response(200, "x"));
+        assert_eq!(response.headers()[http::header::SERVER], "Kino");
+
+        let mut custom = plain_response(200, "x");
+        let server = http::HeaderValue::from_static("custom");
+        custom.headers_mut().insert(http::header::SERVER, server);
+        assert_eq!(branded(custom).headers()[http::header::SERVER], "custom");
+    }
+}

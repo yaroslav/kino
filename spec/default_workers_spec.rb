@@ -6,14 +6,6 @@ RSpec.describe "default worker count" do
 
   before { allow(Kino).to receive(:available_parallelism).and_return(10) }
 
-  def with_max_cpu(value)
-    previous = ENV["RUBY_MAX_CPU"]
-    value.nil? ? ENV.delete("RUBY_MAX_CPU") : ENV["RUBY_MAX_CPU"] = value
-    yield
-  ensure
-    previous.nil? ? ENV.delete("RUBY_MAX_CPU") : ENV["RUBY_MAX_CPU"] = previous
-  end
-
   def workers_for(app, **opts)
     Kino::Server.new(app, threads: 1, **opts).stats[:workers]
   end

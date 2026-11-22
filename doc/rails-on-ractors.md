@@ -39,6 +39,34 @@ Verified on the example in `:ractor` mode:
 - Error pages: unknown paths return 404, a request missing a required
   parameter returns 400, and the server keeps serving.
 - Concurrent reads from several worker Ractors, with no Ractor errors.
+- A live feed of new posts over Kino's native WebSockets (below).
+
+### Live posts
+
+`/live` is a WebSocket that gets every post created after it connects,
+one text message per post, in the JSON that `POST /posts` returns. With
+the example running, open <http://localhost:9292> and run this in the
+browser console:
+
+```js
+new WebSocket("ws://localhost:9292/live").onmessage = e => console.log(e.data)
+```
+
+Then create a post, and the console logs it:
+
+```sh
+curl -d body="Hello, live" localhost:9292/posts
+```
+
+Action Cable does not run on Ractors yet: `ActionCable.server` reads
+its config from a class variable, which worker Ractors cannot read, and
+websocket-driver unmasks frames in a C extension that is not marked
+Ractor-safe. The feed uses Kino's own WebSockets instead. Each socket
+subscribes to a `posts` topic when it opens, and `PostsController#create`
+publishes to it after a save; Kino sends each message to every
+subscriber, whichever worker holds its socket. Native WebSockets need
+`lanes true`, which the example's `kino.rb` sets. Under Puma, `/live`
+answers 426 and posts are not published.
 
 ## What the example sets, and why
 

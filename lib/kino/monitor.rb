@@ -25,7 +25,7 @@ module Kino
 
     def stop
       @running = false
-      @thread&.join(@tick * 2)
+      Teardown.join(@thread, @tick * 2) if @thread
     end
 
     private

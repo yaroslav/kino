@@ -11,7 +11,7 @@ RSpec.describe Kino do
   it "can call natives from a non-main Ractor" do
     result = Ractor.new { Kino::Native.queue_stats(0) }.value
 
-    expect(result).to eq([0, 0])
+    expect(result).to eq([0, 0, 0])
   end
 
   describe ".available_parallelism" do

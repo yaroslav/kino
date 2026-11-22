@@ -4,13 +4,6 @@ require "socket"
 require "tmpdir"
 
 RSpec.describe "sharded native I/O" do
-  def https_get(host, port, path)
-    http = Net::HTTP.new(host, port)
-    http.use_ssl = true
-    http.verify_mode = OpenSSL::SSL::VERIFY_NONE
-    http.start { |session| session.get(path) }
-  end
-
   it "serves requests in ractor mode" do
     app = Ractor.shareable_proc { |_env| [200, {"content-type" => "text/plain"}, ["ok"]] }
 
@@ -25,10 +18,9 @@ RSpec.describe "sharded native I/O" do
 
   it "serves TLS requests on shards" do
     app = ->(env) { [200, {"content-type" => "text/plain"}, [env["rack.url_scheme"]]] }
-    tls = {cert: TlsFixture.cert_pem, key: TlsFixture.key_pem}
 
     with_server(app, mode: :threaded, workers: 1, threads: 1,
-      io_shards: true, io_threads: 2, tls: tls) do |host, port|
+      io_shards: true, io_threads: 2, **TlsFixture.options) do |host, port|
       expect(https_get(host, port, "/").body).to eq("https")
     end
   end
@@ -85,9 +77,7 @@ RSpec.describe "sharded native I/O" do
     socket = TCPSocket.new("127.0.0.1", server.port)
     socket.write("GET / HTTP/1.1\r\n")
 
-    started = Process.clock_gettime(Process::CLOCK_MONOTONIC)
-    server.shutdown(timeout: 1)
-    elapsed = Process.clock_gettime(Process::CLOCK_MONOTONIC) - started
+    elapsed = timed { server.shutdown(timeout: 1) }
 
     expect(elapsed).to be < 5
   ensure

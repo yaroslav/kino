@@ -51,6 +51,8 @@ runs on Ractors too (see [Rails on Ractors](doc/rails-on-ractors.md)).
 - [Logging](#logging)
 - [Timer waits](#timer-waits)
 - [Rack 3 compliance](#rack-3-compliance)
+- [Streaming responses](#streaming-responses)
+- [WebSockets](#websockets-experimental)
 - [Rails](#rails)
 
 ## Why
@@ -288,22 +290,31 @@ server.shutdown               # graceful: drain → deadline → abort straggler
 - **`:ractor`**: `workers` Ractors × `threads` Threads each. The app must
   be `Ractor.shareable?` (frozen middleware, `shareable_proc` endpoints).
   Forcing `:ractor` with an unshareable app raises
-  `Kino::UnshareableAppError`. A crashed ractor returns 500 to its
-  in-flight requests right away, then respawns.
+  `Kino::UnshareableAppError`. A crashed worker thread returns 500 to
+  its in-flight requests right away and is replaced; the other threads
+  of its ractor serve on.
 - **`:threaded`**: the same machinery on `workers × threads` plain
   Threads. Runs **any** Rack app, including all of Rails. Parallel for
-  I/O, serialized by the GVL for CPU.
+  I/O, serialized by the GVL for CPU. A crashed worker thread is
+  replaced the same way.
 - **`:auto`** (default): `:ractor` when the app is shareable, otherwise
   a warning and `:threaded`. One caveat: a *class* used as a Rack app
   always counts as "shareable" (classes are), even if calling it touches
   unshareable state. Force `:threaded` for those.
 
+A crash is an exception that is not a `StandardError` (which only fails
+its request). A worker that keeps crashing within a second of
+starting, before it served a request (in `after_worker_boot` too), is
+respawned after a delay doubling from 0.1 s up to 5 s; any other crash
+respawns it at once.
+
 ### Sharded I/O
 
 `io_shards true` (off by default) moves HTTP I/O from Tokio's shared
 multi-thread runtime onto current-thread shards: one thread accepts and
-hands each connection to the least-loaded shard, which then owns it for
-its lifetime—no work-stealing, no cross-thread wakeups on the hot path.
+hands each connection to the least-loaded shard (open WebSockets and
+hijacked connections count), which then owns it for its lifetime—no
+work-stealing, no cross-thread wakeups on the hot path.
 On the 8-core reference box fast handlers gain +1-3% (best with
 `io_threads 8`); the win grows with scheduler contention, so measure on
 your own core count. Ruby-bound endpoints are unchanged. Orthogonal to
@@ -333,9 +344,10 @@ pseudo-header (h2 requests carry no Host header), split cookie headers
 are rejoined with `"; "`, and streamed uploads flow through the same
 backpressured body channel as HTTP/1. Streams multiplex into the same
 worker slots as keep-alive requests—`workers × threads` bounds
-concurrency either way. (`rack.hijack` stays out on h2 as it is on h1;
-the protocol has no 101 upgrade to hijack anyway.) `http2 false` pins
-the server to HTTP/1 and drops `h2` from ALPN.
+concurrency either way. (`rack.hijack` and WebSockets stay on HTTP/1:
+h2 multiplexes streams on one connection, so no request has a
+connection of its own to hand over.) `http2 false` pins the server to
+HTTP/1 and drops `h2` from ALPN.
 
 ## Config file and CLI
 
@@ -406,7 +418,9 @@ app or delivery error,
 `on_error ->(error, env) { ErrorTracker.capture(error) }` is called
 after the client got its 500—the only place a tracker sees errors
 raised while the response was being written (in `:ractor` mode, build
-the handler with `Ractor.shareable_proc`).
+the handler with `Ractor.shareable_proc`). For what a WebSocket callback
+or a wake hook raised, `env` is a small frozen Hash naming the callback
+(`"kino.callback"`), not a Rack env.
 
 ## Lifecycle hooks
 
@@ -414,11 +428,11 @@ Kino fires four lifecycle hooks alongside `on_error`, split by firing context.
 
 **Worker-context hooks** run inside the worker and are available to all workers:
 - `after_worker_boot { |worker_id| }`: runs once before the worker begins serving, with its slot id. In `:ractor` mode it runs inside the worker ractor and must be `Ractor.shareable_proc`.
-- `after_request_complete { |env, status| }`: fires inside the worker after each successful response. This is the hot path—leave it unset for zero cost. In `:ractor` mode it must be `Ractor.shareable_proc`.
+- `after_request_complete { |env, status| }`: fires inside the worker after each successful response. This is the hot path—leave it unset for zero cost. In `:ractor` mode it must be `Ractor.shareable_proc`. It fires once an accepted WebSocket handshake's 101 is out (status 101) and after a partial hijack, but not after a full `rack.hijack`, where the app owns the connection and its response.
 
 **Main-context hooks** run on the main thread, outside workers, and are plain procs:
 - `after_boot { }`: fires once after the worker pool is up. Wire readiness here—sd_notify, a "server ready" metric, and so on.
-- `on_worker_exit { |worker_index, error| }`: fires when a worker exits, with its index and the crash cause (or nil on a clean exit).
+- `on_worker_exit { |worker_index, error| }`: fires when a worker exits, with its index and the crash cause (or nil on a clean exit). In `:ractor` mode it fires for each worker thread that crashed, with the ractor's index and a copy of the cause (a `Kino::Error` naming it when it cannot be copied out of the ractor).
 
 `after_worker_boot`'s argument is the worker's slot id, while in `:ractor` mode `on_worker_exit`'s argument identifies the exited ractor (`0`..`workers - 1`)—a different number space—so don't correlate boot and exit by that number in `:ractor` mode.
 
@@ -442,7 +456,8 @@ While requests wait in the queue, Kino adds a worker every 100 ms until
 the queue clears or the pool hits `max_workers`. When the load passes,
 workers above `workers` retire one at a time after `scale_down_after`
 seconds idle, each finishing its current request first. Same behavior
-in `:ractor` and `:threaded` mode.
+in `:ractor` and `:threaded` mode. A worker with open WebSockets or
+hijacked connections counts as busy.
 
 **Use it when your app waits**: on databases, upstream services, slow
 clients. With `workers` at your core count, all workers can be blocked
@@ -479,8 +494,9 @@ cause) for every one it retires.
 ## Stuck-worker quarantine
 
 `quarantine_timeout: seconds` (or `quarantine_timeout 60` in `kino.rb`)
-quarantines a dispatch slot whose request has run longer than the deadline
-and spawns a replacement worker to restore capacity—distinct from
+quarantines a dispatch slot whose request (or WebSocket callback, or wake
+hook) has run longer than the deadline and spawns a replacement worker to
+restore capacity—distinct from
 `request_timeout`, which gives the client a 504 but leaves the slot
 occupied. `quarantine_max` (default: the worker count in `:ractor` mode,
 workers × threads in `:threaded`) caps the total number of replacement
@@ -508,7 +524,7 @@ cost):
 server.stats
 # => {mode: :ractor, lanes: false, workers: 8, threads: 1, batch: 1,
 #     respawns: 0, queued: 0, in_flight: 2, served: 1041, rejected: 0,
-#     timeouts: 0, worker_status: [...]}
+#     timeouts: 0, worker_status: [...], …}
 # plus lane_depths: [...] when lane dispatch is on
 ```
 
@@ -516,7 +532,7 @@ From the outside, `kill -USR1 <pid>` logs the same snapshot as one line
 (pair it with `pidfile` to find the pid):
 
 ```
-kino[4213] main: stats mode=:ractor lanes=false workers=8 threads=1 batch=1 respawns=0 queued=0 in_flight=2 served=1041 rejected=0 timeouts=0
+kino[4213] main: stats mode=:ractor lanes=false workers=8 threads=1 batch=1 respawns=0 queued=0 in_flight=2 served=1041 rejected=0 timeouts=0 …
 ```
 
 For pull-based monitoring, `control_bind "127.0.0.1:9293"` (or a
@@ -531,19 +547,29 @@ is busy or stuck, and reports `draining` through a graceful shutdown:
 
 Both `/stats` and `/metrics` also break the counters down per dispatch
 slot: `/stats` carries a `worker_status` array (`index`, `served`,
-`in_flight`, `busy_ms`) and `/metrics` emits `kino_worker_*{worker="N"}`
-series, one entry per execution slot (`workers × threads`)—a crashed
-worker's slot is never reused, so it stays in the list with its counters
-frozen where they stopped, meaning the array (and its `worker="N"` metric
-series) grows by one across every respawn. `busy_ms` is how long the
-slot's current request has been running (0 when idle), so a single slot
-climbing while the rest sit at 0 is your stuck worker.
+`in_flight`, `busy_ms`, `quarantined`, `retired`, `websockets_open`,
+`hijacked_connections`) and `/metrics` emits `kino_worker_*{worker="N"}`
+series, one entry per execution slot (`workers × threads`). A crashed
+or retired worker's slot goes to a later worker, its counters starting
+over, once its sockets and hijacked connections are gone. `busy_ms` is
+how long the slot's current request, WebSocket callback or wake hook
+has been running (0 when idle), so a single slot climbing while the
+rest sit at 0 is your stuck worker.
 
 The `/stats` response and `server.stats` carry `queue_time` (count and
 summed seconds), and `/metrics` exposes `kino_request_queue_seconds`—a
 Prometheus histogram of queue-wait time, the worker-saturation signal.
 Counts admitted requests only; a 503 after queue wait goes to `rejected`,
 not `queue_time`.
+
+A hijacked request leaves `in_flight` when the app takes it over and
+counts in `hijacked_connections` until its connection closes; `wakes`
+counts wake hook runs. `responses_cut` counts, for the whole process,
+[streamed responses](#streaming-responses) that ended early, by cause:
+`client_gone`, `shutdown` (the drain's deadline) and `crash`. The
+process's WebSocket counters sit under `websockets`;
+[doc/websockets.md](doc/websockets.md#stats) lists them and their
+`/metrics` series.
 
 - `GET /ready`—`200` when serving, `503` while booting or draining:
   wire it to your load balancer or Kubernetes readiness probe.
@@ -657,20 +683,93 @@ I/O does not need it.
 The spec suite runs every test app under `Rack::Lint` over real sockets:
 streaming request bodies (forward-only `rack.input`), enumerable and
 callable (full-duplex stream) response bodies, lowercase and multi-value
-headers, HEAD/204 semantics. Full hijack is left out on purpose; it is
-optional in Rack 3.
+headers, HEAD/204 semantics. `rack.hijack`, full and partial, is offered
+on HTTP/1.1 requests that ask to upgrade (see
+[WebSockets](#websockets-experimental)).
+
+## Streaming responses
+
+A body that does not respond to `to_ary` streams: each chunk goes out
+as the body yields it (chunked unless the app set `content-length`),
+and a Rack 3 streaming body, one that responds to `call` but not
+`each`, writes to the stream it is called with. A client slower than
+the app makes the next write wait for it, with the GVL released.
+
+Once the client has gone (it hung up, or its connection broke), the
+body's next write raises `Kino::ClientGone`, an `IOError`, so an endless
+body such as a server-sent event feed or an LLM token stream ends there
+and frees its worker. A response that can carry no body (a HEAD
+request, a 204 or 304, one already answered with a `request_timeout`
+504) ends its body the same way. Kino closes the body and runs
+`after_request_complete` as for any finished response, and logs
+nothing; an `ensure` in the body is the place to clean up:
+
+```ruby
+class Ticks
+  def each
+    loop do
+      yield "data: #{Time.now.to_i}\n\n"
+      Kino.sleep(1)
+    end
+  ensure
+    Kino::Log.info("ticker stopped")
+  end
+end
+
+app = ->(env) { [200, {"content-type" => "text/event-stream"}, Ticks.new] }
+```
+
+A body that raises anything else mid-stream is logged and reported to
+`on_error`, and its client sees the connection cut rather than a
+response that looks complete. Cutting a stream short never waits on a
+client that stopped reading, so such a client cannot hold up the worker
+or a shutdown.
+
+## WebSockets (experimental)
+
+Kino runs WebSockets natively: Rust does the handshake, framing, pings,
+the close handshake and topic fan-out, and your handler's callbacks run
+on the worker that accepted the socket, so an idle socket costs Ruby
+nothing. Native WebSockets need `lanes true`. Libraries with a
+WebSocket stack of their own, such as Action Cable, get `rack.hijack`
+in either mode.
+
+```ruby
+module Chat
+  def self.on_open(ws) = ws.subscribe("chat")
+  def self.on_message(ws, data) = Kino::WebSocket.publish("chat", data)
+end
+
+app = Ractor.shareable_proc do |env|
+  if env["rack.upgrade?"] == :websocket
+    env["rack.upgrade"] = Chat
+    [101, {}, []]   # the headers go into the 101; the status is ignored
+  else
+    [200, {"content-type" => "text/plain"}, ["hello"]]
+  end
+end
+```
+
+`ws` is a frozen, shareable handle that works from any thread or
+Ractor, `Kino::WebSocket.publish` builds each frame once for all of a
+topic's subscribers, and `Kino::Worker.on_wake` runs background work on
+a worker's own thread. [doc/websockets.md](doc/websockets.md) is the
+guide: callbacks, flow control, topics, limits, close codes,
+`rack.hijack` and Action Cable, stats.
 
 ## Rails
 
 Rails main partially runs on Ractors: `Rails.application.ractorize!`
 makes a production app shareable. `examples/rails-hello` runs in `:ractor`
-mode with Active Record on SQLite (`bundle exec kino` in that directory;
+mode with Active Record on SQLite and a live feed of new posts over
+Kino's native WebSockets (`bundle exec kino` in that directory;
 `--mode threaded` also works). Its Ractor setup follows Shopify's
 [ractor-safe-rails](https://github.com/Shopify/ractor-safe-rails)
 template. Action Cable, the default cache store, the Solid gems, the
 async Active Job adapter and `render json:` are not Ractor-safe yet, so
 apps that use them stay on `:threaded` (`rails server -u kino`, or the
-`kino` CLI). What the example needs, and what still does not work, is in
+`kino` CLI), where Action Cable runs unmodified through `rack.hijack`.
+What the example needs, and what still does not work, is in
 [doc/rails-on-ractors.md](doc/rails-on-ractors.md).
 
 ## Development

@@ -1,6 +1,6 @@
 # frozen_string_literal: true
 
-# Phase 1: the wire works. Real sockets, real HTTP: no rack-test fakery.
+# The wire works. Real sockets, real HTTP: no rack-test fakery.
 RSpec.describe "HTTP basics" do
   let(:hello_app) do
     lambda do |env|

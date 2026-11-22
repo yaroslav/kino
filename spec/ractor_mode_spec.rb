@@ -2,18 +2,14 @@
 
 require "tmpdir"
 
-# Phase 3: the headline feature. Requests served by worker Ractors, true
-# parallelism, supervised crash recovery.
+# The headline feature. Requests served by worker Ractors, with
+# true parallelism (crash recovery: worker_crash_spec.rb).
 RSpec.describe "ractor mode" do
   # A Ractor-shareable Rack app: captures nothing, builds everything
   # per-request inside the worker ractor.
   def shareable_app
     Ractor.shareable_proc do |env|
       case env["PATH_INFO"]
-      when "/boom"
-        # Exception (not StandardError) bypasses the worker rescue and kills
-        # the whole ractor: the supervisor's problem.
-        raise Exception, "deliberate hard crash" # rubocop:disable Lint/RaiseException
       when "/whoami"
         [200, {"content-type" => "text/plain"}, [Ractor.main? ? "main" : "worker-ractor"]]
       when "/meet"
@@ -116,52 +112,6 @@ RSpec.describe "ractor mode" do
           "requests never overlapped: #{bodies.inspect}"
         # Same ractor this time: the tags must match.
         expect(bodies.map { |b| b.split.last }.uniq.size).to eq(1)
-      end
-    end
-  end
-
-  describe "crash recovery" do
-    it "500s the crashed request, respawns, and keeps serving" do
-      with_server(shareable_app, mode: :ractor, workers: 1, threads: 1) do |host, port, server|
-        crashed = Net::HTTP.get_response(host, "/boom", port)
-        expect(crashed.code).to eq("500")
-
-        # Respawn is near-instant but asynchronous; poll briefly.
-        recovered = nil
-        20.times do
-          recovered = begin
-            Net::HTTP.get_response(host, "/ok", port)
-          rescue
-            nil
-          end
-          break if recovered&.code == "200"
-
-          sleep 0.1
-        end
-
-        expect(recovered&.code).to eq("200")
-        expect(server.stats[:respawns]).to eq(1)
-      end
-    end
-
-    it "leaves no phantom in_flight on the crashed worker's slot" do
-      with_server(shareable_app, mode: :ractor, workers: 1, threads: 1) do |host, port, server|
-        crashed = Net::HTTP.get_response(host, "/boom", port)
-        expect(crashed.code).to eq("500")
-
-        # The respawned worker needs a moment to come up and finish serving;
-        # poll for the whole server going idle rather than a bare sleep.
-        stats = nil
-        20.times do
-          Net::HTTP.get_response(host, "/ok", port)
-          stats = server.stats
-          break if stats[:worker_status].sum { |w| w[:in_flight] }.zero?
-
-          sleep 0.1
-        end
-
-        expect(stats[:worker_status].sum { |w| w[:in_flight] }).to eq(0)
-        expect(stats[:worker_status].sum { |w| w[:served] }).to eq(stats[:served])
       end
     end
   end

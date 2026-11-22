@@ -16,6 +16,9 @@ module TlsFixture
     @key_pem
   end
 
+  # The server option that turns TLS on with the fixture cert.
+  def options = {tls: {cert: cert_pem, key: key_pem}}
+
   def generate
     key = OpenSSL::PKey::RSA.new(2048)
     cert = OpenSSL::X509::Certificate.new

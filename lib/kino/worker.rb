@@ -1,59 +1,141 @@
 # frozen_string_literal: true
 
+require "socket"
+
 module Kino
-  # @private
-  # The request loop. Identical for threaded and ractor modes.
-  #
-  # The default (batch 1) hot path allocates one Hash per request: the env
-  # arrives with the native request handle embedded under "kino.request",
-  # and the common complete-body response rides the fused
-  # respond_and_take_one call: ~one FFI crossing per request, no arrays.
-  #
-  # batch > 1 trades fairness for throughput: a worker grabs up to that
-  # many already-queued requests per crossing, adding head-of-line blocking
-  # behind slow handlers and stretching effective queue depth.
-  module Worker
+  module Native
+    # @private
+    # The request handle is its own rack.hijack callable: calling it takes the connection over.
+    class Request
+      def call = UNIXSocket.for_fd(hijack)
+    end
+  end
+
+  # A worker's wake hook: work on the worker's own thread between requests (::on_wake). Needs lanes.
+  # An instance is one worker thread's request loop (private API).
+  class Worker
     RACK_INPUT = "rack.input"
+    RACK_UPGRADE = "rack.upgrade"
+    RACK_HIJACK_OFFERED = "rack.hijack?"
+    RACK_HIJACK = "rack.hijack"
     KINO_REQUEST = "kino.request"
+    # Thread variables, so fibers on the thread see them: the native handle and the wake hook.
+    HANDLE = :kino_worker
+    HOOK = :kino_wake_hook
+    WAKE = :wake
+    WAKE_ENV = Ractor.make_shareable({"kino.callback" => "on_wake"})
+    # What a worker without hooks runs with.
+    NO_HOOKS = Ractor.make_shareable(
+      WorkerHooks.new(on_error: nil, after_worker_boot: nil, after_request_complete: nil, access_timing: false)
+    )
+    private_constant :RACK_INPUT, :RACK_UPGRADE, :RACK_HIJACK_OFFERED, :RACK_HIJACK, :KINO_REQUEST, :HANDLE, :HOOK,
+      :WAKE, :WAKE_ENV, :NO_HOOKS
 
-    module_function
+    # Wakes one worker's hook, from any thread or Ractor (frozen, shareable); returns at once.
+    class Waker
+      # @private
+      def initialize(server_id, worker_id, generation)
+        @server_id = server_id
+        @worker_id = worker_id
+        @generation = generation
+        freeze
+      end
 
-    def run(server_id, worker_id, app, batch_size = 1, hooks = nil)
-      fire_after_worker_boot(hooks, worker_id)
+      # @return [Boolean] false once the worker has exited or is retiring, or without lanes
+      def wake = Native.wake_worker(@server_id, @worker_id, @generation)
+    end
+
+    # Run `block` on this worker's thread, between requests and socket events, whenever the
+    # returned Waker is used; wakes coalesce, a self-waking hook alternates with waiting requests,
+    # and calling again replaces the hook. A raising hook goes to on_error, as on_wake's callback.
+    # @raise [ArgumentError] off a worker thread, or without a block
+    # @return [Waker] wakes this worker
+    def self.on_wake(&block)
+      thread = Thread.current
+      worker = thread.thread_variable_get(HANDLE)
+      raise ArgumentError, "Kino::Worker.on_wake must be called on a worker thread" unless worker
+      raise ArgumentError, "Kino::Worker.on_wake needs a block" unless block
+
+      Log.warn(WAKE_WARNING) if !worker.lanes? && worker.claim_warning(WAKE_WARNING)
+      thread.thread_variable_set(HOOK, block)
+      Waker.new(*worker.identity)
+    end
+
+    # @private
+    # The request loop, the same in both modes. At batch 1 a request costs one Hash and about one
+    # FFI crossing (respond_and_take_one); batch > 1 trades fairness for fewer crossings.
+    def self.run(server_id, worker_id, app, batch_size, hooks)
+      new(server_id, worker_id, app, batch_size, hooks).run
+    end
+
+    # @private
+    def initialize(server_id, worker_id, app, batch_size, hooks)
+      @server_id = server_id
+      @worker_id = worker_id
+      @app = app
+      @batch_size = batch_size
+      @hooks = hooks || NO_HOOKS
+    end
+
+    # @private
+    def run
       # One resolution of (server, worker) into a native handle; every take
       # after this skips the registry lookup. nil = server already gone.
-      worker = Native.worker(server_id, worker_id)
-      return unless worker
-      if batch_size <= 1
-        env = worker.take_one
-        env = handle_one(env, worker, app, hooks) while env
+      # Resolved before after_worker_boot, so that hook can call on_wake.
+      @worker = Native.worker(@server_id, @worker_id)
+      Thread.current.thread_variable_set(HANDLE, @worker)
+      HookFire.fire(@hooks.after_worker_boot, "after_worker_boot", @worker_id)
+      return unless @worker
+      if @batch_size <= 1
+        env = @worker.take_one
+        env = handle_one(env) while env
       else
-        batch = worker.take_batch(batch_size)
-        batch = process(batch, worker, app, batch_size, hooks) while batch
+        batch = @worker.take_batch(@batch_size)
+        batch = process(batch) while batch
       end
+    rescue Exception # rubocop:disable Lint/RescueException -- a crash: clean up, and the pool replaces the worker
+      # Nothing waits on a dead worker: its clients get a 500 now, its sockets a 1011.
+      Native.abort_inflight(@server_id, @worker_id)
+      raise
+    ensure
+      # The worker loop is over: its wakers report false from now on.
+      @worker&.release
+      Thread.current.thread_variable_set(HANDLE, nil)
+      Thread.current.thread_variable_set(HOOK, nil)
     end
 
     # serve() returns this when the response did NOT ride a fused
     # respond-and-take (streaming body or app error) and the caller must
     # take the next request itself. Frozen: worker ractors read it.
     NOT_FUSED = Object.new.freeze
+    private_constant :NOT_FUSED
 
-    # Handle one request; returns the next env (fused take) or nil.
-    def handle_one(env, worker, app, hooks)
-      result = serve(env, app, hooks) do |request, status, headers, chunks|
-        request.respond_and_take_one(worker, status, headers, chunks)
+    private
+
+    # Handle one take; returns the next env (fused take) or nil.
+    def handle_one(env)
+      unless env.is_a?(Hash)
+        dispatch(env)
+        return @worker.take_one
       end
-      result.equal?(NOT_FUSED) ? worker.take_one : result
+      result = serve(env) do |request, status, headers, chunks|
+        request.respond_and_take_one(@worker, status, headers, chunks)
+      end
+      result.equal?(NOT_FUSED) ? @worker.take_one : result
     end
 
-    # Handle every env in the batch; returns the next batch (the last
-    # simple response rides the fused respond_and_take) or nil on shutdown.
-    def process(batch, worker, app, batch_size, hooks)
+    # Handle every take in the batch; returns the next batch (the last simple response
+    # rides the fused respond_and_take) or nil on shutdown.
+    def process(batch)
       last = batch.size - 1
       batch.each_with_index do |env, index|
-        result = serve(env, app, hooks) do |request, status, headers, chunks|
+        unless env.is_a?(Hash)
+          dispatch(env)
+          next
+        end
+        result = serve(env) do |request, status, headers, chunks|
           if index == last
-            request.respond_and_take(worker, batch_size, status, headers, chunks)
+            request.respond_and_take(@worker, @batch_size, status, headers, chunks)
           else
             request.send_simple(status, headers, chunks)
             NOT_FUSED
@@ -61,7 +143,18 @@ module Kino
         end
         return result if index == last && !result.equal?(NOT_FUSED)
       end
-      worker.take_batch(batch_size)
+      @worker.take_batch(@batch_size)
+    end
+
+    def dispatch(item)
+      item.equal?(WAKE) ? run_wake_hook : WebSocket::Events.dispatch(item, @hooks.on_error)
+    end
+
+    def run_wake_hook
+      Thread.current.thread_variable_get(HOOK)&.call
+    rescue => e
+      Log.failure("on_wake hook", e)
+      HookFire.fire(@hooks.on_error, "on_error", e, WAKE_ENV)
     end
 
     # Run one request through the app. Complete bodies are yielded so the
@@ -70,29 +163,36 @@ module Kino
     # here and return NOT_FUSED. App errors must never kill the worker;
     # hard crashes (Exception) are the supervisor's job; and `abort` does
     # the right thing whether or not the response head already went out.
-    def serve(env, app, hooks)
+    def serve(env)
       request = env[KINO_REQUEST]
       env[RACK_INPUT] ||= Input.new(request)
-      if hooks&.access_timing
+      if @hooks.access_timing
         # The access log's breakdown: the VM's cumulative GC time and
         # allocation count, differenced around the app call.
         gc_before = GC.total_time
         allocated_before = GC.stat(:total_allocated_objects)
-        status, headers, body = app.call(env)
+        status, headers, body = @app.call(env)
         request.timing(GC.total_time - gc_before, GC.stat(:total_allocated_objects) - allocated_before)
       else
-        status, headers, body = app.call(env)
+        status, headers, body = @app.call(env)
+      end
+      if env[RACK_HIJACK_OFFERED]
+        hijacked = serve_hijacked(request, status, headers, body, env)
+        return hijacked if hijacked
+      end
+      if (handler = env[RACK_UPGRADE])
+        return NOT_FUSED if serve_upgrade(request, headers, body, handler, env)
       end
 
       if body.respond_to?(:to_ary)
         chunks = join_chunks(body.to_ary)
-        if hooks&.after_request_complete
+        if @hooks.after_request_complete
           # Hook set: do not fuse. Send the complete response, fire the hook
           # after it is out, then signal the caller to take the next request
           # separately (so the hook never waits on the next request).
           request.send_simple(status.to_i, headers, chunks)
           body.close if body.respond_to?(:close)
-          fire_after_request_complete(hooks, env, status.to_i)
+          after_request_complete(env, status.to_i)
           NOT_FUSED
         else
           # No hook: fused fast path, unchanged, zero cost.
@@ -102,7 +202,7 @@ module Kino
         end
       else
         deliver_streaming(request, status.to_i, headers, body, env[RACK_INPUT])
-        fire_after_request_complete(hooks, env, status.to_i)
+        after_request_complete(env, status.to_i)
         NOT_FUSED
       end
     rescue => e
@@ -113,34 +213,123 @@ module Kino
       # because nothing may escape this block and kill the worker.
       Log.exception(e, env)
       request.abort
-      HookFire.fire(hooks&.on_error, "on_error", e, env)
+      HookFire.fire(@hooks.on_error, "on_error", e, env)
       NOT_FUSED
     end
 
+    # What an app offered rack.hijack did with it: NOT_FUSED once it took the connection over,
+    # in full or with a callable; nil when it answers as any other request.
+    def serve_hijacked(request, status, headers, body, env)
+      # Taken over with rack.hijack: the app answers on the connection, and its triple is
+      # ignored (Rack 3). The body still closes: middleware cleans up there.
+      return closing(body) { NOT_FUSED } if request.hijacked?
+      partial = headers&.[](RACK_HIJACK)
+      if status.to_i == 101 && (partial || (!env[RACK_UPGRADE] && streaming_body?(body)))
+        closing(body) { switch_hijacked(request, headers, partial || body, body, env) }
+      elsif partial
+        closing(body) { hijack_partially(request, status, headers, partial, env) }
+      end
+    end
+
+    # A native WebSocket for `handler`: true once Kino answered the handshake (its 101, a 500
+    # or a 503), false when it cannot accept one and the app's response goes out.
+    def serve_upgrade(request, headers, body, handler, env)
+      id = accept_upgrade(request, headers, body, handler.respond_to?(:on_shutdown))
+      if id
+        # The 101 goes out only after on_open, so what it writes and subscribes is in place;
+        # if on_open raised, the client gets a 500 before on_error hears of it.
+        if (failure = WebSocket::Events.open(id, handler))
+          request.abort
+          WebSocket::Events.report(failure, id, "on_open", @hooks.on_error)
+        elsif request.switch_protocols
+          after_request_complete(env, 101)
+        end
+      end
+      return true unless id.nil?
+
+      # Once per server, from the first worker that meets the cause.
+      Log.warn(UPGRADE_WARNING) if !@worker.lanes? && @worker.claim_warning(UPGRADE_WARNING)
+      false
+    end
+
+    # Accept a handshake, its 101 held for switch_protocols with the app's headers, and close
+    # the body. Nil when Kino cannot (no handshake, no lanes): the app's response goes out.
+    # False for Kino's 503 refusal. A body that fails to close drops the new socket (a 500).
+    def accept_upgrade(request, headers, body, on_shutdown)
+      id = request.upgrade_websocket(headers || {}, on_shutdown)
+      closing(body) unless id.nil?
+      id
+    rescue
+      closing(body) if id.nil?
+      Native.ws_abort(id) if id
+      raise
+    end
+
+    # Partial hijack (Rack 3): the rack.hijack callable gets the response stream after the head.
+    def hijack_partially(request, status, headers, callable, env)
+      deliver_streaming(request, status.to_i, headers.except(RACK_HIJACK), callable, env[RACK_INPUT])
+      after_request_complete(env, status.to_i)
+      NOT_FUSED
+    end
+
+    # A 101 with a callable (a partial hijack, or a Rack 3 streaming body): the callable gets
+    # the switched connection as a socket. Kino closes it once a streaming body returns.
+    def switch_hijacked(request, headers, callable, body, env)
+      io = UNIXSocket.for_fd(request.hijack_switched(headers.except(RACK_HIJACK)))
+      begin
+        callable.call(io)
+      rescue
+        io.close
+        raise
+      end
+      io.close if callable.equal?(body) && !io.closed?
+      after_request_complete(env, 101)
+      NOT_FUSED
+    end
+
+    # Runs the block, if any, then closes `body` however it ended.
+    def closing(body)
+      yield if block_given?
+    ensure
+      body.close if body.respond_to?(:close)
+    end
+
+    def streaming_body?(body) = body.respond_to?(:call) && !body.respond_to?(:each)
+
+    UPGRADE_WARNING = "the app set rack.upgrade, but native WebSockets need `lanes true`; " \
+      "sending its own response instead"
+    WAKE_WARNING = "the app registered a Kino::Worker.on_wake hook, but wakes need `lanes true`; " \
+      "the hook will never run"
+    private_constant :UPGRADE_WARNING, :WAKE_WARNING
+
     def deliver_streaming(request, status, headers, body, input)
       request.send_headers(status, headers)
-      if body.respond_to?(:call) && !body.respond_to?(:each)
+      if streaming_body?(body)
         # Rack 3 streaming body: the app drives a full-duplex stream whose
         # read side is the request's existing rack.input (a fresh Input
         # here would strand anything the app already buffered from it).
+        # Its write side closes only on success; a raising body is cut by serve's abort.
         stream = Stream.new(request, input)
         begin
           body.call(stream)
-        ensure
-          stream.close
+        rescue
+          stream.close_read
+          raise
         end
+        stream.close
       else
         # Enumerable body: chunked transfer unless the app set content-length.
         # finish only on success: a body that raised must abort the
         # connection (serve's rescue), not fake a clean end of stream that
         # the client cannot tell from a complete response.
-        begin
+        closing(body) do
           body.each { |chunk| request.write_chunk(chunk) }
           request.finish
-        ensure
-          body.close if body.respond_to?(:close)
         end
       end
+    rescue ClientGone
+      # The client left mid-stream: the request is over, and nothing failed.
+      nil
     end
 
     def join_chunks(chunks)
@@ -153,15 +342,8 @@ module Kino
       joined
     end
 
-    def fire_after_worker_boot(hooks, worker_id)
-      HookFire.fire(hooks&.after_worker_boot, "after_worker_boot", worker_id)
+    def after_request_complete(env, status)
+      HookFire.fire(@hooks.after_request_complete, "after_request_complete", env, status)
     end
-
-    def fire_after_request_complete(hooks, env, status)
-      HookFire.fire(hooks&.after_request_complete, "after_request_complete", env, status)
-    end
-
-    private_class_method :handle_one, :process, :serve, :deliver_streaming,
-      :join_chunks, :fire_after_worker_boot, :fire_after_request_complete
   end
 end

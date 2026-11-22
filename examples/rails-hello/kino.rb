@@ -11,6 +11,10 @@ port 9292
 
 environment "production"
 
+# /live is a native WebSocket, and those need lanes: each socket's
+# messages go to the worker that accepted it.
+lanes true
+
 # Kino's own access log (status-colored on color terminals). This is the
 # server's view; Rails' request log is the app's view; both interleave
 # on stdout.

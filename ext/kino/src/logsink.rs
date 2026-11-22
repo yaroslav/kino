@@ -118,7 +118,6 @@ mod tests {
     use super::Sink;
     use std::io::Write;
     use std::sync::Arc;
-    use std::time::{Duration, Instant};
 
     #[derive(Clone, Default)]
     struct SharedBuf(Arc<parking_lot::Mutex<Vec<u8>>>);
@@ -143,13 +142,8 @@ mod tests {
         sink.write_line("second".to_string());
         drop(sink); // sender gone: the flusher drains everything and exits
 
-        let deadline = Instant::now() + Duration::from_secs(2);
-        loop {
-            if *buf.0.lock() == b"first\nsecond\n" {
-                break;
-            }
-            assert!(Instant::now() < deadline, "flusher never drained");
-            std::thread::sleep(Duration::from_millis(5));
-        }
+        crate::testing::eventually_blocking("the flusher to drain", || {
+            (*buf.0.lock() == b"first\nsecond\n").then_some(())
+        });
     }
 }

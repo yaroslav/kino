@@ -55,6 +55,7 @@
 # max_workers 32
 
 # Seconds an extra worker must sit idle before it is retired.
+# A worker with open WebSockets or hijacked connections counts as busy.
 # scale_down_after 30
 
 ## Dispatch mode
@@ -97,6 +98,7 @@
 
 # Experimental dispatcher that gives each worker its own line. Faster
 # for quick handlers; behavior under heavy overload differs slightly.
+# Native WebSockets and Kino::Worker.on_wake hooks need it.
 # lanes false
 
 # Log every request to stdout: an arrival line before the app runs and a
@@ -133,8 +135,24 @@
 # error). error is the crash cause, or nil on a clean exit. In :ractor
 # mode worker_index identifies the exited ractor (0..workers - 1), a
 # different number space than after_worker_boot's slot id: do not
-# correlate boot and exit by that number in :ractor mode.
+# correlate boot and exit by that number in :ractor mode. It also fires
+# for each worker thread that crashed.
 # on_worker_exit { |worker_index, error| }
+
+## WebSockets (experimental)
+#
+# Native WebSockets need `lanes true`; rack.hijack (Action Cable) works in both modes.
+
+# Largest message a client may send, in bytes; a bigger one closes the
+# socket with 1009. Default: 1 MiB.
+# websocket_max_message 1024 * 1024
+
+# Most native WebSockets open at once (default: only max_connections); past it, a 503.
+# websocket_max 10_000
+
+# Ping a client silent for this many seconds, and drop one silent for
+# twice that. nil or 0 sends no pings.
+# websocket_ping_interval 30
 
 ## Lifecycle
 
@@ -178,7 +196,8 @@
 # quarantined for good (in :ractor mode the ractor itself leaks until
 # process exit, since a wedged ractor cannot be safely interrupted). Off
 # unless set; set it above your slowest legitimate endpoint, and above
-# request_timeout.
+# request_timeout. A WebSocket callback or wake hook counts as a request;
+# the slot's sockets close with 1011.
 # quarantine_timeout 60
 
 # Cap on the total number of replacement events over the process

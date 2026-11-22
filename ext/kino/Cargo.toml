@@ -25,6 +25,8 @@ hyper = { version = "1.6", features = ["http1", "http2", "server"] }
 hyper-util = { version = "0.1", features = ["server", "server-auto", "tokio", "http1", "http2"] }
 http = "1"
 http-body-util = "0.1"
+# Parses a hijacked app's response head; already in the tree via hyper.
+httparse = "1.10"
 bytes = "1"
 # Local-time stamps for the access log: the system zone only (no bundled
 # tzdb, no serde), which keeps the dependency tree to jiff itself.
@@ -33,7 +35,19 @@ jiff = { version = "0.2", default-features = false, features = ["std", "tz-syste
 # cross-compiles cleanly in rb-sys-dock containers, while aws-lc-sys wants
 # cmake and a per-target C toolchain.
 tokio-rustls = { version = "0.26", default-features = false, features = ["ring", "logging", "tls12"] }
+# Either, one stream type for TCP, unix and TLS connections; already in
+# the tree via h2.
+tokio-util = { version = "0.7", default-features = false }
 rustls-pemfile = "2.2"
+# SHA-1 for the WebSocket handshake key; already in the tree via rustls.
+ring = "0.17"
+# Reads WebSocket client frames into messages; Kino writes its own frames.
+tungstenite = { version = "0.30", default-features = false }
+# EPROTO, which std has no ErrorKind for; already in the tree via tokio.
+libc = "0.2"
+# Reading what an app wrote to a hijack bridge without tokio, which std
+# lacks; already in the tree via tokio.
+socket2 = "0.6"
 
 # musl's loader rejects initial-exec TLS in dlopen'd libraries ("initial-exec
 # TLS resolves to dynamic definition"); build the same mimalloc with the

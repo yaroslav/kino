@@ -63,6 +63,8 @@ pub struct EnvStrings {
     pub rack_input: Opaque<RString>,
     pub rack_errors: Opaque<RString>,
     pub kino_request: Opaque<RString>,
+    pub rack_hijack_offered: Opaque<RString>,
+    pub rack_hijack: Opaque<RString>,
     // values
     pub empty: Opaque<RString>,
     pub http: Opaque<RString>,
@@ -370,6 +372,8 @@ pub fn init(ruby: &Ruby) {
         rack_input: frozen(ruby, "rack.input"),
         rack_errors: frozen(ruby, "rack.errors"),
         kino_request: frozen(ruby, "kino.request"),
+        rack_hijack_offered: frozen(ruby, "rack.hijack?"),
+        rack_hijack: frozen(ruby, "rack.hijack"),
         empty: frozen(ruby, ""),
         http: frozen(ruby, "http"),
         https: frozen(ruby, "https"),

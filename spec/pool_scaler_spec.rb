@@ -32,9 +32,10 @@ class ScalerFakePool
 end
 
 RSpec.describe Kino::PoolScaler do
-  # A worker_stats row: [slot, served, in_flight, busy_ms, quarantined, retired].
-  def row(slot, served:, in_flight: 0)
-    [slot, served, in_flight, 0, false, false]
+  # A slot's row, as the scaler reads worker_stats.
+  def row(slot, served:, in_flight: 0, sockets: 0, hijacked: 0)
+    Kino::WorkerRow.new(slot:, served:, in_flight:, busy_ms: 0, quarantined: false, retired: false,
+      websockets_open: sockets, hijacked_connections: hijacked, generation: 0)
   end
 
   def scaler(pool, floor: 1, ceiling: 4, scale_down_after: 30)
@@ -149,6 +150,23 @@ RSpec.describe Kino::PoolScaler do
       6.times { |t| s.step(t, 0, rows) }
 
       expect(pool.retired).to eq([0])
+    end
+
+    [:sockets, :hijacked].each do |held|
+      it "does not count a worker that holds open #{held} connections as idle" do
+        pool = ScalerFakePool.new({0 => [0], 1 => [1]})
+        s = scaler(pool, floor: 1, scale_down_after: 5)
+
+        # Worker 0 keeps serving; worker 1 serves nothing, and holds a
+        # connection until t=10.
+        (0..16).each do |t|
+          holding = {held => (t < 10) ? 1 : 0}
+          s.step(t, 0, [row(0, served: t + 1), row(1, served: 5, **holding)])
+          expect(pool.retired).to be_empty, "retired at t=#{t}" if t < 15
+        end
+
+        expect(pool.retired).to eq([1])
+      end
     end
   end
 end

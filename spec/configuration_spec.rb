@@ -62,6 +62,9 @@ RSpec.describe Kino::Configuration do
       tokio_threads 4
       tls cert: "cert.pem", key: "key.pem"
       http2 false
+      websocket_max_message 64
+      websocket_max 100
+      websocket_ping_interval 10
     CONFIG
 
     config = described_class.new.load_file(path)
@@ -79,10 +82,12 @@ RSpec.describe Kino::Configuration do
     expect(config[:tokio_threads]).to eq(4)
     expect(config[:tls]).to eq(cert: "cert.pem", key: "key.pem")
     expect(config[:http2]).to eq(false)
+    expect(config.to_h).to include(websocket_max_message: 64, websocket_max: 100, websocket_ping_interval: 10)
   end
 
-  it "defaults http2 to on" do
-    expect(described_class.new.to_h[:http2]).to eq(true)
+  it "defaults http2 to on, and the WebSocket limits" do
+    expect(described_class.new.to_h).to include(http2: true, websocket_max_message: 1_048_576,
+      websocket_max: nil, websocket_ping_interval: 30)
   end
 
   it "validates native I/O thread count" do
@@ -94,6 +99,24 @@ RSpec.describe Kino::Configuration do
     expect {
       Kino::Server.new(app, io_shards: true, io_threads: false)
     }.to raise_error(TypeError)
+  end
+
+  it "rejects WebSocket limits out of range, and takes nil for no websocket_max and no pings" do
+    app = ->(_env) { [200, {}, []] }
+    config = described_class.new.load_file(write_config("websocket_max nil\nwebsocket_ping_interval nil\n"))
+
+    expect(config.to_h).to include(websocket_max: nil, websocket_ping_interval: nil)
+    [nil, 0, 0.5].each do |seconds|
+      expect { Kino::Server.new(app, websocket_ping_interval: seconds) }.not_to raise_error
+    end
+    %i[websocket_max_message websocket_max].each do |key|
+      expect { Kino::Server.new(app, key => 0) }
+        .to raise_error(ArgumentError, /#{key} must be a positive Integer \(got 0\)/)
+    end
+    [-1, "often", Float::NAN, Float::INFINITY].each do |bad|
+      expect { Kino::Server.new(app, websocket_ping_interval: bad) }
+        .to raise_error(ArgumentError, /websocket_ping_interval must be a finite, non-negative number of seconds or nil/)
+    end
   end
 
   it "warns when io_threads is set without io_shards" do
