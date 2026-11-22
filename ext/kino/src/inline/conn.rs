@@ -273,7 +273,7 @@ impl InlineConn {
             // connection ends now if the drain began or its worker was quarantined.
             if unsent {
                 let draining = self.server.is_draining();
-                if draining || self.slot.life.quarantined.load(Ordering::Relaxed) {
+                if draining || self.slot.life.quarantined() {
                     if !draining {
                         state.ends(&self.slot);
                     }
@@ -286,7 +286,7 @@ impl InlineConn {
         // Once the drain began, a request that came is still served, then the connection closes;
         // a kept-alive one mid-head ends, as hyper's does; a fresh one reads its first head on.
         let draining = self.server.is_draining();
-        if !draining && self.slot.life.retired.load(Ordering::Relaxed) {
+        if !draining && self.slot.life.seems_retired() {
             return self.hand_back();
         }
         if let Some(head) = self.pending.take() {
@@ -385,7 +385,7 @@ impl InlineConn {
             return Some(self.end());
         }
         if self.len == 0 {
-            if self.slot.life.quarantined.load(Ordering::Relaxed) {
+            if self.slot.life.quarantined() {
                 state.ends(&self.slot);
                 drop(state);
                 return Some(self.end());
@@ -410,7 +410,7 @@ impl InlineConn {
             return self.retired_meanwhile();
         }
         let mut state = self.io.state.lock();
-        if self.server.is_draining() || self.slot.life.quarantined.load(Ordering::Relaxed) {
+        if self.server.is_draining() || self.slot.life.quarantined() {
             return None;
         }
         state.waits = Waits::Idle;
@@ -470,7 +470,7 @@ impl InlineConn {
     /// when the connection goes to hyper as at the look's start.
     fn retired_meanwhile(&mut self) -> Option<Next> {
         let draining = self.server.is_draining();
-        (!draining && self.slot.life.retired.load(Ordering::Relaxed)).then(|| self.hand_back())
+        (!draining && self.slot.life.seems_retired()).then(|| self.hand_back())
     }
 
     /// Parsed short of a request: no whole one waits in the buffer (IoState::unparsed).
@@ -653,13 +653,13 @@ mod tests {
 
     use super::*;
     use crate::inline::testing::{
-        advance, answer, answer_dispatched, await_bytes, body_of, configured_server, cut_offs,
-        handbacks, inline_loop_server, look, loop_server_as, loopback, loopback_holding, narrowed,
-        next_request, once_written, read_to_end, reads_within, send_get, server, with_body, Event,
-        Wire,
+        advance, answer, answer_dispatched, await_bytes, body_of, closes, configured_server,
+        cut_offs, handbacks, inline_loop_server, look, loop_server_as, loopback, loopback_holding,
+        narrowed, next_request, once_written, read_to_end, reads_within, send_get, server,
+        with_body, Event, Wire,
     };
     use crate::inline::Wrote;
-    use crate::testing::eventually_blocking;
+    use crate::testing::{eventually_blocking, slot};
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn a_body_past_max_body_size_goes_to_hyper_for_its_413() {
@@ -735,18 +735,14 @@ mod tests {
             drop(ctx);
             let mut wire = Wire::of(client);
             let (status, headers, body) = wire.response();
-            let close = headers.contains(&"connection: close".to_string());
             assert!(
-                status == "HTTP/1.1 200 OK" && body == b"done" && close,
+                status == "HTTP/1.1 200 OK" && body == b"done" && closes(&headers),
                 "{headers:?}"
             );
             assert!(matches!(conn.next(true), Next::Closed));
             assert_eq!(wire.answer(false), Event::Closed);
         }
-        assert_eq!(
-            server.slots.read()[0].inline.conns.load(Ordering::Relaxed),
-            0
-        );
+        assert_eq!(slot(&server, 0).inline.conns.load(Ordering::Relaxed), 0);
         assert_eq!(cut_offs(&server), 0, "a drain's closes count as cut off");
     }
 
@@ -790,8 +786,7 @@ mod tests {
             answer(&ctx, b"two");
             drop(ctx);
             let (_, headers, body) = wire.response();
-            let close = headers.contains(&"connection: close".to_string());
-            assert!(body == b"two" && close, "{shown}: {headers:?}");
+            assert!(body == b"two" && closes(&headers), "{shown}: {headers:?}");
             assert!(matches!(conn.next(true), Next::Closed), "{shown}");
             assert_eq!(wire.answer(false), Event::Closed, "{shown}");
         }
@@ -835,7 +830,7 @@ mod tests {
                 assert!(matches!(look(conn, true), Next::Readable));
                 (&*client).write_all(&next[1..]).unwrap();
                 await_bytes(conn);
-                let slot = server.slots.read()[0].clone();
+                let slot = slot(server, 0);
                 slot.retire();
                 drain_on_whole(server, conn);
                 assert!(matches!(conn.next(true), Next::Closed));
@@ -860,9 +855,8 @@ mod tests {
                     let answered = tokio::time::timeout(Duration::from_secs(3), answered);
                     assert!(answered.await.is_ok(), "{shown}: never dispatched");
                     let (status, headers, _) = Wire::of(&client).response();
-                    let close = headers.contains(&"connection: close".to_string());
                     assert!(
-                        status == "HTTP/1.1 200 OK" && close,
+                        status == "HTTP/1.1 200 OK" && closes(&headers),
                         "{shown}: {status} {headers:?}"
                     );
                     assert_eq!(read_to_end(&client), b"", "{shown}");
@@ -1070,7 +1064,7 @@ mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn a_connection_a_write_still_waits_on_is_cut_rather_than_handed_to_hyper() {
         let server = inline_loop_server(2, 8);
-        let slot = server.slots.read()[0].clone();
+        let slot = slot(&server, 0);
         let (client, mut conn) = narrowed(&server);
         send_get(&client, "/s", false);
         let ctx = next_request(&mut conn);

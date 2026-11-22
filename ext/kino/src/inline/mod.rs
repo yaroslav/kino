@@ -33,10 +33,9 @@ pub mod testing;
 pub use answer::Wrote;
 pub use conn::{InlineConn, Next};
 pub use deadline::tick;
-pub(crate) use io::abandon as abandon_slot;
 pub(crate) use io::Origin;
 pub use io::{await_writable, InlineIo, Listed};
-use io::{take_seat, Shut};
+use io::{forget, take_seat, Shut};
 
 const INLINE_BODY_MAX: u64 = 64 * 1024;
 
@@ -176,10 +175,7 @@ fn pick(server: &ServerInner) -> Option<Arc<WorkerSlot>> {
         .read()
         .iter()
         .filter(|slot| slot.lane.doorbell.is_some())
-        .filter(|slot| {
-            !slot.life.retired.load(Ordering::Relaxed)
-                && !slot.life.quarantined.load(Ordering::Relaxed)
-        })
+        .filter(|slot| !slot.life.seems_retired() && !slot.life.quarantined())
         .filter(|slot| {
             slot.lane
                 .rx
@@ -245,6 +241,18 @@ pub fn unplace(slot: &WorkerSlot) {
 pub fn giving_up(slot: &WorkerSlot, why: Cut) {
     for io in ios(slot) {
         io.giving_up(why);
+    }
+}
+
+/// `slot`'s worker is given up on: each connection is answered or shut down and counted there no
+/// more, whether or not its job looks again.
+pub(crate) fn abandon_slot(slot: &WorkerSlot, why: Cut) {
+    for io in ios(slot) {
+        let (seat, held) = io.abandon(why);
+        if seat.is_some() {
+            forget(slot, &io);
+        }
+        drop((seat, held));
     }
 }
 
@@ -322,12 +330,13 @@ mod tests {
 
     use super::*;
     use crate::inline::testing::{
-        accepted, answer, answer_dispatched, await_bytes, cut_offs, handbacks, inline_loop_server,
-        look, loopback, loopback_holding, narrowed, next_request, once_written, permit, placed,
-        placed_on_first, read_to_end, reads_within, send_get, wedge, Event, Wire,
+        accepted, answer, answer_dispatched, await_bytes, closes, cut_offs, handbacks,
+        inline_loop_server, look, loopback, loopback_holding, narrowed, next_request, once_written,
+        placed, placed_on_first, read_to_end, reads_within, send_get, wedge, Event, Wire,
     };
     use crate::queue::{Item, Take, Taker};
     use crate::request::test_ctx;
+    use crate::testing::{permit, slot};
 
     fn conns(server: &ServerInner) -> Vec<usize> {
         let slots = server.slots.read();
@@ -350,7 +359,7 @@ mod tests {
         let peer = crate::server::UNIX_PEER;
         let held = Held::new(permit(), None);
         assert!(place(&server, Either::Right(accepted), held, peer).is_ok());
-        let slot = server.slots.read()[0].clone();
+        let slot = slot(&server, 0);
         let Take::Item(Item::Conn(mut conn)) = Taker::new(&server, &slot).ready() else {
             panic!("its worker did not take the unix-socket connection");
         };
@@ -402,9 +411,9 @@ mod tests {
     async fn what_was_placed_on_a_leaving_worker_goes_to_hyper_with_its_client_and_no_more_comes() {
         for leaves in [Leaves::TakenRetiring, Leaves::Ends, Leaves::EndsRetired] {
             let server = inline_loop_server(2, 8);
+            let sibling = slot(&server, 1);
             let (slot, worker) = crate::queue::testing::boot(&server, 0);
-            let sibling = server.slots.read()[1].clone();
-            let client = placed_on_first(&server).await;
+            let client = placed_on_first(&server);
             send_get(&client, "/placed", false);
             if !matches!(leaves, Leaves::Ends) {
                 slot.retire();
@@ -427,14 +436,13 @@ mod tests {
             answer_dispatched(&server, &["/placed"]).await;
             let (_, headers, body) = Wire::of(&client).response();
             assert_eq!(body, b"hyper:/placed", "{leaves:?}");
-            let close = "connection: close".to_string();
             assert!(
-                !headers.contains(&close),
+                !closes(&headers),
                 "{leaves:?}: its client lost the connection"
             );
             assert_eq!(handbacks(&server), 1, "{leaves:?}");
             for _ in 0..2 {
-                drop(placed(&server).await);
+                drop(placed(&server));
             }
             assert_eq!(
                 conns(&server),
@@ -462,7 +470,7 @@ mod tests {
         send_get(&done_client, "/done", false);
         answer(&next_request(&mut done), b"done");
         // Placed on it, and not taken: its client's request comes.
-        let placed_client = placed_on_first(&server).await;
+        let placed_client = placed_on_first(&server);
         send_get(&placed_client, "/placed", false);
 
         wedge(&slots[0]);
@@ -474,7 +482,7 @@ mod tests {
         );
         answer_dispatched(&server, &["/placed"]).await;
         assert_eq!(Wire::of(&placed_client).response().2, b"hyper:/placed");
-        drop(placed(&server).await);
+        drop(placed(&server));
         assert_eq!(
             conns(&server)[1],
             1,
@@ -495,9 +503,8 @@ mod tests {
         answer(&late, b"late");
         let mut wire = Wire::of(&stuck_client);
         let (_, headers, body) = wire.response();
-        let close = headers.contains(&"connection: close".to_string());
         assert!(
-            body == b"late" && close,
+            body == b"late" && closes(&headers),
             "the answer kept its connection alive: {headers:?}"
         );
         assert!(matches!(stuck.next(true), Next::Closed));
@@ -519,7 +526,7 @@ mod tests {
         // resets the connection.
         for (writes, quarantined) in [(1, false), (1, true), (2, false), (2, true)] {
             let server = inline_loop_server(2, 8);
-            let slot = server.slots.read()[0].clone();
+            let slot = slot(&server, 0);
             let (client, mut conn) = narrowed(&server);
             let behind = b"GET /behind HTTP/1.1\r\nhost: x\r\n\r\n";
             let mut sent = b"GET /big HTTP/1.1\r\nhost: x\r\n\r\n".to_vec();
@@ -598,7 +605,7 @@ mod tests {
         send_get(&aside_client, "/next", false);
         await_bytes(&aside);
         // One placed on it that it never took, its client's request sent.
-        let placed_client = placed_on_first(&server).await;
+        let placed_client = placed_on_first(&server);
         send_get(&placed_client, "/placed", false);
         assert!(
             slot.recycle().is_none(),
@@ -643,13 +650,13 @@ mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn a_connection_being_placed_as_its_worker_crashes_goes_to_hyper_untouched() {
         let server = inline_loop_server(2, 8);
-        let slot = server.slots.read()[0].clone();
-        let (_client, stream, held, peer) = accepted(1).await.pop().expect("one");
+        let slot = slot(&server, 0);
+        let (_client, crate::server::Accepted { conn, peer, held }) = accepted();
         // As place has it: its seat taken and the connection made, not
         // sent to the worker yet, when the worker crashes.
-        let stream = stream.into_std().expect("a std stream");
+        let stream = StdConn::detach(conn).expect("a std stream");
         let home = tokio::runtime::Handle::current();
-        let conn = InlineConn::new(&server, take_seat(&slot), stream.into(), held, peer, home);
+        let conn = InlineConn::new(&server, take_seat(&slot), stream, held, peer, home);
         slot.crash(&server);
         let Err(mut conn) = slot.send_placed(conn) else {
             panic!("a crashed worker took a connection");
@@ -672,7 +679,7 @@ mod tests {
         for room in [Room::Events, Room::Connections] {
             let server = inline_loop_server(2, 1);
             let slots = server.slots.read().clone();
-            let client = placed_on_first(&server).await;
+            let client = placed_on_first(&server);
             let lane = crate::registry::LaneItem::Request(test_ctx());
             assert!(slots[0].send_lane(lane).is_ok());
             let running = test_ctx();
@@ -731,14 +738,12 @@ mod tests {
                         draining.stop_accepting();
                     }
                 }));
-                let (client, stream, held, peer) = accepted(1).await.pop().expect("one");
+                let (client, accepted) = accepted();
                 send_get(&client, "/refused", false);
-                stream.peek(&mut [0u8]).await.expect("its bytes in");
-                let accepted = crate::server::Accepted {
-                    conn: Either::Left(stream),
-                    peer,
-                    held,
+                let Either::Left(stream) = &accepted.conn else {
+                    panic!("a TCP connection");
                 };
+                stream.peek(&mut [0u8]).await.expect("its bytes in");
                 tokio::spawn(crate::server::serve_conn(accepted, None, server.clone()));
                 let answered = tokio::time::timeout(
                     std::time::Duration::from_secs(3),
@@ -748,8 +753,7 @@ mod tests {
                 let reading = tokio::task::spawn_blocking(move || Wire::of(&client).response());
                 let (_, headers, body) = reading.await.expect("the client");
                 assert_eq!(body, b"hyper:/refused", "drain {drain}");
-                let closes = headers.contains(&"connection: close".to_string());
-                assert_eq!(closes, drain, "drain {drain}: {headers:?}");
+                assert_eq!(closes(&headers), drain, "drain {drain}: {headers:?}");
                 assert!(
                     inline.on_pick.lock().is_none(),
                     "placement picked no worker"

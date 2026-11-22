@@ -17,10 +17,10 @@ use tokio_util::either::Either;
 use super::{InlineConn, Next};
 use crate::registry::{BoxedCtx, ServerInner};
 use crate::request::RequestCtx;
-use crate::server::{Held, Peer};
+use crate::server::testing::hyper_body_of;
+use crate::server::{Accepted, Held, Peer};
 use crate::slot::WorkerSlot;
-pub use crate::testing::permit;
-use crate::testing::{eventually, eventually_blocking, TestServer};
+use crate::testing::{eventually, eventually_blocking, permit, slot, TestServer};
 
 /// A classic (queue) server with inline serving on and one worker slot;
 /// hyper's requests land in its queue, and hand-backs run on the
@@ -53,53 +53,64 @@ pub fn loop_server_as(
     capacity: usize,
     adjust: impl FnOnce(TestServer) -> TestServer,
 ) -> Arc<ServerInner> {
-    let test = TestServer::worker_loop().workers(workers).with(|c| {
+    let test = TestServer::worker_loop()
+        .workers(workers)
+        .capacity(capacity);
+    let test = test.with(|c| {
         c.queue_depth = 8;
         c.inline = true;
     });
     let server = adjust(test).build();
-    for slot in server.slots.read().iter() {
-        slot.load.capacity.store(capacity, Ordering::Relaxed);
-    }
     let _ = server.io_runtime.set(tokio::runtime::Handle::current());
     server
 }
 
-/// `count` connections as an accept loop has them, each with its client
-/// and what it holds, ready to place.
-pub async fn accepted(count: usize) -> Vec<(TcpStream, tokio::net::TcpStream, Held, Peer)> {
-    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
-        .await
-        .expect("bind");
-    let addr = listener.local_addr().expect("addr");
-    let mut accepted = Vec::with_capacity(count);
-    for _ in 0..count {
-        let client = TcpStream::connect(addr).expect("connect");
-        client
-            .set_read_timeout(Some(Duration::from_secs(5)))
-            .expect("read timeout");
-        let (stream, remote) = listener.accept().await.expect("accept");
-        let local = stream.local_addr().expect("local addr");
-        let peer = Peer { remote, local };
-        accepted.push((client, stream, Held::new(permit(), None), peer));
-    }
-    accepted
+/// A client connected over loopback, and the server's end.
+fn pair() -> (TcpStream, TcpStream) {
+    let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
+    let client = TcpStream::connect(listener.local_addr().expect("addr")).expect("connect");
+    let (stream, _) = listener.accept().expect("accept");
+    (client, stream)
 }
 
-/// One connection as accepted(1) has it, placed on `server` as the
-/// accept loop places it: its client.
-pub async fn placed(server: &Arc<ServerInner>) -> TcpStream {
-    let (client, stream, held, peer) = accepted(1).await.pop().expect("one");
-    assert!(super::place(server, Either::Left(stream), held, peer).is_ok());
+/// Both ends as a test and a server need them: a `client` read that
+/// hangs fails five seconds on, so its test fails instead, and `stream`
+/// never blocks. The connection's addresses, as its server sees them.
+fn ready(client: &TcpStream, stream: &TcpStream) -> Peer {
+    client
+        .set_read_timeout(Some(Duration::from_secs(5)))
+        .expect("read timeout");
+    stream.set_nonblocking(true).expect("nonblocking");
+    Peer {
+        remote: stream.peer_addr().expect("remote addr"),
+        local: stream.local_addr().expect("local addr"),
+    }
+}
+
+/// A connection as an accept loop has it, registered with the caller's
+/// runtime and ready to place or serve, and its client.
+pub fn accepted() -> (TcpStream, Accepted) {
+    let (client, stream) = pair();
+    let peer = ready(&client, &stream);
+    let stream = tokio::net::TcpStream::from_std(stream).expect("registered");
+    let (conn, held) = (Either::Left(stream), Held::new(permit(), None));
+    (client, Accepted { conn, peer, held })
+}
+
+/// One connection placed on `server` as the accept loop places it: its
+/// client.
+pub fn placed(server: &Arc<ServerInner>) -> TcpStream {
+    let (client, Accepted { conn, peer, held }) = accepted();
+    assert!(super::place(server, conn, held, peer).is_ok());
     client
 }
 
 /// placed(), on the first worker: its siblings have no room meanwhile.
-pub async fn placed_on_first(server: &Arc<ServerInner>) -> TcpStream {
+pub fn placed_on_first(server: &Arc<ServerInner>) -> TcpStream {
     let siblings = server.slots.read()[1..].to_vec();
     let room = |slot: &Arc<WorkerSlot>| slot.load.capacity.swap(0, Ordering::Relaxed);
     let rooms: Vec<usize> = siblings.iter().map(room).collect();
-    let client = placed(server).await;
+    let client = placed(server);
     for (slot, room) in siblings.iter().zip(rooms) {
         slot.load.capacity.store(room, Ordering::Relaxed);
     }
@@ -122,9 +133,7 @@ pub fn loopback_holding(
     server: &Arc<ServerInner>,
     permit: tokio::sync::OwnedSemaphorePermit,
 ) -> (TcpStream, Box<InlineConn>) {
-    let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
-    let client = TcpStream::connect(listener.local_addr().expect("addr")).expect("connect");
-    let (stream, _) = listener.accept().expect("accept");
+    let (client, stream) = pair();
     inline_conn(server, permit, client, stream)
 }
 
@@ -162,19 +171,8 @@ fn inline_conn(
     client: TcpStream,
     stream: TcpStream,
 ) -> (TcpStream, Box<InlineConn>) {
-    // A test that hangs fails instead, on its next read.
-    client
-        .set_read_timeout(Some(Duration::from_secs(5)))
-        .expect("read timeout");
-    stream.set_nonblocking(true).expect("nonblocking");
-    let peer = Peer {
-        remote: stream.peer_addr().expect("remote addr"),
-        local: stream.local_addr().expect("local addr"),
-    };
-    let (seat, held) = (
-        super::take_seat(&server.slots.read()[0]),
-        Held::new(permit, None),
-    );
+    let peer = ready(&client, &stream);
+    let (seat, held) = (super::take_seat(&slot(server, 0)), Held::new(permit, None));
     let home = tokio::runtime::Handle::current();
     let conn = InlineConn::new(server, seat, stream.into(), held, peer, home);
     conn.list();
@@ -338,6 +336,11 @@ pub fn body_of(ctx: &RequestCtx) -> Vec<u8> {
     }
 }
 
+/// Whether an answer's `headers` (Wire's lines) end its connection.
+pub fn closes(headers: &[String]) -> bool {
+    headers.iter().any(|line| line == "connection: close")
+}
+
 /// The next request on `conn`, waiting for its bytes.
 pub fn next_request(conn: &mut InlineConn) -> BoxedCtx {
     eventually_blocking("the next request", || match conn.next(true) {
@@ -383,12 +386,7 @@ pub async fn answer_dispatched(server: &Arc<ServerInner>, paths: &[&str]) {
             continue;
         };
         left.swap_remove(at);
-        let mut body = Vec::new();
-        if let Some(body_rx) = &ctx.body_rx {
-            while let Ok(chunk) = body_rx.recv_async().await {
-                body.extend_from_slice(&chunk);
-            }
-        }
+        let body = hyper_body_of(ctx.body_rx.as_ref()).await;
         let mut text = format!("hyper:{}", ctx.uri.path()).into_bytes();
         if !body.is_empty() {
             text.push(b':');

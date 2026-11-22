@@ -99,9 +99,7 @@ impl InlineIo {
     /// Whether the connection ends after `current`'s answer (the app's own Connection aside):
     /// asked by the request, the drain, or a quarantine. A retiring worker's goes on, with hyper.
     fn closes(&self, current: &Current) -> bool {
-        current.close
-            || self.origin.server.is_draining()
-            || self.slot.life.quarantined.load(Ordering::Relaxed)
+        current.close || self.origin.server.is_draining() || self.slot.life.quarantined()
     }
 
     /// The socket took the last of the stream's length: the connection's end is decided now, as

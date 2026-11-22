@@ -228,9 +228,9 @@ impl InlineIo {
             self.time_out(&mut state);
             return;
         }
-        let alive = !slot.life.quarantined.load(Ordering::Relaxed);
+        let alive = !slot.life.quarantined();
         if state.current.is_some() || !state.out.sent() {
-            let leaving = !alive || slot.life.retired.load(Ordering::Relaxed);
+            let leaving = !alive || slot.life.seems_retired();
             if leaving && state.current.is_none() && !(alive && state.writable()) {
                 state.ends(slot);
                 state.shutdown();
@@ -299,7 +299,7 @@ impl InlineIo {
     /// out, the socket is shut down so its client reads the end, and its worker counts it no
     /// more, once. Only its job, or the last write waiting at its end, closes the descriptor. Out
     /// come its seat and permit.
-    fn abandon(&self, why: Cut) -> (Option<Seat>, Option<Held>) {
+    pub(super) fn abandon(&self, why: Cut) -> (Option<Seat>, Option<Held>) {
         if why == Cut::Crash {
             if let Some(seat) = self.to_hyper_if_idle() {
                 return (Some(seat), None);
@@ -459,18 +459,6 @@ pub(super) fn close(stream: StdConn) {
 pub(super) fn forget(slot: &WorkerSlot, io: &Arc<InlineIo>) {
     let io = Arc::as_ptr(io);
     slot.inline.ios.lock().retain(|listed| !listed.is(io));
-}
-
-/// `slot`'s worker is given up on: each connection is answered or shut down and counted there no
-/// more, whether or not its job looks again.
-pub(crate) fn abandon(slot: &WorkerSlot, why: Cut) {
-    for io in super::ios(slot) {
-        let (seat, held) = io.abandon(why);
-        if seat.is_some() {
-            forget(slot, &io);
-        }
-        drop((seat, held));
-    }
 }
 
 pub(super) fn micros(span: Duration) -> u64 {

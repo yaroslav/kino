@@ -20,6 +20,7 @@ use super::{InlineConn, Next, Wrote};
 use crate::registry::{BoxedCtx, ServerInner};
 use crate::request::RequestCtx;
 use crate::response::{BodyFrame, Cut};
+use crate::server::testing::hyper_body_of;
 
 /// How the app answers each request of a row.
 #[derive(Clone, Copy)]
@@ -169,12 +170,7 @@ fn answer_inline(ctx: &RequestCtx, reply: Reply, taken: &Taken) {
 
 /// The app answers a request hyper read, as request.rs sends it.
 async fn answer_hyper(ctx: BoxedCtx, reply: Reply, taken: &Taken) {
-    let mut body = Vec::new();
-    if let Some(body_rx) = &ctx.body_rx {
-        while let Ok(chunk) = body_rx.recv_async().await {
-            body.extend_from_slice(&chunk);
-        }
-    }
+    let body = hyper_body_of(ctx.body_rx.as_ref()).await;
     let (reply, headers) = answer_for(&ctx, &body, reply);
     let mut builder = hyper::Response::builder().status(reply.status);
     for (name, value) in &headers {
@@ -387,13 +383,8 @@ async fn hyper_view(row: &Row) -> Vec<Event> {
     let server = test.with(|c| (c.queue_depth, c.http2) = (8, true)).build();
     let taken = Taken::default();
     let app = app(&server, row.reply, taken.clone());
-    let (client, stream, held, peer) = accepted(1).await.pop().expect("one");
+    let (client, accepted) = accepted();
     abortive(&client);
-    let accepted = crate::server::Accepted {
-        conn: tokio_util::either::Either::Left(stream),
-        peer,
-        held,
-    };
     tokio::spawn(crate::server::serve_conn(accepted, None, server.clone()));
     let events = tokio::task::block_in_place(|| view(client, row, &taken));
     app.abort();

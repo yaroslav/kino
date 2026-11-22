@@ -18,12 +18,6 @@ fn pem_bytes(input: &str) -> Result<Vec<u8>, String> {
 }
 
 pub fn build_acceptor(cert: &str, key: &str, http2: bool) -> Result<TlsAcceptor, String> {
-    Ok(TlsAcceptor::from(Arc::new(server_config(
-        cert, key, http2,
-    )?)))
-}
-
-fn server_config(cert: &str, key: &str, http2: bool) -> Result<ServerConfig, String> {
     let cert_pem = pem_bytes(cert)?;
     let key_pem = pem_bytes(key)?;
 
@@ -49,7 +43,7 @@ fn server_config(cert: &str, key: &str, http2: bool) -> Result<ServerConfig, Str
     } else {
         vec![b"http/1.1".to_vec()]
     };
-    Ok(config)
+    Ok(TlsAcceptor::from(Arc::new(config)))
 }
 
 /// A TLS server and client for tests: an acceptor for a fixture cert,
@@ -148,84 +142,42 @@ WJ2lRijROyX9v7f8aSQlb6kEwKhI8kG8SbeUc+zbKkzGgRXNaZHY/mAa
 
 #[cfg(test)]
 mod tests {
+    use super::build_acceptor;
     use super::testing::{acceptor, connector, localhost, CERT, KEY};
-    use super::{build_acceptor, server_config};
 
     #[test]
-    fn inline_pem_builds_an_acceptor() {
-        assert!(build_acceptor(CERT, KEY, true).is_ok());
+    fn pem_that_cannot_make_an_acceptor_is_refused_saying_why() {
+        let garbage = "-----BEGIN PRIVATE KEY-----\ngarbage\n-----END PRIVATE KEY-----";
+        #[rustfmt::skip] // One row per refused cert and key.
+        let refused = [
+            ("/nonexistent/cert.pem", "/nonexistent/key.pem", "cannot read"),
+            (KEY, KEY, "no certificates found"),
+            (CERT, CERT, "no private key found"),
+            (CERT, garbage, "TLS config rejected"),
+        ];
+        for (cert, key, says) in refused {
+            let error = build_acceptor(cert, key, true).err();
+            let error = error.unwrap_or_else(|| panic!("{says}: built"));
+            assert!(error.contains(says), "{says}: {error}");
+        }
     }
 
-    #[test]
-    fn missing_file_paths_error_without_panicking() {
-        let err = build_acceptor("/nonexistent/cert.pem", "/nonexistent/key.pem", true)
-            .err()
-            .expect("missing files");
-        assert!(err.contains("cannot read"));
-    }
-
-    #[test]
-    fn pem_without_certificates_is_rejected() {
-        let err = build_acceptor(KEY, KEY, true)
-            .err()
-            .expect("a key is not a cert");
-        assert!(err.contains("no certificates found"));
-    }
-
-    #[test]
-    fn pem_without_a_key_is_rejected() {
-        let err = build_acceptor(CERT, CERT, true)
-            .err()
-            .expect("a cert is not a key");
-        assert!(err.contains("no private key found"));
-    }
-
-    #[test]
-    fn mismatched_cert_and_garbage_key_are_rejected() {
-        let err = build_acceptor(
-            CERT,
-            "-----BEGIN PRIVATE KEY-----\ngarbage\n-----END PRIVATE KEY-----",
-            true,
-        )
-        .err()
-        .expect("garbage key");
-        assert!(!err.is_empty());
-    }
-
-    #[test]
-    fn alpn_advertises_h2_first_when_http2_is_on() {
-        let config = server_config(CERT, KEY, true).expect("valid PEM");
-        assert_eq!(
-            config.alpn_protocols,
-            vec![b"h2".to_vec(), b"http/1.1".to_vec()]
-        );
-    }
-
-    #[test]
-    fn alpn_advertises_only_http11_when_http2_is_off() {
-        let config = server_config(CERT, KEY, false).expect("valid PEM");
-        assert_eq!(config.alpn_protocols, vec![b"http/1.1".to_vec()]);
-    }
-
-    /// A real rustls handshake over an in-memory pipe: an h2-capable
-    /// client must land on "h2", proving the advertisement is not just a
-    /// config field but what the wire negotiates. The client skips
-    /// certificate verification: ALPN is under test here, not the trust
-    /// chain.
+    /// A real rustls handshake over an in-memory pipe, its client offering HTTP/1.1 first: the
+    /// server's order chooses, so h2 while http2 is on. The client skips certificate
+    /// verification: ALPN is under test here, not the trust chain.
     #[tokio::test]
-    async fn handshake_negotiates_h2_with_a_capable_client() {
-        let acceptor = acceptor(true);
-        let connector = connector(&[b"h2", b"http/1.1"]);
-
-        let (client_io, server_io) = tokio::io::duplex(16 * 1024);
-        let server = tokio::spawn(async move { acceptor.accept(server_io).await });
-        let client_stream = connector
-            .connect(localhost(), client_io)
-            .await
-            .expect("client handshake");
-        let server_stream = server.await.expect("join").expect("server handshake");
-
-        assert_eq!(client_stream.get_ref().1.alpn_protocol(), Some(&b"h2"[..]));
-        assert_eq!(server_stream.get_ref().1.alpn_protocol(), Some(&b"h2"[..]));
+    async fn the_handshake_chooses_h2_over_http11_only_while_http2_is_on() {
+        for (http2, chosen) in [(true, &b"h2"[..]), (false, &b"http/1.1"[..])] {
+            let acceptor = acceptor(http2);
+            let (client_io, server_io) = tokio::io::duplex(16 * 1024);
+            let server = tokio::spawn(async move { acceptor.accept(server_io).await });
+            let client = connector(&[b"http/1.1", b"h2"])
+                .connect(localhost(), client_io)
+                .await
+                .expect("client handshake");
+            let server = server.await.expect("join").expect("server handshake");
+            assert_eq!(client.get_ref().1.alpn_protocol(), Some(chosen), "{http2}");
+            assert_eq!(server.get_ref().1.alpn_protocol(), Some(chosen), "{http2}");
+        }
     }
 }

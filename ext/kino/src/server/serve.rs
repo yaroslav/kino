@@ -172,15 +172,21 @@ macro_rules! h2_settings {
     };
 }
 
+/// Kino's HTTP/1 settings, on either of hyper's h1 builders: the timer is what makes
+/// header_read_timeout fire, and no Date header, as on h2.
+macro_rules! h1_settings {
+    ($builder:expr) => {
+        $builder
+            .timer(TokioTimer::new())
+            .header_read_timeout(HEADER_READ_TIMEOUT)
+            .auto_date_header(false)
+    };
+}
+
 /// Plaintext: h2 by preface sniff, else HTTP/1 (TLS: by ALPN, http1_builder and http2_builder).
-/// The h1 timer is what makes header_read_timeout fire.
 fn conn_builder(max_streams: u32) -> auto::Builder<TokioExecutor> {
     let mut builder = auto::Builder::new(TokioExecutor::new());
-    builder
-        .http1()
-        .timer(TokioTimer::new())
-        .header_read_timeout(HEADER_READ_TIMEOUT)
-        .auto_date_header(false);
+    h1_settings!(builder.http1());
     h2_settings!(builder.http2(), max_streams);
     builder
 }
@@ -265,10 +271,7 @@ fn http2_builder(max_streams: u32) -> hyper::server::conn::http2::Builder<TokioE
 
 fn http1_builder() -> hyper::server::conn::http1::Builder {
     let mut builder = hyper::server::conn::http1::Builder::new();
-    builder
-        .timer(TokioTimer::new())
-        .header_read_timeout(HEADER_READ_TIMEOUT)
-        .auto_date_header(false);
+    h1_settings!(builder);
     builder
 }
 
@@ -276,7 +279,7 @@ fn http1_builder() -> hyper::server::conn::http1::Builder {
 pub(crate) mod testing {
     use std::sync::Arc;
 
-    use super::{serve_connection, ConnIo, Peer, Protocol};
+    use super::{serve_connection, ConnIo, Protocol};
     use crate::registry::ServerInner;
     use crate::server::accept::Held;
 
@@ -299,12 +302,21 @@ pub(crate) mod testing {
         protocol: Protocol,
     ) -> (tokio::io::DuplexStream, tokio::task::JoinHandle<()>) {
         let (client, conn) = tokio::io::duplex(64 * 1024);
-        let peer = Peer {
-            remote: ([127, 0, 0, 1], 40000).into(),
-            local: ([127, 0, 0, 1], 9292).into(),
-        };
+        let peer = crate::testing::PEER;
         let served = serve_connection(conn_io(conn), protocol, server, peer);
         (client, tokio::spawn(served))
+    }
+
+    /// The body of a request hyper read (its `body_rx`), as its forwarder
+    /// sends it: each chunk as it comes, up to the end.
+    pub async fn hyper_body_of(body_rx: Option<&flume::Receiver<bytes::Bytes>>) -> Vec<u8> {
+        let mut body = Vec::new();
+        if let Some(body_rx) = body_rx {
+            while let Ok(chunk) = body_rx.recv_async().await {
+                body.extend_from_slice(&chunk);
+            }
+        }
+        body
     }
 }
 

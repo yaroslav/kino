@@ -715,7 +715,7 @@ async fn closing_the_queues_hands_connections_no_worker_took_to_hyper() {
     use crate::inline::testing::{inline_loop_server, placed, read_to_end, send_get};
 
     let server = inline_loop_server(1, 8);
-    let client = placed(&server).await;
+    let client = placed(&server);
 
     // The drain, with a worker that never took its connection.
     server.stop_accepting();

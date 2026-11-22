@@ -459,38 +459,27 @@ mod tests {
     }
 
     #[test]
-    fn explicit_io_threads_win() {
+    fn a_connection_goes_to_the_live_shard_with_the_fewest_open() {
+        let rows: [(&[usize], &[bool], Option<usize>); 3] = [
+            (&[3, 0, 1], &[true, true, true], Some(1)),
+            // A dead shard's count is frozen at 0; it must not win anyway.
+            (&[3, 0, 1], &[true, false, true], Some(2)),
+            (&[0, 0], &[false, false], None),
+        ];
+        for (counts, live, picked) in rows {
+            assert_eq!(
+                least_loaded(&loads(counts), live),
+                picked,
+                "{counts:?} {live:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn io_threads_sets_the_shard_count_else_it_is_half_the_cpus() {
         assert_eq!(thread_count(3), 3);
-    }
-
-    #[test]
-    fn least_loaded_picks_the_emptiest_live_shard() {
-        assert_eq!(
-            least_loaded(&loads(&[3, 0, 1]), &[true, true, true]),
-            Some(1)
-        );
-    }
-
-    #[test]
-    fn least_loaded_routes_around_dead_shards() {
-        // The dead shard's count is frozen at 0; it must not win anyway.
-        assert_eq!(
-            least_loaded(&loads(&[3, 0, 1]), &[true, false, true]),
-            Some(2)
-        );
-    }
-
-    #[test]
-    fn least_loaded_reports_when_no_shard_is_left() {
-        assert_eq!(least_loaded(&loads(&[0, 0]), &[false, false]), None);
-    }
-
-    #[test]
-    fn default_is_half_the_cpus() {
-        assert_eq!(default_thread_count(1), 1);
-        assert_eq!(default_thread_count(2), 1);
-        assert_eq!(default_thread_count(3), 2);
-        assert_eq!(default_thread_count(12), 6);
-        assert_eq!(default_thread_count(128), 64);
+        for (cpus, shards) in [(1, 1), (2, 1), (3, 2), (12, 6), (128, 64)] {
+            assert_eq!(default_thread_count(cpus), shards, "{cpus} CPUs");
+        }
     }
 }

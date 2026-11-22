@@ -32,18 +32,6 @@ async fn body_of(response: hyper::Response<hyper::body::Incoming>) -> Bytes {
         .to_bytes()
 }
 
-/// Read the request body the way a worker does: leftover first, then
-/// the forwarder channel until the sender drops (EOF).
-async fn drain_body(ctx: &mut RequestCtx) -> Vec<u8> {
-    let mut out = ctx.leftover.take().map(Vec::from).unwrap_or_default();
-    if let Some(rx) = &ctx.body_rx {
-        while let Ok(chunk) = rx.recv_async().await {
-            out.extend_from_slice(&chunk);
-        }
-    }
-    out
-}
-
 #[tokio::test]
 async fn h2c_prior_knowledge_reaches_the_queue_as_http2() {
     let server = TestServer::shared_queue().build();
@@ -89,8 +77,8 @@ async fn h2_upload_forwards_data_and_drops_trailers() {
     let worker = tokio::spawn({
         let server = server.clone();
         async move {
-            let mut ctx = take_ctx(&server).await;
-            let body = drain_body(&mut ctx).await;
+            let ctx = take_ctx(&server).await;
+            let body = super::testing::hyper_body_of(ctx.body_rx.as_ref()).await;
             assert!(
                 ctx.responder.body_abandoned().is_none(),
                 "a trailer frame must not abort the body read"

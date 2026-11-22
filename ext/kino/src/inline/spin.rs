@@ -218,8 +218,8 @@ fn going(server: &ServerInner, slot: &WorkerSlot) -> bool {
         && lightly_loaded(server)
         && slot.load.in_flight.load(Ordering::Relaxed) == 0
         && !slot.lane.wake_pending.load(Ordering::Relaxed)
-        && !slot.life.retired.load(Ordering::Relaxed)
-        && !slot.life.quarantined.load(Ordering::Relaxed)
+        && !slot.life.seems_retired()
+        && !slot.life.quarantined()
 }
 
 #[cfg(test)]
@@ -229,23 +229,21 @@ mod tests {
     use std::sync::Arc;
     use std::time::{Duration, Instant};
 
+    use super::Spin;
+    use crate::inline::testing::{
+        answer, answer_dispatched, await_bytes, handbacks, loopback, placed, send_get,
+        spinning_server, wedge, Wire,
+    };
+    use crate::inline::{InlineConn, Next};
+    use crate::registry::{BoxedCtx, ServerInner};
+    use crate::slot::WorkerSlot;
+    use crate::testing::{eventually_blocking, slot};
+
     /// The spin's switch, as boot and the drain set it.
     fn spin_on(server: &ServerInner, on: bool) {
         let inline = server.inline.as_ref().expect("an inline server");
         inline.spin_on.store(on, Ordering::Relaxed);
     }
-
-    use super::Spin;
-    use crate::inline::testing::{
-        answer, answer_dispatched, await_bytes, handbacks, loopback, permit, send_get,
-        spinning_server, wedge, Wire,
-    };
-    use crate::inline::{InlineConn, Next};
-    use crate::registry::{BoxedCtx, ServerInner};
-    use crate::server::{Held, Peer};
-    use crate::slot::WorkerSlot;
-    use crate::testing::eventually_blocking;
-    use tokio_util::either::Either;
 
     /// Far longer than any test waits: a look still spinning when a test
     /// checks fails it.
@@ -345,16 +343,7 @@ mod tests {
                 spin_on(server, false);
                 Box::new(())
             }, readable),
-            ("a second connection placed on its worker", true, |server, _| {
-                let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
-                let client = TcpStream::connect(listener.local_addr().expect("addr")).expect("connect");
-                let (stream, remote) = listener.accept().expect("accept");
-                stream.set_nonblocking(true).expect("nonblocking");
-                let peer = Peer { remote, local: stream.local_addr().expect("local addr") };
-                let stream = Either::Left(tokio::net::TcpStream::from_std(stream).expect("registered"));
-                assert!(crate::inline::place(server, stream, Held::new(permit(), None), peer).is_ok());
-                Box::new(client)
-            }, readable),
+            ("a second connection placed on its worker", true, |server, _| Box::new(placed(server)), readable),
             ("a request sent to its worker", true, |_, slot| { crate::testing::assign(slot); Box::new(()) }, readable),
             ("the drain", true, |server, _| { server.stop_accepting(); Box::new(()) }, closed),
             ("its worker given up on as wedged", true, |_, slot| {
@@ -364,7 +353,7 @@ mod tests {
         ];
         for (what, during, set, then) in rows {
             let (server, _client, conn) = alone_after_a_request(1);
-            let slot = server.slots.read()[0].clone();
+            let slot = slot(&server, 0);
             let before = Some(spun_since(&server, None));
             let (started, spinning) = std::sync::mpsc::channel();
             let held = (!during).then(|| set(&server, &slot));
@@ -391,7 +380,7 @@ mod tests {
     async fn a_request_a_spin_catches_as_its_worker_retires_goes_to_hyper_with_the_connection() {
         // Two workers: hyper sends the request to the one that stays.
         let (server, client, mut conn) = alone_after_a_request(2);
-        let slot = server.slots.read()[0].clone();
+        let slot = slot(&server, 0);
         send_get(&client, "/second", false);
         await_bytes(&conn);
 

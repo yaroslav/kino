@@ -39,13 +39,14 @@ mod tests {
     use std::time::Duration;
 
     use crate::inline::testing::{
-        advance, answer, await_bytes, body_of, configured_server, cut_offs, elapse,
+        advance, answer, await_bytes, body_of, closes, configured_server, cut_offs, elapse,
         inline_loop_server, look, loopback, narrowed, next_request, read_to_end, send_get, server,
         wedge, with_body, Event, Wire,
     };
     use crate::inline::{shut_unserved, tick, InlineConn, Next, Wrote};
     use crate::registry::ServerInner;
     use crate::request::RequestCtx;
+    use crate::testing::slot;
 
     fn secs(seconds: f64) -> Duration {
         Duration::from_secs_f64(seconds)
@@ -69,7 +70,7 @@ mod tests {
     fn cut_off(server: &ServerInner, client: &TcpStream, conn: &mut InlineConn) {
         assert!(!waiting(conn), "its job did not see the end");
         assert_eq!(read_to_end(client), b"", "answered before it ended");
-        let slot = server.slots.read()[0].clone();
+        let slot = slot(server, 0);
         assert_eq!(slot.inline.conns.load(Ordering::Relaxed), 0);
         let handed = crate::inline::testing::handbacks(server);
         assert_eq!(handed, 0, "a connection cut off went to hyper");
@@ -193,7 +194,7 @@ mod tests {
         // passes its own.
         let cuts: [(&str, Cut); 2] = [
             ("deadline", |server| tick(server)),
-            ("shutdown", |server| shut_unserved(&server.slots.read()[0])),
+            ("shutdown", |server| shut_unserved(&slot(server, 0))),
         ];
         for (why, cut) in cuts {
             let server = server();
@@ -218,7 +219,7 @@ mod tests {
         let pipelined = b"GET /1 HTTP/1.1\r\nhost: x\r\n\r\nGET /2 HTTP/1.1\r\nhost: x\r\n\r\n";
         for given_up in [false, true] {
             let server = inline_loop_server(1, 8);
-            let slot = server.slots.read()[0].clone();
+            let slot = slot(&server, 0);
             let (unread_client, mut unread) = loopback(&server);
             send_get(&unread_client, "/2", false);
             await_bytes(&unread);
@@ -311,8 +312,7 @@ mod tests {
             assert_eq!(read, body, "{what}");
             if late {
                 assert_eq!(status, "HTTP/1.1 504 Gateway Timeout", "{what}");
-                let close = headers.contains(&"connection: close".to_string());
-                assert!(close, "{what}: {headers:?}");
+                assert!(closes(&headers), "{what}: {headers:?}");
                 // Its 504 settled it, though its app still holds it, and
                 // left the request behind it unrun.
                 assert_eq!(server.counters.in_flight.load(Ordering::Relaxed), 0);
@@ -353,7 +353,7 @@ mod tests {
         // can leave.
         for leaving in [Leaving::Staying, Leaving::Retired, Leaving::Quarantined] {
             let server = inline_loop_server(2, 8);
-            let slot = server.slots.read()[0].clone();
+            let slot = slot(&server, 0);
             let (mut client, mut conn) = narrowed(&server);
             send_get(&client, "/big", false);
             let ctx = next_request(&mut conn);

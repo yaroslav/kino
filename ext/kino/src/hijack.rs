@@ -17,7 +17,7 @@ use std::sync::Arc;
 use std::task::{Context, Poll};
 
 use bytes::{Buf, Bytes, BytesMut};
-use http::header::{CONTENT_LENGTH, TRANSFER_ENCODING};
+use http::header::TRANSFER_ENCODING;
 use http::StatusCode;
 use hyper::upgrade::OnUpgrade;
 use hyper_util::rt::TokioIo;
@@ -161,6 +161,10 @@ fn unanswered() -> HyperResponse {
     own_answer(503, "Service Unavailable\n")
 }
 
+fn bad_gateway() -> HyperResponse {
+    own_answer(502, "Bad Gateway\n")
+}
+
 /// Why the bridge has no head from the app.
 enum NoHead {
     /// The app closed its end without writing a byte.
@@ -185,7 +189,7 @@ impl Bridge {
         // The answer that leaves nothing to carry: Kino's own, or one the app wrote whole in time.
         let last = 'last: {
             let Ok(mut io) = into_tokio(io) else {
-                break 'last own_answer(502, "Bad Gateway\n");
+                break 'last bad_gateway();
             };
             let mut buf = BytesMut::new();
             // Whether the head was read after the workers stopped.
@@ -217,7 +221,7 @@ impl Bridge {
                 Err(NoHead::Silent) if *server.bridges_closed.borrow() >= Closed::Switched => {
                     break 'last unanswered();
                 }
-                Err(_) => break 'last own_answer(502, "Bad Gateway\n"),
+                Err(_) => break 'last bad_gateway(),
             };
 
             if head.status() == StatusCode::SWITCHING_PROTOCOLS {
@@ -234,7 +238,7 @@ impl Bridge {
             }
 
             let Some(length) = body_length(&head, head_request) else {
-                break 'last own_answer(502, "Bad Gateway\n");
+                break 'last bad_gateway();
             };
             close_connection(&mut head);
             let (frames, body) = flume::bounded(BODY_FRAMES);
@@ -418,10 +422,14 @@ fn parse_head(buf: &mut BytesMut) -> Result<Option<hyper::Response<()>>, ()> {
 
 /// The Content-Length of the body behind a head; None for a body framed any
 /// other way (chunked, or by the close), which the bridge does not carry, and
-/// for a Content-Length hyper would refuse to send. A bodiless answer has no
-/// body whatever its head declares, which is what hyper sends of it.
+/// for a Content-Length hyper's encoder refuses by dropping the connection
+/// unanswered: a value that is not all ASCII digits (a sign, a list, a number
+/// past u64), or two values that differ. A bodiless answer has no body
+/// whatever its head declares, which is what hyper sends of it.
 fn body_length(head: &hyper::Response<()>, head_request: bool) -> Option<u64> {
-    let declared = declared_length(head.headers()).ok()?;
+    if !framing::usable_length(head.headers()) {
+        return None;
+    }
     if framing::bodiless(head.status().as_u16(), head_request) {
         return Some(0);
     }
@@ -429,28 +437,7 @@ fn body_length(head: &hyper::Response<()>, head_request: bool) -> Option<u64> {
     if head.headers().contains_key(TRANSFER_ENCODING) {
         return None;
     }
-    declared
-}
-
-/// The length a head declares, Ok(None) when it declares none. Err for what
-/// hyper's encoder refuses by dropping the connection unanswered: a value
-/// that is not all ASCII digits (a sign, a list, a number past u64), or two
-/// values that differ.
-fn declared_length(headers: &http::HeaderMap) -> Result<Option<u64>, ()> {
-    let mut declared = None;
-    for value in headers.get_all(CONTENT_LENGTH) {
-        let digits = value.as_bytes();
-        if digits.is_empty() || !digits.iter().all(u8::is_ascii_digit) {
-            return Err(());
-        }
-        let length = std::str::from_utf8(digits).map_err(drop)?;
-        let length = length.parse::<u64>().map_err(drop)?;
-        if declared.is_some_and(|first| first != length) {
-            return Err(());
-        }
-        declared = Some(length);
-    }
-    Ok(declared)
+    framing::content_length(head.headers())
 }
 
 /// The body's `length` bytes as frames, from `buf` first, then from the app.

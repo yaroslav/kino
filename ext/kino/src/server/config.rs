@@ -75,11 +75,7 @@ impl TryFrom<RHash> for ServerConfig {
             tls: match (optional(hash, "tls_cert")?, optional(hash, "tls_key")?) {
                 (Some(cert), Some(key)) => Some((cert, key)),
                 (None, None) => None,
-                _ => {
-                    let ruby = Ruby::get_with(hash);
-                    let error = "TLS requires both cert and key";
-                    return Err(Error::new(ruby.exception_arg_error(), error));
-                }
+                _ => return Err(arg_error(hash, "TLS requires both cert and key")),
             },
             lanes: optional(hash, "lanes")?.unwrap_or(false),
             worker_loop: optional(hash, "worker_loop")?.unwrap_or(false),
@@ -110,15 +106,12 @@ impl TryFrom<RHash> for ServerConfig {
         };
         // Ruby refuses this up front: a queue of none would turn every request away.
         if config.queue_depth == 0 {
-            let ruby = Ruby::get_with(hash);
             let error = "queue_depth must be a positive Integer (got 0)";
-            return Err(Error::new(ruby.exception_arg_error(), error));
+            return Err(arg_error(hash, error));
         }
         // Guards embedders calling the native layer directly; Ruby refuses this up front.
         if config.worker_loop && !config.lanes {
-            let ruby = Ruby::get_with(hash);
-            let error = "worker_loop needs lanes";
-            return Err(Error::new(ruby.exception_arg_error(), error));
+            return Err(arg_error(hash, "worker_loop needs lanes"));
         }
         // Absent or below the floor means a fixed pool.
         let topology = &mut config.topology;
@@ -131,12 +124,12 @@ impl TryFrom<RHash> for ServerConfig {
 }
 
 fn required<T: TryConvert>(hash: RHash, key: &str) -> Result<T, Error> {
-    optional(hash, key)?.ok_or_else(|| {
-        Error::new(
-            Ruby::get_with(hash).exception_arg_error(),
-            format!("server_start: missing config key :{key}"),
-        )
-    })
+    let missing = || arg_error(hash, format!("server_start: missing config key :{key}"));
+    optional(hash, key)?.ok_or_else(missing)
+}
+
+fn arg_error(hash: RHash, message: impl Into<std::borrow::Cow<'static, str>>) -> Error {
+    Error::new(Ruby::get_with(hash).exception_arg_error(), message)
 }
 
 /// Absent or nil: None.
