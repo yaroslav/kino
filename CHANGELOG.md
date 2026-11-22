@@ -1,4 +1,4 @@
-## [0.8.0] - 2026-11-22
+## [0.8.0] - 2026-11-23
 
 ### WebSockets
 
@@ -273,6 +273,11 @@
   `:authority`) names no port: it is now the port of the listener that
   took the request (80 on a unix socket), where a process running more
   than one server reported the port of whichever saw that host first.
+
+### Dependencies
+
+- Updated dependencies, including magnus 0.9.4, bytes 1.12.2 and
+  rustls-webpki 0.103.17.
 
 ## [0.7.2] - 2026-10-24
 
