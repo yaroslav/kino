@@ -19,6 +19,7 @@ use crate::server::{Held, Peer, StdConn, HEADER_READ_TIMEOUT};
 use crate::slot::WorkerSlot;
 
 /// The socket and what its requests share with the threads that may answer them.
+/// Its last Arc may go in a thread-safe free, so what it holds keeps typed_data.rs's promise.
 pub struct InlineIo {
     pub(super) state: Mutex<IoState>,
     pub(super) deadline: Deadline,

@@ -98,7 +98,8 @@ impl Default for Sink {
     }
 }
 
-/// How a request's answer reaches its connection.
+/// How a request's answer reaches its connection. Dropped and given up in a thread-safe free:
+/// what it holds and what give_up calls keep typed_data.rs's promise.
 #[derive(Default)]
 pub struct Responder {
     sink: Sink,

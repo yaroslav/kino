@@ -79,6 +79,9 @@ impl RuntimeHandle {
 
 /// One per `Kino::Server`. Owns the tokio runtime, the request queue and the
 /// worker slots.
+/// Its last Arc may go in a thread-safe free, so what it holds keeps typed_data.rs's promise. The
+/// runtime, whose drop does not, is out by then: the registry holds the server until
+/// shutdown_runtime took it.
 pub struct ServerInner {
     pub id: u64,
     pub config: ServerConfig,

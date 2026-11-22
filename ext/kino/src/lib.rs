@@ -38,6 +38,7 @@ mod testing;
 mod ticker;
 mod timer;
 mod tls;
+mod typed_data;
 mod upgrade;
 mod ws;
 
@@ -172,13 +173,7 @@ fn init(ruby: &Ruby) -> Result<(), Error> {
         "ws_publish" => ws::topics::ws_publish, 3;
     );
 
-    // Force-resolve the TypedData class caches on the main ractor: magnus
-    // resolves them lazily on first wrap, and a racy first resolution from
-    // two worker ractors is the failure mode we must rule out.
-    let _ = <Request as magnus::TypedData>::class(ruby);
-    let _ = <queue::Worker as magnus::TypedData>::class(ruby);
-    let _ = <pin::PinKeeper as magnus::TypedData>::class(ruby);
-    let _ = <inline::ConnHandle as magnus::TypedData>::class(ruby);
+    typed_data::resolve_classes(ruby);
 
     // Frozen env key/value cache: built once here (main ractor, GVL held),
     // shared by every worker ractor afterwards.

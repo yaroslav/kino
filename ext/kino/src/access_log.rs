@@ -68,6 +68,8 @@ impl Logged {
     }
 
     /// Queues the completion line, with the breakdown where a worker measured `timing`.
+    /// A thread-safe free may run it (an inline give-up's 500), so it keeps typed_data.rs's
+    /// promise: it formats and queues, no more.
     pub fn completion(self, log: &Sink, status: u16, total: Duration, timing: Option<Timing>) {
         let line = completion(status, &self.method, &self.target, total, timing);
         log.write_line(line);

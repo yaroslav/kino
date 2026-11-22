@@ -96,6 +96,8 @@ impl Doorbell {
 
     /// The load keeps a busy worker's sends off the flag; a full socket means a ring already
     /// waits.
+    /// A thread-safe free may run it (a request given up), so it keeps typed_data.rs's promise:
+    /// one write that never waits, under a lock nothing holds across a Ruby call.
     pub fn ring(&self) {
         if self.armed.load(Ordering::SeqCst) && self.armed.swap(false, Ordering::SeqCst) {
             if let Some(sockets) = self.sockets.lock().as_ref() {

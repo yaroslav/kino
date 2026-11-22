@@ -32,6 +32,7 @@ pub const WS_INBOX: usize = 1024;
 /// A held lane lock: retire, quarantine and recycle check the generation under it.
 type LaneGuard<'a> = parking_lot::MutexGuard<'a, Option<flume::Sender<LaneItem>>>;
 
+/// Its last Arc may go in a thread-safe free, so what it holds keeps typed_data.rs's promise.
 /// Park, Load, Life, the lane lock and the Arc's count sit on cache lines of their own (128 bytes,
 /// as inline's Spinners): dispatch locks the lane and reads Park and Load for every request while
 /// the worker writes them, and a field added anywhere moves none of them onto another's line.

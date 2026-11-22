@@ -419,7 +419,9 @@ fn invalid_response(ruby: &Ruby, e: impl std::fmt::Display) -> Error {
     )
 }
 
-#[magnus::wrap(class = "Kino::Native::Request", free_immediately)]
+/// Kino::Native::Request, wrapped in typed_data.rs, whose promise its drop keeps: RequestCtx's
+/// gives the request up through atomics, Kino's own locks, channels and a socket write.
+#[derive(magnus::DataTypeFunctions)]
 pub struct Request(pub RefCell<RequestCtx>);
 
 impl Request {

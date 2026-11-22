@@ -152,6 +152,11 @@
   a boot can still take the path of a live server whose accept queue is
   full, and two boots at the same instant on a stale path can both bind
   it; a `pidfile` the two share prevents both.
+- Built for a Ruby that supports it (4.1 and later), Kino's own native
+  objects are freed in each Ractor's own garbage collection, and no
+  longer wait for the batch frees that stop every Ractor. On a Ruby 4.1
+  development build this raised throughput and cut tail latency under
+  load.
 - In ractor mode the default worker count is now the CPU count capped
   at `RUBY_MAX_CPU` (8 unless set), so a default boot no longer warns
   on machines with more than 8 cores. An explicit `workers` is

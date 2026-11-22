@@ -146,6 +146,22 @@ and the 99th percentile falls from 56 to 3 ms.
   (`Kino::Native::Request`, a TypedData object) is created *inside* the
   worker ractor by the take calls (`take_one`/`take_batch`), so its
   ownership is correct by construction.
+- **Thread-safe frees:** on a Ruby with per-Ractor GC (4.1 and later), a
+  free not declared thread-safe waits in a process-wide batch run under
+  a VM barrier, and Kino frees a Request per request. So Kino's native
+  types (`Request`, `Conn`, `Worker` and `PinKeeper`, listed in
+  `typed_data.rs`) declare `RUBY_TYPED_THREAD_SAFE_FREE` where the Ruby
+  has it: their frees may run on any thread, without the VM lock, beside
+  other frees and Ractors. Each calls no Ruby API, reads no Ruby object,
+  touches only `Send` and `Sync` state, takes no lock held across a Ruby
+  call or a GVL release (whose holder may sweep right there, or wait on
+  a barrier for the free's thread), never panics, and never blocks or
+  waits (no join, no blocking send, no runtime dropped). A change to
+  those drops or to what they reach (`ServerInner`, `WorkerSlot`,
+  `InlineIo`, `Responder`, and the calls they make: `Doorbell::ring`,
+  `Logged::completion`, `serve_handed_back`) re-checks this;
+  `ws::Registration`'s drop may release the GVL, so it must never become
+  reachable from them.
 - **Blocking discipline:** every blocking native call releases the GVL
   through `rb_thread_call_without_gvl2` (rb-sys; magnus doesn't wrap it,
   and a lint bars every other release or pass of the GVL, which would

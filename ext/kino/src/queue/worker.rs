@@ -148,7 +148,8 @@ fn handed(server: &ServerInner, take: &Take) {
 /// is correct by construction. Holds the server weakly: after teardown the
 /// upgrade fails, which is the same clean shutdown signal the per-take
 /// registry lookup used to give.
-#[magnus::wrap(class = "Kino::Native::Worker", free_immediately)]
+/// Wrapped in typed_data.rs, whose promise its drop keeps: a compare-and-swap, then its Arcs.
+#[derive(magnus::DataTypeFunctions)]
 pub struct Worker {
     server: std::sync::Weak<ServerInner>,
     server_id: u64,

@@ -154,8 +154,8 @@ impl PinSlab {
 /// through it. `Kino::Server` holds one for its response-buffer slab for
 /// the server's lifetime (surviving worker-ractor crashes); env_strings
 /// registers one for its cache slab as an immortal root at init.
-#[derive(magnus::TypedData)]
-#[magnus(class = "Kino::Native::PinKeeper", free_immediately, mark)]
+/// Wrapped in typed_data.rs, whose promise its drop keeps: it lets go of the slab, reading none
+/// of the strings.
 pub struct PinKeeper(pub Arc<PinSlab>);
 
 impl magnus::DataTypeFunctions for PinKeeper {
