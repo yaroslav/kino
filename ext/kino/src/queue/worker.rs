@@ -50,16 +50,14 @@ pub(super) fn enlist(server: &ServerInner, slot: &Arc<WorkerSlot>, ctx: &mut Req
     // One clock read serves the busy age, the histogram and, for the access log, the
     // request's queue wait and the start of its time in Ruby.
     let now = std::time::Instant::now();
-    let (counters, load) = (&server.counters, &slot.load);
-    counters.served.fetch_add(1, Ordering::Relaxed);
-    load.admit(&ctx.responder, now);
+    serves(server, slot, ctx, now);
     let wait = now.duration_since(ctx.enqueued_at);
-    counters.queue_histogram.record(wait.as_micros() as u64);
+    server
+        .counters
+        .queue_histogram
+        .record(wait.as_micros() as u64);
     ctx.wait = wait;
     ctx.admitted_at = now;
-    if slot.lane.is_worker_loop() {
-        load.hold(Arc::as_ptr(&ctx.responder) as usize);
-    }
     // Wire the slot into the request so blocked body reads/writes are
     // interruptible the same way the queue pop is.
     ctx.slot = Some(slot.clone());
@@ -84,8 +82,15 @@ pub(crate) fn admit_inline(
 }
 
 pub(crate) fn enlist_inline(server: &ServerInner, slot: &WorkerSlot, ctx: &RequestCtx) {
+    serves(server, slot, ctx, std::time::Instant::now());
+}
+
+/// What every admission counts: the request served, in flight on `slot` from `now`, and held by
+/// a worker_loop worker's thread until answered.
+#[inline]
+fn serves(server: &ServerInner, slot: &WorkerSlot, ctx: &RequestCtx, now: std::time::Instant) {
     server.counters.served.fetch_add(1, Ordering::Relaxed);
-    slot.load.admit(&ctx.responder, std::time::Instant::now());
+    slot.load.admit(&ctx.responder, now);
     if slot.lane.is_worker_loop() {
         slot.load.hold(Arc::as_ptr(&ctx.responder) as usize);
     }
@@ -146,8 +151,7 @@ fn handed(server: &ServerInner, take: &Take) {
 /// paid once at worker boot instead of on every take. Created inside the
 /// worker thread/ractor that uses it (like Request handles), so ownership
 /// is correct by construction. Holds the server weakly: after teardown the
-/// upgrade fails, which is the same clean shutdown signal the per-take
-/// registry lookup used to give.
+/// upgrade fails, which its takes read as a clean shutdown.
 /// Wrapped in typed_data.rs, whose promise its drop keeps: a compare-and-swap, then its Arcs.
 #[derive(magnus::DataTypeFunctions)]
 pub struct Worker {

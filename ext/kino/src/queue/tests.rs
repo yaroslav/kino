@@ -1,7 +1,4 @@
-use std::sync::atomic::AtomicBool;
-use std::time::Duration;
-
-use std::sync::atomic::Ordering;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
 use super::take::OWN_RUN;
@@ -9,7 +6,7 @@ use super::testing::{admit_next, boot, kind, nonblock, ready, rung, socket_sends
 use super::*;
 use crate::registry::{BoxedCtx, ServerInner};
 use crate::slot::{WorkerSlot, LANE_DEPTH};
-use crate::testing::{assign, slot, InPlace, TestServer};
+use crate::testing::{assign, finishes_in_time, slot, InPlace, TestServer};
 use crate::ws;
 
 /// A classic worker's take as Worker::checkout makes it, where `release`
@@ -315,9 +312,8 @@ fn what_a_worker_loop_worker_waits_for_rings_its_doorbell() {
 
 #[test]
 fn an_answer_leaves_a_full_worker_counted_full_until_its_take_with_room() {
-    let server = TestServer::worker_loop().workers(1).build();
+    let server = TestServer::worker_loop().workers(1).capacity(1).build();
     let slot = slot(&server, 0);
-    slot.load.capacity.store(1, Ordering::Relaxed);
     assign(&slot);
     let request = admit_next(&server, &slot);
 
@@ -370,14 +366,10 @@ fn take_in_time(
     release: impl FnMut(&AtomicBool, &mut dyn FnMut()) + Send + 'static,
     interrupts: impl FnMut() -> Result<(), &'static str> + Send + 'static,
 ) -> Result<Taken, &'static str> {
-    let (taken_tx, taken) = flume::bounded(1);
     let (server, slot) = (server.clone(), slot.clone());
-    std::thread::spawn(move || {
-        let _ = taken_tx.send(take(&server, &slot, release, interrupts));
-    });
-    taken
-        .recv_timeout(Duration::from_secs(5))
-        .expect("the take still waits after 5 s")
+    finishes_in_time("the take", move || {
+        take(&server, &slot, release, interrupts)
+    })
 }
 
 #[test]
@@ -550,10 +542,7 @@ fn the_shutdowns_interrupt_ends_a_parked_take_whatever_the_vm_has_pending() {
 /// What a worker's checkout took: the request, admitted as take_one admits it (the env aside),
 /// its handle kept as Ruby would keep it.
 fn checked_out(server: &ServerInner, worker: &Worker, slot: &Arc<WorkerSlot>) -> BoxedCtx {
-    let taken = worker.waiting(server).expect("take");
-    let mut ctx = super::testing::expect_request(taken);
-    super::worker::enlist(server, slot, &mut ctx);
-    ctx
+    super::testing::admitted(server, slot, worker.waiting(server).expect("take"))
 }
 
 #[test]

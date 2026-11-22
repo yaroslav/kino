@@ -281,9 +281,8 @@ fn a_crashed_worker_loop_workers_slot_goes_to_its_replacement_doorbell_and_all()
 
 #[test]
 fn a_worker_loop_worker_at_capacity_gets_no_request_and_all_at_capacity_is_overload() {
-    let server = TestServer::worker_loop().workers(3).build();
+    let server = TestServer::worker_loop().workers(3).capacity(1).build();
     let (full, colder, warmer) = (slot(&server, 0), slot(&server, 1), slot(&server, 2));
-    with_capacity(&server, 1);
     // Awake, the full worker is the one an awake lane is looked for in.
     assign(&full);
     let mut open = vec![admit_next(&server, &full)];
@@ -345,13 +344,6 @@ fn dispatch_all(server: &ServerInner, count: usize) {
     }
 }
 
-/// Sets the capacity of each of `server`'s worker_loop workers.
-fn with_capacity(server: &ServerInner, capacity: usize) {
-    for slot in server.slots.read().iter() {
-        slot.load.capacity.store(capacity, Ordering::Relaxed);
-    }
-}
-
 #[test]
 fn a_worker_loop_lane_holds_as_many_requests_as_its_worker_has_room_for() {
     // Before its serve sets a capacity, and with less room than a
@@ -364,8 +356,10 @@ fn a_worker_loop_lane_holds_as_many_requests_as_its_worker_has_room_for() {
         (16, 14, LANE_DEPTH),
     ];
     for (capacity, open, depth) in cases {
-        let server = TestServer::worker_loop().workers(1).build();
-        with_capacity(&server, capacity);
+        let server = TestServer::worker_loop()
+            .workers(1)
+            .capacity(capacity)
+            .build();
         slot(&server, 0)
             .load
             .in_flight
@@ -384,8 +378,7 @@ fn a_worker_loop_lane_holds_as_many_requests_as_its_worker_has_room_for() {
 #[test]
 fn a_hot_worker_loop_lane_takes_one_while_a_sibling_idles_and_fills_as_far_as_a_classic_one_once_none_does(
 ) {
-    let server = TestServer::worker_loop().workers(2).build();
-    with_capacity(&server, 16);
+    let server = TestServer::worker_loop().workers(2).capacity(16).build();
     assert_eq!(
         nonblock(&server, &slot(&server, 1), Room::All),
         "nothing",
@@ -572,7 +565,7 @@ async fn a_full_worker_loop_worker_lets_a_waiting_request_in_once_a_job_ends() {
     for (then, next) in cases {
         let server = one_worker_waiting(true, 60_000);
         let worker = slot(&server, 0);
-        worker.load.capacity.store(1, Ordering::Relaxed);
+        worker.load.set_capacity(1);
         assign(&worker);
         let job = admit_next(&server, &worker);
         let waiting = waiting_dispatch(&server, 1).await;
@@ -681,7 +674,7 @@ fn a_dead_workers_late_end_never_touches_the_worker_that_took_its_slot_over() {
     crate::queue::Worker::release(&dead);
     assert!(slot.recycle().is_some(), "a slot let go of is recycled");
     let (_, taker) = boot(&server, 0);
-    slot.load.capacity.store(8, Ordering::Relaxed);
+    slot.load.set_capacity(8);
     let generation = slot.generation();
     // The successor took a request it has not answered yet.
     let (ctx, mut client) = crate::request::test_ctx_with_client();
@@ -719,36 +712,20 @@ fn a_dead_workers_late_end_never_touches_the_worker_that_took_its_slot_over() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn closing_the_queues_hands_connections_no_worker_took_to_hyper() {
-    use std::io::{Read, Write};
+    use crate::inline::testing::{inline_loop_server, placed, read_to_end, send_get};
 
-    let server = crate::inline::testing::inline_loop_server(1, 8);
-    let (client, stream, held, peer) = crate::inline::testing::accepted(1)
-        .await
-        .pop()
-        .expect("one");
-    client
-        .set_read_timeout(Some(Duration::from_secs(5)))
-        .expect("read timeout");
-    let stream = tokio_util::either::Either::Left(stream);
-    assert!(crate::inline::place(&server, stream, held, peer).is_ok());
+    let server = inline_loop_server(1, 8);
+    let client = placed(&server).await;
 
     // The drain, with a worker that never took its connection.
     server.stop_accepting();
     server.close_queues();
 
     let worker = slot(&server, 0);
-    assert!(worker
-        .lane
-        .placed_rx
-        .as_ref()
-        .is_some_and(|placed| placed.is_empty()));
+    assert!(!worker.lane.placed_waiting());
     assert_eq!(worker.inline.conns.load(Ordering::Relaxed), 0);
     // Hyper serves it now: the drain's answer, then the end.
-    (&client)
-        .write_all(b"GET / HTTP/1.1\r\nhost: x\r\nconnection: close\r\n\r\n")
-        .expect("a request");
-    let mut answer = Vec::new();
-    (&client).read_to_end(&mut answer).expect("the end");
-    let answer = String::from_utf8_lossy(&answer);
+    send_get(&client, "/", true);
+    let answer = String::from_utf8_lossy(&read_to_end(&client)).into_owned();
     assert!(answer.starts_with("HTTP/1.1 503 "), "{answer}");
 }

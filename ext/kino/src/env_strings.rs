@@ -586,7 +586,7 @@ pub fn set_addr_env(ruby: &Ruby, env: magnus::RHash, ip: IpAddr) -> Result<(), m
 
 #[cfg(test)]
 mod tests {
-    use super::{cgi_name, COMMON_HEADERS, COMMON_METHODS};
+    use super::{cgi_name, COMMON_HEADERS, COMMON_METHODS, INTERNABLE_VALUES};
 
     #[test]
     fn cgi_names() {
@@ -596,31 +596,22 @@ mod tests {
         assert_eq!(cgi_name("sec-ch-ua"), "HTTP_SEC_CH_UA");
     }
 
-    // The cache is keyed by hyper's lowercase wire form; one uppercase
-    // entry would silently never hit.
+    // The caches are keyed by hyper's wire forms, lowercase names and uppercase methods; an
+    // entry in another case would silently never hit.
     #[test]
-    fn common_headers_are_lowercase_and_unique() {
-        let mut seen = std::collections::HashSet::new();
-        for header in COMMON_HEADERS {
-            assert_eq!(
-                *header,
-                header.to_ascii_lowercase(),
-                "{header} must be lowercase"
-            );
-            assert!(seen.insert(*header), "{header} listed twice");
-        }
-    }
-
-    #[test]
-    fn common_methods_are_uppercase_and_unique() {
-        let mut seen = std::collections::HashSet::new();
-        for method in COMMON_METHODS {
-            assert_eq!(
-                *method,
-                method.to_ascii_uppercase(),
-                "{method} must be uppercase"
-            );
-            assert!(seen.insert(*method), "{method} listed twice");
+    fn the_cached_names_are_listed_once_each_in_their_wire_case() {
+        type WireCase = fn(&str) -> String;
+        let lists: [(&[&str], WireCase); 3] = [
+            (COMMON_HEADERS, str::to_ascii_lowercase),
+            (INTERNABLE_VALUES, str::to_ascii_lowercase),
+            (COMMON_METHODS, str::to_ascii_uppercase),
+        ];
+        for (list, wire_case) in lists {
+            let mut seen = std::collections::HashSet::new();
+            for &name in list {
+                assert_eq!(name, wire_case(name), "{name} is not in its wire case");
+                assert!(seen.insert(name), "{name} listed twice");
+            }
         }
     }
 }

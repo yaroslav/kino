@@ -4,6 +4,7 @@
 //! thread or task does.
 
 use std::fmt::Display;
+use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::sync::atomic::AtomicBool;
 use std::sync::Arc;
 use std::time::Duration;
@@ -17,12 +18,18 @@ use tokio::io::{AsyncRead, AsyncReadExt};
 use crate::doorbell::Doorbell;
 use crate::gvl::Parker;
 use crate::registry::{BoxedCtx, ServerInner};
-use crate::server::{ServerConfig, Topology};
+use crate::server::{Peer, ServerConfig, Topology};
 use crate::slot::{WorkerSlot, WS_INBOX};
 
 /// Tests that read process-wide counters (sockets, bridges, cut
 /// streams) run one at a time.
 pub static SERIAL: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
+/// The peer of a connection no socket carries: a client port on loopback, Kino's default port.
+pub const PEER: Peer = Peer {
+    remote: SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 40000),
+    local: SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 9292),
+};
 
 /// How long `eventually` keeps polling before the test fails.
 const PATIENCE: Duration = Duration::from_secs(5);
@@ -67,19 +74,20 @@ pub fn eventually_blocking<T>(what: impl Display, mut ready: impl FnMut() -> Opt
     }
 }
 
-/// Run `work` on its own thread and fail naming `what` if it has not
-/// returned within the patience. A call that blocks a runtime thread
-/// cannot be cut short by `tokio::time::timeout`; this can. A stuck
-/// thread is left behind, the test fails.
-pub fn finishes_in_time(what: &str, work: impl FnOnce() + Send + 'static) {
+/// What `work` returns, run on its own thread; fails naming `what` if it has not returned
+/// within the patience. A call that blocks a runtime thread cannot be cut short by
+/// `tokio::time::timeout`; this can. A stuck thread is left behind, the test fails.
+pub fn finishes_in_time<T: Send + 'static>(
+    what: &str,
+    work: impl FnOnce() -> T + Send + 'static,
+) -> T {
     let (done, finished) = std::sync::mpsc::channel();
     std::thread::spawn(move || {
-        work();
-        let _ = done.send(());
+        let _ = done.send(work());
     });
     finished
         .recv_timeout(PATIENCE)
-        .unwrap_or_else(|_| panic!("{what} blocked for over {PATIENCE:?}"));
+        .unwrap_or_else(|_| panic!("{what} blocked for over {PATIENCE:?}"))
 }
 
 /// SERIAL, taken outside a runtime once no socket of an earlier test is
@@ -142,6 +150,7 @@ pub struct TestServer {
     config: ServerConfig,
     workers: usize,
     inbox: usize,
+    capacity: usize,
 }
 
 impl TestServer {
@@ -176,11 +185,18 @@ impl TestServer {
             },
             workers: 0,
             inbox: WS_INBOX,
+            capacity: 0,
         }
     }
 
     pub fn workers(mut self, count: usize) -> Self {
         self.workers = count;
+        self
+    }
+
+    /// Each worker_loop worker runs up to `jobs` requests at once, as its serve sets it.
+    pub fn capacity(mut self, jobs: usize) -> Self {
+        self.capacity = jobs;
         self
     }
 
@@ -210,6 +226,7 @@ impl TestServer {
         for _ in 0..self.workers {
             let doorbell = worker_loop.then(|| Doorbell::new().expect("a doorbell"));
             let slot = WorkerSlot::new(lanes, self.inbox, doorbell, server.inline.is_some());
+            slot.load.set_capacity(self.capacity);
             server.slots.write().push(Arc::new(slot));
         }
         server

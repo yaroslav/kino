@@ -181,105 +181,43 @@ fn write_count(out: &mut String, n: u64) {
 
 #[cfg(test)]
 mod tests {
-    use super::{arrival_line, completion_line, now_stamp, write_breakdown, write_count, Timing};
-    use std::net::{IpAddr, Ipv4Addr};
     use std::time::Duration;
 
-    fn breakdown(total: Duration, timing: &Timing) -> String {
-        let mut out = String::new();
-        write_breakdown(&mut out, total, timing);
-        out
-    }
+    use super::{write_breakdown, write_count, Timing};
 
-    fn count(n: u64) -> String {
-        let mut out = String::new();
-        write_count(&mut out, n);
-        out
-    }
-
+    // The records' shape, their stamp and the blank line after a completion:
+    // spec/logging_spec.rb. What the breakdown's numbers are is checked here.
     #[test]
-    fn arrival_line_carries_method_target_and_ip() {
-        let ip = IpAddr::V4(Ipv4Addr::new(203, 0, 113, 5));
-        assert_eq!(
-            arrival_line("GET", "/users?q=1", ip),
-            "\u{2192} GET /users?q=1  from 203.0.113.5"
-        );
-    }
-
-    #[test]
-    fn completion_line_carries_status_target_and_total() {
-        assert_eq!(
-            completion_line(200, "GET", "/users", Duration::from_millis(12)),
-            "\u{2190} 200 GET /users  12.0ms"
-        );
-    }
-
-    #[test]
-    fn breakdown_splits_the_total_into_ruby_kino_and_wait() {
-        let timing = Timing {
-            wait: Duration::from_micros(100),
-            ruby: Duration::from_millis(41),
-            gc: Some((Duration::from_micros(9_700), 52_000)),
-        };
-        // kino = total - ruby - wait = 45.2 - 41.0 - 0.1 = 4.1ms.
-        assert_eq!(
-            breakdown(Duration::from_micros(45_200), &timing),
-            "(ruby 41.0ms [gc 9.7ms; 52k obj]; kino 4.1ms; wait 0.1ms)"
-        );
-    }
-
-    #[test]
-    fn breakdown_leaves_out_the_gc_bracket_when_not_measured() {
-        let timing = Timing {
-            wait: Duration::from_millis(1),
-            ruby: Duration::from_millis(2),
-            gc: None,
-        };
-        assert_eq!(
-            breakdown(Duration::from_millis(4), &timing),
-            "(ruby 2.0ms; kino 1.0ms; wait 1.0ms)"
-        );
-    }
-
-    #[test]
-    fn breakdown_floors_kino_at_zero() {
-        let timing = Timing {
-            wait: Duration::from_millis(1),
-            ruby: Duration::from_millis(40),
-            gc: Some((Duration::ZERO, 10)),
-        };
-        assert_eq!(
-            breakdown(Duration::from_millis(40), &timing),
-            "(ruby 40.0ms [gc 0.0ms; 10 obj]; kino 0.0ms; wait 1.0ms)"
-        );
+    fn a_breakdown_splits_the_total_into_ruby_kino_and_wait_with_the_gc_bracket_when_measured() {
+        let us = Duration::from_micros;
+        // The total, wait, ruby and GC pause in microseconds with the objects allocated, and the
+        // breakdown: kino is what is left, floored at zero. One row per case; rustfmt would split
+        // each row field by field.
+        #[rustfmt::skip]
+        let rows = [
+            (45_200, 100, 41_000, Some((9_700, 52_000)), "(ruby 41.0ms [gc 9.7ms; 52k obj]; kino 4.1ms; wait 0.1ms)"),
+            (4_000, 1_000, 2_000, None, "(ruby 2.0ms; kino 1.0ms; wait 1.0ms)"),
+            (40_000, 1_000, 40_000, Some((0, 10)), "(ruby 40.0ms [gc 0.0ms; 10 obj]; kino 0.0ms; wait 1.0ms)"),
+        ];
+        for (total, wait, ruby, gc, expected) in rows {
+            let gc = gc.map(|(pause, objects)| (us(pause), objects));
+            let timing = Timing {
+                wait: us(wait),
+                ruby: us(ruby),
+                gc,
+            };
+            let mut breakdown = String::new();
+            write_breakdown(&mut breakdown, us(total), &timing);
+            assert_eq!(breakdown, expected);
+        }
     }
 
     #[test]
     fn count_humanizes_allocation_counts() {
-        assert_eq!(count(0), "0");
-        assert_eq!(count(523), "523");
-        assert_eq!(count(1500), "1.5k");
-        assert_eq!(count(52_000), "52k");
-    }
-
-    #[test]
-    fn timestamp_is_date_time_and_numeric_offset() {
-        // `YYYY-MM-DD HH:MM:SS +HHMM`, e.g. `2026-08-22 14:03:11 +0300`.
-        let ts = now_stamp();
-        let (datetime, offset) = ts.rsplit_once(' ').expect("offset field");
-        let (date, time) = datetime.split_once(' ').expect("date and time");
-        assert_eq!(date.len(), 10, "date {date}");
-        assert_eq!(&date[4..5], "-");
-        assert_eq!(time.len(), 8, "time {time}");
-        assert_eq!(&time[2..3], ":");
-        assert_eq!(offset.len(), 5, "offset {offset}");
-        assert!(matches!(&offset[0..1], "+" | "-"));
-        assert!(offset[1..].bytes().all(|b| b.is_ascii_digit()));
-    }
-
-    #[test]
-    fn completion_ends_with_the_blank_line_newline() {
-        let line = super::completion(200, "GET", "/", Duration::from_millis(1), None);
-        assert!(line.ends_with("\u{2190} 200 GET /  1.0ms\n") || line.ends_with("1.0ms\x1b[0m\n"));
+        for (n, humanized) in [(0, "0"), (523, "523"), (1500, "1.5k"), (52_000, "52k")] {
+            let mut count = String::new();
+            write_count(&mut count, n);
+            assert_eq!(count, humanized);
+        }
     }
 }

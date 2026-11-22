@@ -213,7 +213,7 @@ and the 99th percentile falls from 56 to 3 ms.
   Hash carries the request handle under `env["kino.request"]`, so no
   per-request pair array exists either.
 - **Env construction:** one FFI call builds the full CGI side of the Rack
-  env as a real Hash. Static keys, common methods/protocols and 44 common
+  env as a real Hash. Static keys, common methods/protocols and 46 common
   `HTTP_*` header names come from a frozen (and therefore Ractor-shareable)
   string cache built once at init on the main ractor. Frozen keys also
   skip the dup that `Hash#[]=` performs on unfrozen string keys. Only

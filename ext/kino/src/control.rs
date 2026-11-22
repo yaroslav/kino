@@ -14,7 +14,7 @@ use crate::stats::Snapshot;
 /// not part of the secret, so it may return early; once the lengths match,
 /// every byte of both strings is visited regardless of where they first
 /// differ.
-pub fn token_ok(expected: &str, authorization: Option<&str>) -> bool {
+fn token_ok(expected: &str, authorization: Option<&str>) -> bool {
     let presented = authorization
         .and_then(|h| h.strip_prefix("Bearer "))
         .unwrap_or("");
@@ -30,9 +30,9 @@ pub fn token_ok(expected: &str, authorization: Option<&str>) -> bool {
     diff == 0
 }
 
-/// (status, content type, body). The token, when configured, guards the
-/// data endpoints only; orchestrator probes must never need credentials.
-pub fn route(
+/// (status, content type, body) for a request to `path`, the URI's path alone. The token, when
+/// configured, guards the data endpoints only; orchestrator probes must never need credentials.
+fn route(
     method: &str,
     path: &str,
     authorization: Option<&str>,
@@ -42,7 +42,6 @@ pub fn route(
     if method != "GET" && method != "HEAD" {
         return (405, "text/plain", "method not allowed\n".to_string());
     }
-    let path = path.split('?').next().unwrap_or(path);
     match path {
         "/live" => (200, "text/plain", "ok\n".to_string()),
         "/ready" => {
@@ -309,13 +308,6 @@ fn handle(
 mod tests {
     use super::*;
 
-    fn snapshot(state: u8) -> Snapshot {
-        Snapshot {
-            state,
-            ..Snapshot::default()
-        }
-    }
-
     #[test]
     fn token_check_wants_the_exact_bearer_token() {
         assert!(token_ok("s3cret", Some("Bearer s3cret")));
@@ -336,29 +328,19 @@ mod tests {
         assert!(!token_ok("s3cret", Some("Bearer s3cret\0")));
     }
 
+    // The rest of the routes, the probes' states and the token's guard: spec/control_plane_spec.rb.
     #[test]
-    fn routing_matrix() {
-        let ready = snapshot(crate::registry::STATE_READY);
-        assert_eq!(route("GET", "/live", None, None, &ready).0, 200);
+    fn a_head_is_routed_as_a_get_and_the_token_guards_the_metrics_too() {
+        let ready = Snapshot {
+            state: STATE_READY,
+            ..Snapshot::default()
+        };
         assert_eq!(route("HEAD", "/live", None, None, &ready).0, 200);
-        assert_eq!(route("GET", "/ready", None, None, &ready).0, 200);
-        assert_eq!(route("GET", "/stats", None, None, &ready).0, 200);
-        assert_eq!(route("GET", "/metrics", None, None, &ready).0, 200);
-        assert_eq!(route("GET", "/nope", None, None, &ready).0, 404);
-        assert_eq!(route("POST", "/stats", None, None, &ready).0, 405);
-        assert_eq!(route("GET", "/stats?x=1", None, None, &ready).0, 200);
-
-        let booting = snapshot(crate::registry::STATE_BOOTING);
-        let (code, _, body) = route("GET", "/ready", None, None, &booting);
-        assert_eq!((code, body.as_str()), (503, "booting\n"));
-
-        // The token guards stats and metrics; the probes stay open.
-        assert_eq!(route("GET", "/stats", None, Some("t"), &ready).0, 401);
+        let token = Some("t");
+        assert_eq!(route("GET", "/metrics", None, token, &ready).0, 401);
         assert_eq!(
-            route("GET", "/metrics", Some("Bearer t"), Some("t"), &ready).0,
+            route("GET", "/metrics", Some("Bearer t"), token, &ready).0,
             200
         );
-        assert_eq!(route("GET", "/ready", None, Some("t"), &ready).0, 200);
-        assert_eq!(route("GET", "/live", None, Some("t"), &ready).0, 200);
     }
 }

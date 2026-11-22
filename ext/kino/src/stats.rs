@@ -128,6 +128,28 @@ impl InlineSnapshot {
             spins,
         })
     }
+
+    /// Its counts, in /stats's order: each one's key there, its metric's name and help, and its
+    /// value.
+    // A table, as Snapshot::counts's.
+    #[rustfmt::skip]
+    fn counts(&self) -> [(&'static str, Metric, u64); 6] {
+        [
+            ("connections", ("kino_inline_connections",
+                "Connections served inline on the workers' threads now."),
+                self.connections as u64),
+            ("requests", ("kino_inline_requests_total", "Requests served inline."), self.requests),
+            ("declined", ("kino_inline_declined_total",
+                "Plain TCP and unix-socket connections left with hyper at accept, as no worker could take them (or none served yet)."),
+                self.declined),
+            ("handbacks", ("kino_inline_handbacks_total", "Inline connections handed back to hyper."),
+                self.handbacks),
+            ("closed", ("kino_inline_closed_total", "Inline connections Kino cut off."), self.closed),
+            ("spins", ("kino_inline_spins_total",
+                "Spins of an inline connection alone on its worker for its next request, before its job waits on the socket."),
+                self.spins),
+        ]
+    }
 }
 
 /// One stat's value; a name is a fixed identifier, a Symbol in Ruby.
@@ -263,14 +285,7 @@ impl Snapshot {
         });
         match &self.inline {
             Some(inline) => e.nest("inline", Map, |e| {
-                e.counts([
-                    ("connections", inline.connections as u64),
-                    ("requests", inline.requests),
-                    ("declined", inline.declined),
-                    ("handbacks", inline.handbacks),
-                    ("closed", inline.closed),
-                    ("spins", inline.spins),
-                ]);
+                e.counts(inline.counts().map(|(key, _, count)| (key, count)));
             }),
             None => e.stat("inline", Stat::Nil),
         }
@@ -435,39 +450,17 @@ impl Snapshot {
                 "Seconds requests waited in the queue before a worker admitted them.",
                 Samples::Histogram(&self.queue_histogram)),
         ]);
-        let inline = self.inline.as_ref().map(|inline| self.inline_rows(inline));
-        let inline = inline.into_iter().flatten();
+        // Only a server that serves inline has its series.
+        let inline = self.inline.iter().flat_map(|inline| {
+            let counts = inline.counts().into_iter();
+            let help = "Connections each dispatch slot's worker serves inline now.";
+            let per_worker = self.per_worker(|w| w.inline_conns as u64);
+            counts
+                .map(|(_, (name, help), count)| (name, help, One(count)))
+                .chain([("kino_worker_inline_connections", help, per_worker)])
+        });
         let stats = plain.chain(head).chain(sockets).chain(lane).chain(workers);
         stats.chain(inline).chain(tail).collect()
-    }
-
-    /// The inline serving's series: only a server that serves inline has any.
-    fn inline_rows(
-        &self,
-        inline: &InlineSnapshot,
-    ) -> [(&'static str, &'static str, Samples<'_>); 7] {
-        use Samples::One;
-        // A table, as metric_rows's.
-        #[rustfmt::skip]
-        let rows = [
-            ("kino_inline_connections", "Connections served inline on the workers' threads now.",
-                One(inline.connections as u64)),
-            ("kino_inline_requests_total", "Requests served inline.", One(inline.requests)),
-            ("kino_inline_declined_total",
-                "Plain TCP and unix-socket connections left with hyper at accept, as no worker could take them (or none served yet).",
-                One(inline.declined)),
-            ("kino_inline_handbacks_total", "Inline connections handed back to hyper.",
-                One(inline.handbacks)),
-            ("kino_inline_closed_total", "Inline connections Kino cut off.",
-                One(inline.closed)),
-            ("kino_inline_spins_total",
-                "Spins of an inline connection alone on its worker for its next request, before its job waits on the socket.",
-                One(inline.spins)),
-            ("kino_worker_inline_connections",
-                "Connections each dispatch slot's worker serves inline now.",
-                self.per_worker(|w| w.inline_conns as u64)),
-        ];
-        rows
     }
 }
 
@@ -743,6 +736,22 @@ mod tests {
         &'static [(&'static str, u64)],
     );
 
+    /// That `text` has each series: a plain one's name, kind and sample, a labeled one's.
+    fn has_series(text: &str, plain: &[(&str, &str, u64)], labeled: &[Labeled]) {
+        let plain = plain
+            .iter()
+            .map(|(name, kind, value)| format!("# TYPE {name} {kind}\n{name} {value}\n"));
+        let labeled = labeled.iter().map(|(name, kind, label, values)| {
+            let sample =
+                |(at, value): &(&str, u64)| format!("{name}{{{label}=\"{at}\"}} {value}\n");
+            let samples: String = values.iter().map(sample).collect();
+            format!("# TYPE {name} {kind}\n{samples}")
+        });
+        for series in plain.chain(labeled) {
+            assert!(text.contains(&series), "expected\n{series}in:\n{text}");
+        }
+    }
+
     #[test]
     fn metrics_text_is_prometheus_shaped() {
         let text = snapshot().metrics();
@@ -768,10 +777,6 @@ mod tests {
             ("kino_websocket_received_bytes_total", "counter", 4096),
             ("kino_websocket_sent_bytes_total", "counter", 8192),
         ];
-        for (name, kind, value) in samples {
-            let series = format!("# TYPE {name} {kind}\n{name} {value}\n");
-            assert!(text.contains(&series), "expected\n{series}in:\n{text}");
-        }
         // One row per case; rustfmt would split each row field by field.
         #[rustfmt::skip]
         let labeled: [Labeled; 9] = [
@@ -790,13 +795,7 @@ mod tests {
             ("kino_worker_websockets_open", "gauge", "worker", &[("0", 2), ("1", 0)]),
             ("kino_worker_hijacked_connections", "gauge", "worker", &[("0", 0), ("1", 3)]),
         ];
-        for (name, kind, label, values) in labeled {
-            let samples = values
-                .iter()
-                .map(|(at, value)| format!("{name}{{{label}=\"{at}\"}} {value}\n"));
-            let series = format!("# TYPE {name} {kind}\n{}", samples.collect::<String>());
-            assert!(text.contains(&series), "expected\n{series}in:\n{text}");
-        }
+        has_series(&text, &samples, &labeled);
         // Cumulative: le=0.0025 holds buckets 0 to 2.
         let histogram = concat!(
             "# TYPE kino_request_queue_seconds histogram\n",
@@ -890,47 +889,35 @@ mod tests {
         }
     }
 
-    /// A server serving inline: 3 connections now, 10 requests served,
-    /// 2 connections declined, 4 handed back and 1 cut off; 7 spins
-    /// for a next request.
-    fn inline_snapshot() -> InlineSnapshot {
-        InlineSnapshot {
+    #[test]
+    fn inline_serving_is_reported_in_metrics_and_json_only_by_a_server_that_serves_inline() {
+        let mut s = snapshot();
+        s.worker_status[1].inline_conns = 2;
+        // 3 connections now, 10 requests served, 2 connections declined, 4 handed back and 1
+        // cut off; 7 spins for a next request.
+        s.inline = Some(InlineSnapshot {
             connections: 3,
             requests: 10,
             declined: 2,
             handbacks: 4,
             closed: 1,
             spins: 7,
-        }
-    }
-
-    #[test]
-    fn inline_serving_is_reported_in_metrics_and_json_only_by_a_server_that_serves_inline() {
-        let mut s = snapshot();
-        s.worker_status[1].inline_conns = 2;
-        s.inline = Some(inline_snapshot());
-        let text = s.metrics();
-        for (name, kind, value) in [
+        });
+        let plain = [
             ("kino_inline_connections", "gauge", 3),
             ("kino_inline_requests_total", "counter", 10),
             ("kino_inline_declined_total", "counter", 2),
             ("kino_inline_handbacks_total", "counter", 4),
             ("kino_inline_closed_total", "counter", 1),
             ("kino_inline_spins_total", "counter", 7),
-        ] {
-            let sample = format!("# TYPE {name} {kind}\n{name} {value}\n");
-            assert!(
-                text.contains(&sample),
-                "expected {name} as a {kind} of {value} in:\n{text}"
-            );
-        }
-        for sample in [
-            "# TYPE kino_worker_inline_connections gauge\n",
-            "kino_worker_inline_connections{worker=\"0\"} 0\n",
-            "kino_worker_inline_connections{worker=\"1\"} 2\n",
-        ] {
-            assert!(text.contains(sample), "expected {sample:?} in:\n{text}");
-        }
+        ];
+        let per_worker: Labeled = (
+            "kino_worker_inline_connections",
+            "gauge",
+            "worker",
+            &[("0", 0), ("1", 2)],
+        );
+        has_series(&s.metrics(), &plain, &[per_worker]);
         let json = s.json();
         let inline = concat!(
             r#""inline":{"connections":3,"requests":10,"declined":2,"handbacks":4,"#,

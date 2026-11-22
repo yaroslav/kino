@@ -5,7 +5,7 @@
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
 
-use super::{Item, Taken, TICK};
+use super::{recv_tick, Item, Taken, TICK};
 use crate::gvl::{self, Back, Parker};
 use crate::registry::{LaneItem, ServerInner};
 use crate::slot::{WorkerSlot, HOLDING_ITEM};
@@ -346,11 +346,7 @@ impl<'a> Taker<'a> {
         let retired = || life.seems_retired();
         let wait = || {
             if !retired() {
-                return match queue.recv_timeout(TICK) {
-                    Ok(ctx) => Some(Some(Item::Ctx(ctx))),
-                    Err(flume::RecvTimeoutError::Timeout) => None,
-                    Err(flume::RecvTimeoutError::Disconnected) => Some(None),
-                };
+                return recv_tick(queue).map(|ctx| ctx.map(Item::Ctx));
             }
             if queue.is_disconnected() {
                 return Some(None);

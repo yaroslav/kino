@@ -1,6 +1,6 @@
 //! The worker-side bridge: batched request intake and the fused
-//! respond-and-take call. This is where FFI crossings per request went
-//! from three in early designs (take, env, respond) to amortized ~one.
+//! respond-and-take call, which make a request's take, env and answer
+//! about one FFI crossing.
 //!
 //! Blocking discipline (everywhere in this crate): bounded `recv_timeout`
 //! ticks + an AtomicBool interrupt flag. No flume::Selector: it loses
@@ -41,3 +41,14 @@ pub enum Item {
 /// None = shutdown (queue closed, or slot halted past the deadline); the caller can't tell
 /// the difference and doesn't need to.
 pub(crate) type Taken = Option<Item>;
+
+/// One bounded wait on `rx`, as a park's attempt reports it: None to wait on, Some(None) once
+/// the channel is closed and empty.
+#[inline]
+pub(crate) fn recv_tick<T>(rx: &flume::Receiver<T>) -> Option<Option<T>> {
+    match rx.recv_timeout(TICK) {
+        Ok(found) => Some(Some(found)),
+        Err(flume::RecvTimeoutError::Timeout) => None,
+        Err(flume::RecvTimeoutError::Disconnected) => Some(None),
+    }
+}

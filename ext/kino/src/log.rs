@@ -94,59 +94,24 @@ pub fn log_line(ruby: &Ruby, level: String, source: String, message: String) -> 
 
 #[cfg(test)]
 mod tests {
-    use super::{format_line, label, Level};
+    use super::{format_line, Level};
 
-    #[test]
-    fn label_is_a_syslog_tag_plus_the_source() {
-        assert_eq!(label(4213, "main"), "kino[4213] main:");
-        assert_eq!(
-            label(4213, "worker-3/thread-2"),
-            "kino[4213] worker-3/thread-2:"
-        );
-    }
-
-    #[test]
-    fn plain_line_is_label_then_message() {
-        assert_eq!(
-            format_line(Level::Info, "kino[1] main:", "hello", false),
-            "kino[1] main: hello"
-        );
-    }
-
+    // The label, a plain line and a report's, each on its level's stream: spec/log_spec.rb, which
+    // sees no color.
     #[test]
     fn color_styles_only_the_label_by_level() {
-        assert_eq!(
-            format_line(Level::Info, "kino[1] main:", "hello", true),
-            "\x1b[90mkino[1] main:\x1b[0m hello"
-        );
-        assert_eq!(
-            format_line(Level::Warn, "kino[1] main:", "careful", true),
-            "\x1b[33mkino[1] main:\x1b[0m careful"
-        );
-        assert_eq!(
-            format_line(Level::Error, "kino[1] main:", "broke", true),
-            "\x1b[91mkino[1] main:\x1b[0m broke"
-        );
+        let rows = [
+            (Level::Info, "\x1b[90mkino[1] main:\x1b[0m hello"),
+            (Level::Warn, "\x1b[33mkino[1] main:\x1b[0m hello"),
+            (Level::Error, "\x1b[91mkino[1] main:\x1b[0m hello"),
+        ];
+        for (level, line) in rows {
+            assert_eq!(format_line(level, "kino[1] main:", "hello", true), line);
+        }
     }
 
     #[test]
-    fn a_report_is_labelled_on_its_first_line_only() {
-        assert_eq!(
-            format_line(
-                Level::Error,
-                "kino[1] main:",
-                "500 GET / · X: y\n    a.rb:1",
-                false
-            ),
-            "kino[1] main: 500 GET / · X: y\n    a.rb:1"
-        );
-    }
-
-    #[test]
-    fn levels_parse_from_their_ruby_names() {
-        assert_eq!(Level::parse("info"), Some(Level::Info));
-        assert_eq!(Level::parse("warn"), Some(Level::Warn));
-        assert_eq!(Level::parse("error"), Some(Level::Error));
+    fn a_level_kino_log_never_names_is_refused() {
         assert_eq!(Level::parse("debug"), None);
     }
 }

@@ -69,7 +69,7 @@ pub fn rings(fd: std::os::fd::RawFd) -> usize {
 /// Slot `index` and the handle its worker holds from boot on, as
 /// Kino::Native.worker makes it.
 pub fn boot(server: &Arc<ServerInner>, index: usize) -> (Arc<WorkerSlot>, Worker) {
-    let slot = server.slots.read()[index].clone();
+    let slot = crate::testing::slot(server, index);
     let worker = Worker::new(server, index, slot.clone());
     (slot, worker)
 }
@@ -99,8 +99,8 @@ pub fn take_admitted(server: &ServerInner, slot: &Arc<WorkerSlot>) -> BoxedCtx {
     admitted(server, slot, Taker::new(server, slot).ready())
 }
 
-/// The request a take that does not park found, admitted by `slot`.
-fn admitted(server: &ServerInner, slot: &Arc<WorkerSlot>, took: Take) -> BoxedCtx {
+/// The request a take found, admitted by `slot`.
+pub fn admitted(server: &ServerInner, slot: &Arc<WorkerSlot>, took: Take) -> BoxedCtx {
     let mut ctx = expect_request(took);
     enlist(server, slot, &mut ctx);
     ctx

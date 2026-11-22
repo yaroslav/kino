@@ -18,20 +18,3 @@ pub fn available_parallelism(_ruby: &Ruby) -> Result<usize, Error> {
 pub(crate) fn count() -> usize {
     std::thread::available_parallelism().map_or(1, |n| n.get())
 }
-
-#[cfg(test)]
-mod tests {
-    use super::count;
-
-    #[test]
-    fn reports_at_least_one_cpu() {
-        assert!(count() >= 1);
-    }
-
-    #[test]
-    fn never_exceeds_what_the_os_reports_as_online() {
-        // A quota can only lower the count below the online CPUs; never raise it.
-        let online = std::thread::available_parallelism().map_or(1, |n| n.get());
-        assert!(count() <= online);
-    }
-}

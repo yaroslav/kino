@@ -343,25 +343,14 @@ fn block_on<T>(
     )
 }
 
+fn runtime_error(ruby: &Ruby, message: impl Into<std::borrow::Cow<'static, str>>) -> Error {
+    Error::new(ruby.exception_runtime_error(), message)
+}
+
+const INTERRUPTED: &str = "Kino: request interrupted during shutdown";
+
 fn interrupted_error(ruby: &Ruby) -> Error {
-    Error::new(
-        ruby.exception_runtime_error(),
-        "Kino: request interrupted during shutdown",
-    )
-}
-
-fn body_too_large_error(ruby: &Ruby) -> Error {
-    Error::new(
-        ruby.exception_runtime_error(),
-        "Kino: request body exceeded max_body_size",
-    )
-}
-
-fn body_timeout_error(ruby: &Ruby) -> Error {
-    Error::new(
-        ruby.exception_runtime_error(),
-        "Kino: request body read timed out",
-    )
+    runtime_error(ruby, INTERRUPTED)
 }
 
 /// A write nothing reaches any more (hyper dropped the body, or Kino gave the stream
@@ -382,7 +371,7 @@ pub(crate) const BUSY: &str =
     "another of the app's threads is waiting on this request (reading its body or writing its response)";
 
 fn busy_error(ruby: &Ruby) -> Error {
-    Error::new(ruby.exception_runtime_error(), format!("Kino: {BUSY}"))
+    runtime_error(ruby, format!("Kino: {BUSY}"))
 }
 
 /// ClientGone once Kino gave the stream up, else it was never started or is already finished.
@@ -390,8 +379,8 @@ fn stream_closed_error(ruby: &Ruby, responder: &Responder) -> Error {
     if responder.stream_cut() {
         return client_gone_error(ruby);
     }
-    Error::new(
-        ruby.exception_runtime_error(),
+    runtime_error(
+        ruby,
         "Kino: response stream not started or already finished",
     )
 }
@@ -413,10 +402,7 @@ fn wait_error(ruby: &Ruby, responder: &Responder, error: WaitError) -> Error {
 }
 
 fn invalid_response(ruby: &Ruby, e: impl std::fmt::Display) -> Error {
-    Error::new(
-        ruby.exception_runtime_error(),
-        format!("invalid response: {e}"),
-    )
+    runtime_error(ruby, format!("invalid response: {e}"))
 }
 
 /// Kino::Native::Request, wrapped in typed_data.rs, whose promise its drop keeps: RequestCtx's
@@ -556,44 +542,31 @@ fn set_headers_env(ruby: &Ruby, env: RHash, s: &EnvStrings, ctx: &RequestCtx) ->
 /// address.
 #[inline(always)]
 fn set_server_env(ruby: &Ruby, env: RHash, ctx: &RequestCtx) -> Result<(), Error> {
+    let local_port = ctx.peer.local.port();
     if let Some(authority) = ctx.uri.authority() {
-        let local_port = ctx.peer.local.port();
         let port = authority.port_u16();
         let key = host_key(authority.as_str().as_bytes(), port.is_some(), local_port);
-        env_strings::set_authority_env(ruby, env, &key, authority.as_str(), || {
+        return env_strings::set_authority_env(ruby, env, &key, authority.as_str(), || {
             (authority.host().to_string(), port.unwrap_or(local_port))
-        })?;
-    } else {
-        match ctx.headers.get(http::header::HOST) {
-            Some(host) => {
-                let local_port = ctx.peer.local.port();
-                let names_port = std::str::from_utf8(host.as_bytes())
-                    .ok()
-                    .and_then(named_port)
-                    .is_some();
-                env_strings::set_host_env(
-                    ruby,
-                    env,
-                    &host_key(host.as_bytes(), names_port, local_port),
-                    || match std::str::from_utf8(host.as_bytes()) {
-                        Ok(h) => split_host_port(h, local_port),
-                        Err(_) => (
-                            String::from_utf8_lossy(host.as_bytes()).into_owned(),
-                            local_port,
-                        ),
-                    },
-                )?;
-            }
-            None => {
-                let ip = ctx.peer.local.ip();
-                let port = ctx.peer.local.port();
-                env_strings::set_host_env(ruby, env, format!("\0{ip}:{port}").as_bytes(), || {
-                    (ip.to_string(), port)
-                })?;
-            }
+        });
+    }
+    match ctx.headers.get(http::header::HOST) {
+        Some(host) => {
+            let (bytes, text) = (host.as_bytes(), std::str::from_utf8(host.as_bytes()));
+            let names_port = text.is_ok_and(|text| named_port(text).is_some());
+            env_strings::set_host_env(ruby, env, &host_key(bytes, names_port, local_port), || {
+                match text {
+                    Ok(text) => split_host_port(text, local_port),
+                    Err(_) => (String::from_utf8_lossy(bytes).into_owned(), local_port),
+                }
+            })
+        }
+        None => {
+            let ip = ctx.peer.local.ip();
+            let key = format!("\0{ip}:{local_port}");
+            env_strings::set_host_env(ruby, env, key.as_bytes(), || (ip.to_string(), local_port))
         }
     }
-    Ok(())
 }
 
 /// Bodyless requests carry no channel at all; a present channel that is
@@ -612,12 +585,13 @@ fn body_possible(ctx: &RequestCtx) -> bool {
 /// abandoned the body (too large, or the client stalled).
 fn body_ended(ruby: &Ruby, ctx: &RequestCtx) -> Result<(), Error> {
     use crate::response::BodyAbandon;
-    match ctx.responder.body_abandoned() {
-        Some(BodyAbandon::Oversize) => Err(body_too_large_error(ruby)),
-        Some(BodyAbandon::TimedOut) => Err(body_timeout_error(ruby)),
-        Some(BodyAbandon::Interrupted) => Err(interrupted_error(ruby)),
-        None => Ok(()),
-    }
+    let why = match ctx.responder.body_abandoned() {
+        None => return Ok(()),
+        Some(BodyAbandon::Oversize) => "Kino: request body exceeded max_body_size",
+        Some(BodyAbandon::TimedOut) => "Kino: request body read timed out",
+        Some(BodyAbandon::Interrupted) => INTERRUPTED,
+    };
+    Err(runtime_error(ruby, why))
 }
 
 /// `chunk`, up to `max_len` bytes (the rest waits in leftover), topped up with what arrived.
@@ -668,7 +642,7 @@ pub fn respond_simple(
     request.decline_upgrade();
     let ctx = request.0.borrow();
     if let Some(io) = &ctx.inline {
-        let head = inline_head(ruby, status, headers)?;
+        let head = head_parts(ruby, status, headers)?;
         // No copy: the GVL is held until the write returns, which copies what the socket leaves.
         // SAFETY: `body` is an RString on this frame's stack (the GC neither frees nor moves it),
         // and no Ruby runs nor is the GVL released before the slice's last use, in respond.
@@ -733,11 +707,9 @@ impl Request {
         headers: RHash,
         on_shutdown: bool,
     ) -> Result<magnus::Value, Error> {
-        let head = build_head(101, headers)?
-            .body(())
-            .map_err(|e| invalid_response(ruby, e))?;
+        let head = head_parts(ruby, 101, headers)?;
         let extra: Vec<_> = head
-            .headers()
+            .headers
             .iter()
             .map(|(name, value)| (name.clone(), value.clone()))
             .collect();
@@ -822,14 +794,7 @@ impl Request {
                 let Some(body_rx) = ctx.body_rx.clone() else {
                     return Ok(None); // bodyless request: EOF from the start
                 };
-                let outcome = block_on(&ctx.slot, || {
-                    match body_rx.recv_timeout(crate::queue::TICK) {
-                        Ok(bytes) => Some(Some(bytes)),
-                        Err(flume::RecvTimeoutError::Timeout) => None,
-                        Err(flume::RecvTimeoutError::Disconnected) => Some(None),
-                    }
-                })?;
-                match outcome {
+                match block_on(&ctx.slot, || crate::queue::recv_tick(&body_rx))? {
                     Some(Some(bytes)) => bytes,
                     Some(None) => return body_ended(ruby, &ctx).map(|()| None),
                     None => return Err(interrupted_error(ruby)),
@@ -875,7 +840,7 @@ impl Request {
         rb_self.decline_upgrade();
         let ctx = rb_self.0.borrow();
         if let Some(io) = &ctx.inline {
-            let head = inline_head(ruby, status, headers)?;
+            let head = head_parts(ruby, status, headers)?;
             return Ok(io.start_stream(&ctx.responder, head.status, &head.headers));
         }
         let builder = timed(&ctx, build_head(status, headers)?);
@@ -941,26 +906,20 @@ impl Request {
         rb_self: &Request,
         chunk: RString,
     ) -> Result<Value, Error> {
-        {
-            let ctx = rb_self.0.borrow();
-            if let Some(io) = &ctx.inline {
-                return Ok(match write_inline(ruby, &ctx, io, chunk)? {
-                    Step::Done(()) => ruby.qtrue().as_value(),
-                    Step::Wait(fd) => ruby
-                        .ary_new_from_values(&[
-                            crate::symbols::get().writable.value(),
-                            ruby.into_value(fd),
-                        ])
-                        .as_value(),
-                });
-            }
+        let ctx = rb_self.0.borrow();
+        if let Some(io) = &ctx.inline {
+            return Ok(match write_inline(ruby, &ctx, io, chunk)? {
+                Step::Done(()) => ruby.qtrue().as_value(),
+                Step::Wait(fd) => {
+                    let writable = crate::symbols::get().writable.value();
+                    let wait = ruby.ary_new_from_values(&[writable, ruby.into_value(fd)]);
+                    wait.as_value()
+                }
+            });
         }
-        let step = rb_self
-            .0
-            .borrow()
-            .write_nonblock(|pin_slab| body_bytes(pin_slab, chunk));
+        let step = ctx.write_nonblock(|pin_slab| body_bytes(pin_slab, chunk));
         Ok(
-            match step.map_err(|e| wait_error(ruby, &rb_self.0.borrow().responder, e))? {
+            match step.map_err(|e| wait_error(ruby, &ctx.responder, e))? {
                 Step::Done(()) => ruby.qtrue().as_value(),
                 Step::Wait(fd) => ruby.into_value(fd),
             },
@@ -1006,9 +965,10 @@ impl Request {
     }
 }
 
-/// The status and headers an inline answer is encoded from (inline/encode.rs).
+/// A head's status and headers alone: what an inline answer is encoded from (inline/encode.rs),
+/// and what a handshake's 101 adds to Kino's own.
 #[inline]
-fn inline_head(ruby: &Ruby, status: u16, headers: RHash) -> Result<http::response::Parts, Error> {
+fn head_parts(ruby: &Ruby, status: u16, headers: RHash) -> Result<http::response::Parts, Error> {
     let response = build_head(status, headers)?.body(());
     Ok(response
         .map_err(|e| invalid_response(ruby, e))?
@@ -1125,13 +1085,9 @@ pub fn test_ctx_with_client() -> (
 ) {
     let (head_tx, head_rx) = tokio::sync::oneshot::channel();
     let (parts, ()) = http::Request::new(()).into_parts();
-    let peer = Peer {
-        remote: "127.0.0.1:40000".parse().expect("static addr"),
-        local: "127.0.0.1:9292".parse().expect("static addr"),
-    };
     let server = crate::testing::TestServer::shared_queue().build();
     let responder = Arc::new(Responder::new(head_tx));
-    let ctx = RequestCtx::new(parts, peer, &server, responder, None, None);
+    let ctx = RequestCtx::new(parts, crate::testing::PEER, &server, responder, None, None);
     (ctx, head_rx)
 }
 
@@ -1140,32 +1096,21 @@ mod tests {
     use super::*;
 
     #[test]
-    fn host_port_split() {
-        assert_eq!(
-            split_host_port("example.com:8080", 80),
-            ("example.com".into(), 8080)
-        );
-        assert_eq!(
-            split_host_port("example.com", 80),
-            ("example.com".into(), 80)
-        );
-    }
-
-    #[test]
-    fn host_port_split_edge_cases() {
-        // Bracketed IPv6 (the RFC-correct Host form) keeps the brackets.
-        assert_eq!(split_host_port("[::1]:8080", 80), ("[::1]".into(), 8080));
-        // Out-of-range or non-numeric port: whole input + default port.
-        assert_eq!(
-            split_host_port("example.com:99999", 80),
-            ("example.com:99999".into(), 80)
-        );
-        assert_eq!(
-            split_host_port("example.com:", 80),
-            ("example.com:".into(), 80)
-        );
-        // Empty name (":8080") falls back whole.
-        assert_eq!(split_host_port(":8080", 80), (":8080".into(), 80));
+    fn a_host_splits_into_its_name_and_port_else_stays_whole_with_the_default_port() {
+        let rows = [
+            ("example.com:8080", "example.com", 8080),
+            ("example.com", "example.com", 80),
+            // Bracketed IPv6 (the RFC-correct Host form) keeps the brackets.
+            ("[::1]:8080", "[::1]", 8080),
+            // An out-of-range or missing port, or an empty name: whole.
+            ("example.com:99999", "example.com:99999", 80),
+            ("example.com:", "example.com:", 80),
+            (":8080", ":8080", 80),
+        ];
+        for (host, name, port) in rows {
+            let split = split_host_port(host, 80);
+            assert_eq!(split, (name.to_string(), port), "{host}");
+        }
     }
 
     #[test]

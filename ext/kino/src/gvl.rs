@@ -109,12 +109,6 @@ fn panic_error(payload: Box<dyn Any + Send>) -> Error {
     )
 }
 
-fn check_ints() -> Result<(), Error> {
-    Ruby::get()
-        .expect("a release runs on a Ruby thread")
-        .thread_check_ints()
-}
-
 /// Run `f` with the GVL released. Blocks the current Ruby thread but lets
 /// every other Ruby thread (in this ractor) run in parallel.
 /// Pending interrupts run before and after `f` in protected calls: a raise comes back as Err.
@@ -173,26 +167,6 @@ pub fn pass() -> Result<(), Error> {
     Ok(())
 }
 
-/// Release the GVL and run `attempt` until it returns Some, or Ok(None) once `flag` rises; Err
-/// when `attempt` panicked or a pending VM interrupt raised (released). Only the test natives use
-/// this: what Ruby can interrupt mid-request parks.
-pub fn interruptible<T>(
-    flag: &AtomicBool,
-    mut attempt: impl FnMut() -> Option<T>,
-) -> Result<Option<T>, Error> {
-    released(
-        || loop {
-            if flag.load(Ordering::SeqCst) {
-                return None;
-            }
-            if let Some(result) = attempt() {
-                return Some(result);
-            }
-        },
-        Some(flag),
-    )
-}
-
 /// How a worker's thread waits: Released, or in place in tests (no VM).
 pub(crate) trait Parker {
     type Error;
@@ -227,7 +201,9 @@ impl Parker for Released {
     }
 
     fn check_ints(&mut self) -> Result<(), Error> {
-        check_ints()
+        Ruby::get()
+            .expect("a release runs on a Ruby thread")
+            .thread_check_ints()
     }
 }
 
@@ -246,7 +222,7 @@ pub(crate) fn park<T, P: Parker>(
     let woken = AtomicBool::new(false);
     loop {
         // `woken` is read only once an attempt waited a tick: one that finds something at once
-        // costs what it did under interruptible.
+        // pays no load for it.
         let mut wait = || loop {
             if stop.load(Ordering::SeqCst) {
                 return None;
@@ -300,15 +276,6 @@ mod tests {
 
     use super::released_by;
     use crate::testing::InPlace;
-
-    #[test]
-    fn ubf_sets_the_interrupt_flag() {
-        let flag = AtomicBool::new(false);
-        let ubf = super::Ubf::interrupt(&flag);
-        // SAFETY: as the VM calls it, while the flag is borrowed.
-        unsafe { (ubf.func)(ubf.data) };
-        assert!(flag.load(Ordering::SeqCst));
-    }
 
     /// The VM's pending interrupts, as the test sets them: none, a wake
     /// (Thread#wakeup, which only ends the wait), or a raise.

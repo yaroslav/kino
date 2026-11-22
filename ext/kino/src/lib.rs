@@ -108,6 +108,19 @@ fn init(ruby: &Ruby) -> Result<(), Error> {
         "log_device_close" => logsink::device_close, 1;
         "register_defaults" => env_strings::register_defaults, 2;
         "pin_keeper" => server::pin_keeper, 1;
+        "ws_write" => ws::ws_write, 2;
+        "ws_write_binary" => ws::ws_write_binary, 2;
+        "ws_write_raw" => ws::ws_write_raw, 2;
+        "ws_close" => ws::ws_close, 2;
+        "ws_abort" => ws::abort, 1;
+        "ws_fail" => ws::fail, 1;
+        "ws_handled" => ws::handled, 1;
+        "ws_shutdown_ran" => ws::shutdown_ran, 1;
+        "ws_pending" => ws::pending, 1;
+        "ws_registered" => ws::registered, 1;
+        "ws_subscribe" => ws::topics::ws_subscribe, 5;
+        "ws_unsubscribe" => ws::topics::ws_unsubscribe, 3;
+        "ws_publish" => ws::topics::ws_publish, 3;
     );
 
     let worker = native.define_class("Worker", ruby.class_object())?;
@@ -130,9 +143,11 @@ fn init(ruby: &Ruby) -> Result<(), Error> {
     worker.define_method("take_woken", method!(queue::Worker::take_woken, -1))?;
 
     let conn = native.define_class("Conn", ruby.class_object())?;
-    conn.define_method("fd", method!(inline::ConnHandle::fd, 0))?;
-    conn.define_method("next_request", method!(inline::ConnHandle::next_request, 1))?;
-    conn.define_method("close", method!(inline::ConnHandle::close, 0))?;
+    methods!(conn:
+        "fd" => inline::ConnHandle::fd, 0;
+        "next_request" => inline::ConnHandle::next_request, 1;
+        "close" => inline::ConnHandle::close, 0;
+    );
 
     let request = native.define_class("Request", ruby.class_object())?;
     methods!(request:
@@ -156,21 +171,6 @@ fn init(ruby: &Ruby) -> Result<(), Error> {
         "hijack" => Request::hijack, 0;
         "hijack_switched" => Request::hijack_switched, 1;
         "hijacked?" => Request::hijacked, 0;
-    );
-    functions!(native:
-        "ws_write" => ws::ws_write, 2;
-        "ws_write_binary" => ws::ws_write_binary, 2;
-        "ws_write_raw" => ws::ws_write_raw, 2;
-        "ws_close" => ws::ws_close, 2;
-        "ws_abort" => ws::abort, 1;
-        "ws_fail" => ws::fail, 1;
-        "ws_handled" => ws::handled, 1;
-        "ws_shutdown_ran" => ws::shutdown_ran, 1;
-        "ws_pending" => ws::pending, 1;
-        "ws_registered" => ws::registered, 1;
-        "ws_subscribe" => ws::topics::ws_subscribe, 5;
-        "ws_unsubscribe" => ws::topics::ws_unsubscribe, 3;
-        "ws_publish" => ws::topics::ws_publish, 3;
     );
 
     typed_data::resolve_classes(ruby);

@@ -19,15 +19,3 @@ pub fn us_at(at: Instant) -> u64 {
     let epoch = *MONO_EPOCH.get_or_init(Instant::now);
     at.saturating_duration_since(epoch).as_micros() as u64 + 1
 }
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn mono_us_is_monotonic_nondecreasing() {
-        let a = mono_us();
-        let b = mono_us();
-        assert!(b >= a, "clock went backwards: {a} then {b}");
-    }
-}

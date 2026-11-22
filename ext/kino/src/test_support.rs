@@ -1,5 +1,5 @@
-//! Test-only natives proving the Phase 0 primitives: blocking channel takes
-//! under `released`, UBF interruptibility, and ractor-safe method calls.
+//! Test-only natives for the specs of the crate's primitives: blocking channel takes with the
+//! GVL released, a panic in a release, and the env caches under parallel Ractors.
 //! Exposed as `Kino::Native::_test_*`; not part of the public API.
 
 use std::collections::HashMap;
@@ -65,14 +65,20 @@ pub fn take(ruby: &magnus::Ruby, id: u64) -> Result<Option<String>, magnus::Erro
     let chan = lookup(ruby, id)?;
     chan.interrupted.store(false, Ordering::SeqCst);
 
-    let taken = gvl::interruptible(&chan.interrupted, || {
-        match chan.rx.recv_timeout(crate::queue::TICK) {
-            Ok(v) => Some(Some(v)),
-            Err(flume::RecvTimeoutError::Timeout) => None,
-            Err(flume::RecvTimeoutError::Disconnected) => Some(None),
-        }
-    })?;
-    Ok(taken.flatten())
+    // One tick at a time, until the channel yields or closes, or the VM's unblock function
+    // raises the flag.
+    let taken = gvl::released(
+        || loop {
+            if chan.interrupted.load(Ordering::SeqCst) {
+                return None;
+            }
+            if let Some(taken) = crate::queue::recv_tick(&chan.rx) {
+                return taken;
+            }
+        },
+        Some(&chan.interrupted),
+    )?;
+    Ok(taken)
 }
 
 /// Panic inside a GVL-released block: proves it surfaces as a Ruby

@@ -559,11 +559,11 @@ pub fn plain_response(status: u16, message: &'static str) -> HyperResponse {
 mod tests {
     use super::*;
 
-    fn pair() -> (
-        Arc<Responder>,
-        tokio::sync::oneshot::Receiver<HyperResponse>,
-    ) {
-        let (head_tx, head_rx) = tokio::sync::oneshot::channel();
+    /// A responder, and hyper's end of its head.
+    type Pair = (Arc<Responder>, oneshot::Receiver<HyperResponse>);
+
+    fn pair() -> Pair {
+        let (head_tx, head_rx) = oneshot::channel();
         (Arc::new(Responder::new(head_tx)), head_rx)
     }
 
@@ -579,10 +579,7 @@ mod tests {
     }
 
     /// A response whose stream has started.
-    fn streaming() -> (
-        Arc<Responder>,
-        tokio::sync::oneshot::Receiver<HyperResponse>,
-    ) {
+    fn streaming() -> Pair {
         let (responder, head_rx) = pair();
         assert!(responder
             .send_stream_head(hyper::Response::builder().status(200))
@@ -669,7 +666,7 @@ mod tests {
         drop(bridge);
 
         let (handshake, mut head_rx) = pair();
-        let (switched, mut told) = tokio::sync::oneshot::channel();
+        let (switched, mut told) = oneshot::channel();
         handshake.hold_for_switch(switched, plain_response(101, ""));
         handshake.let_go();
         assert!(
@@ -679,7 +676,7 @@ mod tests {
         let held = told.try_recv();
         assert_eq!(
             held,
-            Err(tokio::sync::oneshot::error::TryRecvError::Empty),
+            Err(oneshot::error::TryRecvError::Empty),
             "the 101 is held"
         );
     }
