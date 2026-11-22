@@ -36,15 +36,6 @@ RSpec.describe "graceful shutdown" do
     end
   end
 
-  # A drain starts by closing the listener: the socket file stays until
-  # the runtime is gone, but nothing accepts on it.
-  def refuses_connections?(sock)
-    UNIXSocket.open(sock).close
-    false
-  rescue Errno::ECONNREFUSED, Errno::ENOENT
-    true
-  end
-
   # A GET over the unix socket, from a thread whose value is the status
   # line, or nil when the connection closes without one.
   def request_in_background(dir)

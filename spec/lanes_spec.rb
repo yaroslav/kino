@@ -104,15 +104,6 @@ RSpec.describe "lane dispatch" do
     end
   end
 
-  # A drain starts by closing the listener; a connection caught in its
-  # backlog as it closes is reset.
-  def refuses_connections?(port)
-    TCPSocket.new("127.0.0.1", port).close
-    false
-  rescue Errno::ECONNREFUSED, Errno::ECONNRESET
-    true
-  end
-
   # One worker held by a request, 4 more in its lane and 2 waiting for
   # room when the shutdown starts; then the worker is let go. A
   # worker_loop serves nothing inline here, as this is lane dispatch.

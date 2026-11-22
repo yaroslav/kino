@@ -130,11 +130,7 @@ RSpec.describe "streaming bodies" do
 
   # Asks for `path`, then never reads; a small receive buffer fills fast.
   def stalled_client(port, path, method = "GET", headers = "")
-    socket = Socket.new(:INET, :STREAM)
-    socket.setsockopt(:SOCKET, :RCVBUF, 4096)
-    socket.connect(Socket.sockaddr_in(port, "127.0.0.1"))
-    socket.write(request(path, method, headers))
-    socket
+    narrow_connection(port, receive_buffer: 4096).tap { |socket| socket.write(request(path, method, headers)) }
   end
 
   # Reports up to and including the request's completion, or its error.

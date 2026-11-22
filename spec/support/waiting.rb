@@ -2,7 +2,7 @@
 
 # Polling for specs that wait on the server or another thread.
 module Waiting
-  def monotonic = Process.clock_gettime(Process::CLOCK_MONOTONIC)
+  def monotonic = Kino.monotonic
 
   # How long the block took, in seconds. Not for handlers that run in worker
   # ractors, which need no spec helpers.

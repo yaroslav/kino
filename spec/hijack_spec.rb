@@ -98,8 +98,7 @@ RSpec.describe "rack.hijack" do
       # Answers a WebSocket handshake with a 101 and, as `kind`, a callable
       # that echoes one frame and closes the connection.
       app = Ractor.shareable_proc do |env|
-        accept = [Digest::SHA1.digest(env["HTTP_SEC_WEBSOCKET_KEY"] + WsClient::GUID)].pack("m0")
-        headers = {"upgrade" => "websocket", "connection" => "Upgrade", "sec-websocket-accept" => accept}
+        headers = HijackedEcho.accept_headers(env)
         echo = lambda do |io|
           opcode, payload = HijackedEcho.read_frame(io)
           io.write(WsClient.frame(opcode, payload, mask: false))
@@ -188,7 +187,7 @@ RSpec.describe "rack.hijack" do
       with_hijack_server(app, **mode) do |port|
         upgrade = get_upgrade(port).body
         http11 = http_get(port, "/").body
-        http10 = exchange(port, "GET / HTTP/1.0\r\n#{upgrade_headers}\r\n").split("\r\n\r\n", 2).last
+        http10 = response_body_of(exchange(port, "GET / HTTP/1.0\r\n#{upgrade_headers}\r\n"))
         h2 = HTTPX.with(fallback_protocol: "h2").get("http://127.0.0.1:#{port}/")
 
         expect(upgrade).to eq("rack.hijack?,rack.hijack"), "#{mode}: an Upgrade request"
@@ -372,8 +371,7 @@ RSpec.describe "rack.hijack" do
       # and serves the connection on its worker: reads until the connection
       # ends, reporting :switched before and :ended after.
       app = Ractor.shareable_proc do |env|
-        accept = [Digest::SHA1.digest(env["HTTP_SEC_WEBSOCKET_KEY"] + WsClient::GUID)].pack("m0")
-        headers = {"upgrade" => "websocket", "connection" => "Upgrade", "sec-websocket-accept" => accept}
+        headers = HijackedEcho.accept_headers(env)
         serve = lambda do |io|
           reported << :switched
           io.read

@@ -54,14 +54,17 @@ module ServerHelper
     http.start { |session| session.get(path) }
   end
 
-  # The worker_loop that a kino.rb holding `code` sets.
-  def worker_loop_from(code)
+  # The Kino::Configuration that a kino.rb holding `code` loads.
+  def config_from(code)
     Dir.mktmpdir("kino-config") do |dir|
       path = File.join(dir, "kino.rb")
       File.write(path, code)
-      Kino::Configuration.new.load_file(path)[:worker_loop]
+      Kino::Configuration.new.load_file(path)
     end
   end
+
+  # The worker_loop that a kino.rb holding `code` sets.
+  def worker_loop_from(code) = config_from(code)[:worker_loop]
 
   # The job-fiber recipe in doc/worker-loop.md: its ruby block that calls scheduler.resume(,
   # loaded as a kino.rb.
@@ -112,6 +115,16 @@ module ServerHelper
     end
   end
 
+  # Whether a new connection to `target` (a port, or a unix socket's path) is refused. A drain
+  # starts by closing the listener: a connection caught in its backlog as it closes is reset, and
+  # a unix socket's file stays until the runtime is gone, with nothing accepting on it.
+  def refuses_connections?(target)
+    client_socket(target).close
+    false
+  rescue Errno::ECONNREFUSED, Errno::ECONNRESET, Errno::ENOENT
+    true
+  end
+
   # Write `bytes` on a new connection to `target` (a port, or a unix socket's path), then read
   # until the server closes it, or until `wait` seconds pass with nothing new.
   def raw_exchange(target, bytes, wait: 1.0)
@@ -153,6 +166,9 @@ module ServerHelper
     raise "no complete response within #{within} s"
   end
 
+  # The body of an HTTP/1.1 response read to the end.
+  def response_body_of(response) = response.split("\r\n\r\n", 2).last
+
   # How many descriptors this process has open, a server in it included.
   def open_fds = Dir.children("/dev/fd").size
 
@@ -168,6 +184,9 @@ module ServerHelper
 
   # The native id of `server`, which the natives and Kino::WorkerRow take.
   def server_id(server) = server.instance_variable_get(:@id)
+
+  # The worker pool of `server`, for what only the pool can be asked or told.
+  def pool_of(server) = server.instance_variable_get(:@pool)
 
   # Retire the worker on dispatch `slot` natively, as the pool scaler
   # would, whatever the pool thinks: what a worker meets when a retirement

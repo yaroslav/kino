@@ -1,7 +1,6 @@
 # frozen_string_literal: true
 
 require "json"
-require "tmpdir"
 
 RSpec.describe "elastic pool" do
   let(:ok_app) { ->(_env) { [200, {"content-type" => "text/plain"}, ["ok"]] } }
@@ -21,14 +20,10 @@ RSpec.describe "elastic pool" do
 
   describe "configuration" do
     it "loads max_workers and scale_down_after from the DSL" do
-      Dir.mktmpdir do |dir|
-        path = File.join(dir, "kino.rb")
-        File.write(path, "workers 2\nmax_workers 8\nscale_down_after 10\n")
-        config = Kino::Configuration.new.load_file(path)
+      config = config_from("workers 2\nmax_workers 8\nscale_down_after 10\n")
 
-        expect(config[:max_workers]).to eq(8)
-        expect(config[:scale_down_after]).to eq(10)
-      end
+      expect(config[:max_workers]).to eq(8)
+      expect(config[:scale_down_after]).to eq(10)
     end
 
     it "defaults to a fixed pool" do

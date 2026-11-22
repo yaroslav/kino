@@ -42,7 +42,7 @@ end
 # the subscribe took and the longest that thread stood still, both in
 # ms.
 module FanOutSocket
-  def self.now = Process.clock_gettime(Process::CLOCK_MONOTONIC)
+  def self.now = Kino.monotonic
 
   def self.on_message(ws, data)
     command, count = data.split

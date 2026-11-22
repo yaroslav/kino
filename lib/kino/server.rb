@@ -357,8 +357,8 @@ module Kino
     def configure_limits(settings)
       # 0 would hand requests only to a worker already waiting, and 503 the rest.
       @queue_depth = positive_integer(settings[:queue_depth], :queue_depth)
-      @queue_timeout_ms = (Float(settings[:queue_timeout]) * 1000).round
-      @request_timeout_ms = settings[:request_timeout] ? (Float(settings[:request_timeout]) * 1000).round : 0
+      @queue_timeout_ms = whole_ms(settings[:queue_timeout])
+      @request_timeout_ms = settings[:request_timeout] ? whole_ms(settings[:request_timeout]) : 0
       @max_connections = settings[:max_connections] ? Integer(settings[:max_connections]) : default_max_connections
       @max_body_size = Integer(settings[:max_body_size] || 0)
       @batch = [Integer(settings[:batch]), 1].max
@@ -394,7 +394,7 @@ module Kino
     end
 
     def configure_quarantine(settings)
-      @quarantine_timeout_ms = settings[:quarantine_timeout] ? (Float(settings[:quarantine_timeout]) * 1000).round : nil
+      @quarantine_timeout_ms = settings[:quarantine_timeout] && whole_ms(settings[:quarantine_timeout])
       @quarantine_max =
         if settings[:quarantine_max]
           Integer(settings[:quarantine_max])
@@ -463,6 +463,8 @@ module Kino
       raise ArgumentError, "#{name} must be a non-negative number of seconds (got #{value.inspect})"
     end
 
+    def whole_ms(seconds) = (Float(seconds) * 1000).round
+
     # Seconds as whole milliseconds: nil and 0 mean off (0); anything above zero is at least 1.
     def milliseconds(value, name)
       seconds = value.nil? ? 0.0 : Float(value, exception: false)
@@ -470,7 +472,7 @@ module Kino
         raise ArgumentError, "#{name} must be a finite, non-negative number of seconds or nil (got #{value.inspect})"
       end
 
-      seconds.zero? ? 0 : [(seconds * 1000).round, 1].max
+      seconds.zero? ? 0 : [whole_ms(seconds), 1].max
     end
 
     def validate_hook(handler, name)

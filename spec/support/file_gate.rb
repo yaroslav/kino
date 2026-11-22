@@ -19,7 +19,7 @@ FileGate = Data.define(:path) do
 
   # Returns once the gate is open, or after `timeout` seconds.
   def wait(timeout = WsClient::DEADLINE)
-    deadline = Process.clock_gettime(Process::CLOCK_MONOTONIC) + timeout
-    Kino.sleep(0.005) until File.exist?(path) || Process.clock_gettime(Process::CLOCK_MONOTONIC) > deadline
+    deadline = Kino.monotonic + timeout
+    Kino.sleep(0.005) until File.exist?(path) || Kino.monotonic > deadline
   end
 end

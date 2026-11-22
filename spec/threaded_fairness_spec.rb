@@ -8,17 +8,17 @@
 # request must not wait for those to run dry: a worker passes the GVL
 # between requests once it has held it for a millisecond.
 RSpec.describe "fairness among worker threads sharing a GVL" do
-  def burst_size = 10
+  def burst_size = 16
 
-  # Each request holds the GVL for a few milliseconds of Ruby work, so
-  # the whole burst lands in the queue while the first ones run, and the
-  # burst stays well inside Ruby's 100 ms timeslice. Each reports its
-  # thread's name as it starts.
+  # Each request holds the GVL for 5 ms of Ruby work, so the whole burst
+  # lands in the queue while the first ones run, and the burst stays
+  # inside Ruby's 100 ms timeslice. Each reports its thread's name as it
+  # starts.
   def busy_app(starts)
     Ractor.shareable_proc do |_env|
       starts << Thread.current.name
-      deadline = Process.clock_gettime(Process::CLOCK_MONOTONIC) + 0.005
-      nil until Process.clock_gettime(Process::CLOCK_MONOTONIC) >= deadline
+      deadline = Kino.monotonic + 0.005
+      nil until Kino.monotonic >= deadline
       [200, {"content-type" => "text/plain"}, ["ok"]]
     end
   end
@@ -49,24 +49,28 @@ RSpec.describe "fairness among worker threads sharing a GVL" do
     end
   end
 
-  # The first requests go to both workers; the rest queue behind them.
-  # The worker that wins the GVL passes it once an item it starts finds
-  # it held a millisecond, so the other one starts by the third. Before,
-  # it ran all the queued ones before the other got to its own.
-  def expect_both_started_early(order)
-    expect(order.first(3).uniq.size).to eq(2), "the burst started on #{order}"
+  # The worker that wins the GVL passes it between requests once it has
+  # held it a millisecond, so from the moment the other one waits for it,
+  # the two take turns, a request or two each. When the other one joins
+  # is the machine's to decide, so this counts turns, not positions.
+  # Before, the running worker ran every request it could take before the
+  # other started one: one turn at most, and a timeslice running out on a
+  # slow runner adds no more than one.
+  def expect_turns_taken(order)
+    turns = order.each_cons(2).count { |before, after| before != after }
+    expect(turns).to be >= 3, "the burst started on #{order}"
   end
 
   it_in_both_loops "runs a request handed to a waiting worker before the running worker drains the burst" do
-    expect_both_started_early(start_order(**server_defaults))
+    expect_turns_taken(start_order(**server_defaults))
   end
 
   # Inline, its connections' requests decide it; here its loop's takes do.
   it "does the same under a worker_loop whose requests come through its lane" do
-    expect_both_started_early(start_order(worker_loop: async_loop(8), _inline: false))
+    expect_turns_taken(start_order(worker_loop: async_loop(8), _inline: false))
   end
 
   it "does the same for two threads of one Ractor" do
-    expect_both_started_early(start_order(mode: :ractor, threads: 2))
+    expect_turns_taken(start_order(mode: :ractor, threads: 2))
   end
 end

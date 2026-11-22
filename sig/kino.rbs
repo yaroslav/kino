@@ -246,7 +246,7 @@ module Kino
 
     def self.red: (String text, ?io: IO) -> String
 
-    # The banner with a vertical grayscale gradient.
+    # The banner with its three-tone shading.
     def self.motd: (?color: bool) -> String
 
     # One-line stats dump (the SIGUSR1 handler's output).

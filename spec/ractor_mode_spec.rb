@@ -21,10 +21,10 @@ RSpec.describe "ractor mode" do
         meet_file = env["HTTP_X_MEET_FILE"]
         tag = "r#{Ractor.current.object_id}"
         File.open(meet_file, "a") { |f| f.flock(File::LOCK_EX) && f.write("#{tag}\n") }
-        deadline = Process.clock_gettime(Process::CLOCK_MONOTONIC) + 10
+        deadline = Kino.monotonic + 10
         met = loop do
           break true if File.read(meet_file).lines.size >= 2
-          break false if Process.clock_gettime(Process::CLOCK_MONOTONIC) > deadline
+          break false if Kino.monotonic > deadline
           Kino.sleep(0.005)
         end
         [200, {"content-type" => "text/plain"}, ["#{met ? "met" : "alone"} #{tag}"]]

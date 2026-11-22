@@ -1,7 +1,6 @@
 # frozen_string_literal: true
 
 require "async"
-require "digest/sha1"
 require "socket"
 require "tmpdir"
 
@@ -266,8 +265,7 @@ RSpec.describe "worker_loop" do
         next [-1, {}, []]
       end
 
-      accept = [Digest::SHA1.digest(env["HTTP_SEC_WEBSOCKET_KEY"] + WsClient::GUID)].pack("m0")
-      headers = {"upgrade" => "websocket", "connection" => "Upgrade", "sec-websocket-accept" => accept}
+      headers = HijackedEcho.accept_headers(env)
       echo = lambda do |io|
         while (frame = HijackedEcho.read_frame(io))
           io.write(WsClient.frame(*frame, mask: false))
@@ -377,9 +375,6 @@ RSpec.describe "worker_loop" do
     sleep seconds
     Process.clock_gettime(Process::CLOCK_PROCESS_CPUTIME_ID) - before
   end
-
-  # The body of an HTTP/1.1 response read to the end.
-  def response_body_of(response) = response.split("\r\n\r\n", 2).last
 
   # One request whose fiber has to wait on its client: a slow reader of
   # a 1 MiB event stream (:slow), a reader that goes away mid-stream
@@ -565,7 +560,7 @@ RSpec.describe "worker_loop" do
         expect(latencies.max).to be < 1, "beside a stalled stream, requests took #{latencies.map { |t| t.round(2) }} s"
 
         received << reader.read
-        expect(received.split("\r\n\r\n", 2).last.bytesize).to eq(StreamedChunks.bytes)
+        expect(response_body_of(received).bytesize).to eq(StreamedChunks.bytes)
       ensure
         reader&.close
       end

@@ -20,6 +20,7 @@ class WsClient
 
   # RFC 6455 1.3: hashed with the client's key into Sec-WebSocket-Accept.
   GUID = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11"
+  private_constant :GUID
 
   # Seconds a read waits before the spec fails.
   DEADLINE = 5
@@ -45,6 +46,9 @@ class WsClient
   # The code of the server's close frame; nil until one arrives (and
   # for ever, when the connection is dropped without one).
   attr_reader :close_code
+
+  # The Sec-WebSocket-Accept that answers a handshake's Sec-WebSocket-Key.
+  def self.accept(key) = [Digest::SHA1.digest(key + GUID)].pack("m0")
 
   def self.open(host, port, path: "/", headers: {}, tls: false)
     socket = TCPSocket.new(host, port)
@@ -173,7 +177,7 @@ class WsClient
     status, @headers = read_head(deadline)
     raise Refused.new(status, @headers, read_body(@headers, deadline)) unless status == 101
 
-    expected = [Digest::SHA1.digest(key + GUID)].pack("m0")
+    expected = self.class.accept(key)
     return if @headers["sec-websocket-accept"] == expected
 
     raise "wrong Sec-WebSocket-Accept: #{@headers["sec-websocket-accept"].inspect}, expected #{expected}"

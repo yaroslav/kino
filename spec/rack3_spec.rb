@@ -211,9 +211,7 @@ RSpec.describe "Rack 3 compliance" do
     each_mode do |mode|
       it "fails the blocked writer once its client leaves, and keeps the worker serving" do
         with_server(closing_under_a_writer(reports.port), mode: mode, workers: 1, threads: 1) do |_host, port|
-          client = Socket.new(:INET, :STREAM)
-          client.setsockopt(:SOCKET, :RCVBUF, 4096)
-          client.connect(Socket.sockaddr_in(port, "127.0.0.1"))
+          client = narrow_connection(port, receive_buffer: 4096)
           client.write("GET /stream HTTP/1.1\r\nHost: x\r\n\r\n")
           client.readpartial(4096)
 

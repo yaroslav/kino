@@ -15,12 +15,7 @@ RSpec.describe "unix socket bind" do
     end
   end
 
-  def unix_get(path, target)
-    UNIXSocket.open(path) do |sock|
-      sock.write("GET #{target} HTTP/1.1\r\nHost: kino\r\nConnection: close\r\n\r\n")
-      sock.read
-    end
-  end
+  def unix_get(path, target) = raw_exchange(path, "GET #{target} HTTP/1.1\r\nHost: kino\r\nConnection: close\r\n\r\n")
 
   it "serves HTTP over the socket, with a local peer address and no port" do
     with_server(app, bind: "unix://#{@path}") do |_host, port, _server|

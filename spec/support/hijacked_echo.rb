@@ -1,7 +1,5 @@
 # frozen_string_literal: true
 
-require "digest/sha1"
-
 # What Action Cable does on a server with full rack.hijack: take the
 # connection, answer the WebSocket handshake on it, and serve the socket
 # from a thread of its own (here echoing every message) while the worker
@@ -17,10 +15,16 @@ module HijackedEcho
     [-1, {}, []]
   end
 
+  # The headers of a 101 that accepts the WebSocket handshake in `env`, for apps that switch the
+  # connection themselves.
+  def self.accept_headers(env)
+    accept = WsClient.accept(env["HTTP_SEC_WEBSOCKET_KEY"])
+    {"upgrade" => "websocket", "connection" => "Upgrade", "sec-websocket-accept" => accept}
+  end
+
   def self.serve(io, key)
-    accept = [Digest::SHA1.digest(key + WsClient::GUID)].pack("m0")
     io.write("HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\n" \
-      "Connection: Upgrade\r\nSec-WebSocket-Accept: #{accept}\r\n\r\n")
+      "Connection: Upgrade\r\nSec-WebSocket-Accept: #{WsClient.accept(key)}\r\n\r\n")
     while (frame = read_frame(io))
       opcode, payload = frame
       io.write(WsClient.frame(opcode, payload, mask: false))

@@ -93,7 +93,7 @@ RSpec.describe "native primitives" do
 
     it "raises out of the shutdown's wait for hijacked connections, and the server serves on and stops" do
       with_server(->(_env) { [200, {}, ["ok"]] }) do |host, port, server|
-        id = server.instance_variable_get(:@id)
+        id = server_id(server)
         # Delivered at the wait itself: deferred until a blocking point,
         # which the native's release is.
         error = Thread.new do

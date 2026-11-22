@@ -421,7 +421,7 @@ RSpec.describe "Inline connections" do
             expect(median).to be < 0.05, "beside the slow reader, /hello took #{times.map { (it * 1000).round(1) }} ms"
 
             received << reader.read
-            expect(received.split("\r\n\r\n", 2).last.bytesize).to eq(INLINE_BIG)
+            expect(response_body_of(received).bytesize).to eq(INLINE_BIG)
             expect(server.stats[:inline]).to include(requests: 11, handbacks: 0)
           ensure
             [reader, other].compact.each(&:close)
@@ -625,7 +625,7 @@ RSpec.describe "Inline connections" do
           # sleep: the close finds it there.
           client.write(request("/behind"))
           sleep 0.05
-          Kino::Native.stop_accepting(server.instance_variable_get(:@id))
+          Kino::Native.stop_accepting(server_id(server))
           expect(read_response(client).last.bytesize).to eq(INLINE_BIG)
           expect(client.read).to eq(""), "reset, or left open"
         ensure

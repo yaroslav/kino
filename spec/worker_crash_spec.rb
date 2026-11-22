@@ -107,7 +107,7 @@ RSpec.describe "worker crashes" do
     wait_for("a worker holding the request") do
       busy = server.stats[:worker_status].find { |worker| worker[:in_flight].positive? }
     end
-    pool = server.instance_variable_get(:@pool)
+    pool = pool_of(server)
     slot = busy[:index]
     wait_for("the busy worker listed as retirable") { pool.groups.any? { |_index, slots| slots.include?(slot) } }
     index = pool.groups.find { |_index, slots| slots.include?(slot) }.first
@@ -184,7 +184,7 @@ RSpec.describe "worker crashes" do
       boots = HandlerReports.new
       booted = boots.port
       boot = Ractor.shareable_proc do |_id|
-        booted << Process.clock_gettime(Process::CLOCK_MONOTONIC)
+        booted << Kino.monotonic
         raise Exception, "boot failed" # rubocop:disable Lint/RaiseException
       end
       shutdown_took = nil
@@ -247,7 +247,7 @@ RSpec.describe "worker crashes" do
         expect(slot_rows(server).map(&:slot)).to eq([sampled.slot]), "the replacement took the same slot"
 
         expect(Kino::Native.retire_slot(id, sampled.slot, sampled.generation)).to be(false)
-        expect(server.instance_variable_get(:@pool).replace(sampled.slot, sampled.generation)).to be(false)
+        expect(pool_of(server).replace(sampled.slot, sampled.generation)).to be(false)
         expect(get_response(port, "/").body).to eq("ok")
         expect(server.stats[:worker_status]).to contain_exactly(include(quarantined: false, retired: false))
       end
@@ -290,7 +290,7 @@ RSpec.describe "worker crashes" do
       held = Thread::Queue.new
       resume = Thread::Queue.new
       with_server(crashing_app, mode: mode, workers: 1, threads: 2) do |_host, port, server|
-        pool = server.instance_variable_get(:@pool)
+        pool = pool_of(server)
         # The pool's recovery of the crash waits just before it forgets
         # the crashed slots, until `resume` opens.
         allow(pool).to receive(:forget_slots).and_wrap_original do |forget, index, ids|
@@ -374,7 +374,7 @@ RSpec.describe "worker crashes" do
           with_server(app, mode: mode, workers: 1, threads: 2) do |_host, port, server|
             expect(get(port, "/")).to eq("ok")
             # The crashed thread's slot leaves the bank, then is held on its way to the thread.
-            pool = server.instance_variable_get(:@pool)
+            pool = pool_of(server)
             claimed, resume, answered = Array.new(3) { Thread::Queue.new }
             allow(pool).to receive(:claim_slot).and_wrap_original do |claim, *args, &block|
               claim.call(*args, &block).tap do |id|
@@ -407,7 +407,7 @@ RSpec.describe "worker crashes" do
         boots = HandlerReports.new
         booted = boots.port
         boot = Ractor.shareable_proc do |_id|
-          booted << Process.clock_gettime(Process::CLOCK_MONOTONIC)
+          booted << Kino.monotonic
           Thread.main.raise(Exception, "ractor boot failed")
           Kino.sleep(5)
         end
@@ -437,7 +437,7 @@ RSpec.describe "worker crashes" do
       it "gives a worker ractor's slots back to the bank when it dies while quarantine replaces it", :quiet do
         forgotten = Thread::Queue.new
         with_server(gated_crash_app(nil, ractor: true), mode: mode, workers: 1, threads: 1) do |_host, port, server|
-          pool = server.instance_variable_get(:@pool)
+          pool = pool_of(server)
           expect(get_response(port, "/").body).to eq("ok")
           sampled = slot_rows(server).first
           allow(pool).to receive(:forget_slots).and_wrap_original do |forget, *dead|
@@ -707,24 +707,8 @@ RSpec.describe "Ruby interrupts into a worker waiting on its client" do
 
   # The response on `socket`, its body de-chunked: [status, body].
   def response(socket)
-    Timeout.timeout(5) do
-      head = socket.gets("\r\n\r\n") or raise "the connection closed without a response"
-      status = head[%r{\AHTTP/1\.1 (\d+)}, 1]
-      length = head[/^content-length: (\d+)/i, 1]
-      next [status, socket.read(Integer(length))] if length
-
-      body = +""
-      loop do
-        line = socket.gets("\r\n") or raise "the connection closed mid-response, #{body.bytesize} bytes in"
-        break if (size = line.to_i(16)).zero?
-
-        body << socket.read(size)
-        socket.read(2)
-      end
-      [status, body]
-    end
-  rescue Timeout::Error
-    raise "the response did not end within 5 s"
+    status, _headers, body = read_response(socket)
+    [status[%r{\AHTTP/1\.1 (\d+)}, 1], body]
   end
 
   each_mode do |mode|
@@ -906,16 +890,15 @@ RSpec.describe "a worker thread the app kills" do
       rescue Net::ReadTimeout
         ["no answer within \#{within} s"]
       end
-      now = -> { Process.clock_gettime(Process::CLOCK_MONOTONIC) }
       until server.stats[:worker_status].size == 2 && get.call("/", 1) == %w[200 ok]
         sleep 0.01
       end
       slots = server.stats[:worker_status].map { it[:index] }
       sleeping = Thread.new { get.call("/sleep", 5) }
       sleep 0.01 until server.stats[:in_flight] == 1
-      started = now.call
+      started = Kino.monotonic
       killed = get.call("/kill-main", 2)
-      took = now.call - started
+      took = Kino.monotonic - started
       error = exits.pop(timeout: 5)
       answers = Array.new(10) { sleep 0.1; get.call("/", 1) }
       rows = server.stats[:worker_status]
@@ -1021,7 +1004,7 @@ RSpec.describe "a worker thread the app kills" do
             queue_timeout: 0.3) do |_, port, server|
             # No replacement makes room: the pool's recovery of the crash
             # waits until the queued requests are answered.
-            pool = server.instance_variable_get(:@pool)
+            pool = pool_of(server)
             resume = Thread::Queue.new
             allow(pool).to receive(:forget_slots).and_wrap_original do |forget, *args|
               resume.pop(timeout: 5)
