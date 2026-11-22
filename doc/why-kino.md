@@ -15,8 +15,8 @@ deep-copies it, and sockets cannot cross at all.
 
 We measured what the "obvious" workaround costs. The ractor-pool wrapper
 experiment (reduce the env to a shareable subset, copy it to a worker
-over a `Ractor::Port`, copy the response back) runs at **19.5k req/s
-where Kino does 194k** on the same hardware—see the
+over a `Ractor::Port`, copy the response back) runs at **40.7k req/s
+where Kino does 413k** on the same hardware—see the
 [wrapper comparison](benchmarks.md#the-ractor-pool-wrapper-comparison).
 Copying at the Rack layer eats the entire ractor dividend. Dispatch has
 to live below the Rack contract.
@@ -78,10 +78,10 @@ objects; Rust sees one queue and one registry.
 
 With the dispatch cost eliminated, Ractors deliver the thing they were
 built for—a lock per ractor instead of one GVL—and each layer is
-visible in the [benchmarks](benchmarks.md): `/cpu` at 78.0k req/s in
-ractor mode vs **13.4k threaded (5.8×, the GVL ceiling)**, beating the
-fork cluster's CPU parallelism by +34% while holding **~148 MB against
-the cluster's ~1,068 MB** (by PSS, on the bench app), because eight
+visible in the [benchmarks](benchmarks.md): `/cpu` at 118.1k req/s in
+ractor mode vs **20.2k threaded (5.8×, the GVL ceiling)**, beating the
+fork cluster's CPU parallelism by +14% while holding **~167 MB against
+the cluster's ~1,171 MB** (by PSS, on the bench app), because eight
 ractors share one VM, one Rust front-end, one queue, and one JIT, where
 eight forks each pay full price.
 

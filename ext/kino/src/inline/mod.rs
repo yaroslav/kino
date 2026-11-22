@@ -266,7 +266,8 @@ pub(super) fn ios(slot: &WorkerSlot) -> Vec<Arc<InlineIo>> {
 /// Kino::Native::Conn, made in the worker's Ractor by the take that found it. Its drop takes the
 /// state lock and the worker's list, then hands the socket to hyper on the accepting runtime or
 /// answers and shuts it, with no Ruby.
-#[magnus::wrap(class = "Kino::Native::Conn", free_immediately)]
+/// Wrapped in typed_data.rs, whose promise that drop keeps.
+#[derive(magnus::DataTypeFunctions)]
 pub struct ConnHandle(RefCell<Option<Box<InlineConn>>>);
 
 pub fn wrap(ruby: &Ruby, conn: Box<InlineConn>) -> Value {

@@ -124,6 +124,8 @@ async fn serve(
 
 /// An inline connection handed back: hyper serves it on its accepting runtime (`origin`), reading
 /// `read` first; its client has `within`, what is left of its header time.
+/// A thread-safe free may run it (an idle connection's handle), so it keeps typed_data.rs's
+/// promise: it only spawns, and the task registers the stream.
 pub(crate) fn serve_handed_back(
     origin: &crate::inline::Origin,
     stream: StdConn,
