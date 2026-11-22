@@ -14,6 +14,7 @@ mod env_strings;
 mod framing;
 mod gvl;
 mod hijack;
+mod inline;
 mod io_shards;
 mod lane_room;
 mod listen;
@@ -127,6 +128,11 @@ fn init(ruby: &Ruby) -> Result<(), Error> {
     worker.define_method("take_nonblock", method!(queue::Worker::take_nonblock, -1))?;
     worker.define_method("take_woken", method!(queue::Worker::take_woken, -1))?;
 
+    let conn = native.define_class("Conn", ruby.class_object())?;
+    conn.define_method("fd", method!(inline::ConnHandle::fd, 0))?;
+    conn.define_method("next_request", method!(inline::ConnHandle::next_request, 1))?;
+    conn.define_method("close", method!(inline::ConnHandle::close, 0))?;
+
     let request = native.define_class("Request", ruby.class_object())?;
     methods!(request:
         "respond_and_take" => queue::respond_and_take, 5;
@@ -135,9 +141,11 @@ fn init(ruby: &Ruby) -> Result<(), Error> {
         "read_body_nonblock" => Request::read_body_nonblock, 1;
         "send_simple" => crate::request::respond_simple, 3;
         "send_headers" => Request::send_headers, 2;
-        "write_chunk" => Request::write_chunk, 1;
+        // Request#write_chunk (worker.rb) waits on what this hands back.
+        "write_chunk_or_wait" => Request::write_chunk, 1;
         "write_chunk_nonblock" => Request::write_chunk_nonblock, 1;
         "waited" => Request::waited, 0;
+        "waited_writable" => Request::waited_writable, 0;
         "close_waits" => Request::close_waits, 0;
         "finish" => Request::finish, 0;
         "abort" => Request::abort, 0;
@@ -170,6 +178,7 @@ fn init(ruby: &Ruby) -> Result<(), Error> {
     let _ = <Request as magnus::TypedData>::class(ruby);
     let _ = <queue::Worker as magnus::TypedData>::class(ruby);
     let _ = <pin::PinKeeper as magnus::TypedData>::class(ruby);
+    let _ = <inline::ConnHandle as magnus::TypedData>::class(ruby);
 
     // Frozen env key/value cache: built once here (main ractor, GVL held),
     // shared by every worker ractor afterwards.

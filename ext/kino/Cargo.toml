@@ -46,8 +46,8 @@ tungstenite = { version = "0.30", default-features = false }
 # EPROTO, which std has no ErrorKind for; already in the tree via tokio.
 libc = "0.2"
 # Socket calls std lacks: hijack bridge reads without tokio, a unix bind's
-# nonblocking live-socket check and the intake's recv; already in the tree
-# via tokio.
+# nonblocking live-socket check, the intake's recv, and StdConn, the
+# inline connections' socket; already in the tree via tokio.
 socket2 = "0.6"
 
 # musl's loader rejects initial-exec TLS in dlopen'd libraries ("initial-exec
@@ -69,3 +69,4 @@ rb-sys = { version = "0.9", features = ["link-ruby"] }
 # enables both only for `cargo test`.
 hyper = { version = "1.6", features = ["client"] }
 tokio = { version = "1.45", features = ["test-util"] }
+proptest = { version = "1", default-features = false, features = ["std"] }

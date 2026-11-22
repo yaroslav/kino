@@ -20,6 +20,7 @@ use std::fmt::Write as _;
 use std::net::IpAddr;
 use std::time::Duration;
 
+use crate::logsink::Sink;
 use crate::style::{self, Stream};
 
 /// Per-request timing, measured on the way through and riding the
@@ -34,6 +35,43 @@ pub struct Timing {
     /// Left out where the VM's process-wide counters cannot be attributed
     /// to one request (parallel ractors).
     pub gc: Option<(Duration, u64)>,
+}
+
+/// A request's two records in the access log, whichever way it is served: made as its arrival
+/// line is queued, spent on its completion line.
+pub struct Logged {
+    method: String,
+    target: String,
+    start: std::time::Instant,
+}
+
+impl Logged {
+    /// Queues the arrival line on `log` now, before the app sees the request, so a hang shows
+    /// as an arrow with no answer.
+    pub fn arrival(log: &Sink, method: &http::Method, uri: &http::Uri, from: IpAddr) -> Logged {
+        let target = match uri.query() {
+            Some(query) => format!("{}?{query}", uri.path()),
+            None => uri.path().to_string(),
+        };
+        let method = method.to_string();
+        log.write_line(arrival(&method, &target, from));
+        Logged {
+            method,
+            target,
+            start: std::time::Instant::now(),
+        }
+    }
+
+    /// Since its arrival: its total, once its answer begins.
+    pub fn elapsed(&self) -> Duration {
+        self.start.elapsed()
+    }
+
+    /// Queues the completion line, with the breakdown where a worker measured `timing`.
+    pub fn completion(self, log: &Sink, status: u16, total: Duration, timing: Option<Timing>) {
+        let line = completion(status, &self.method, &self.target, total, timing);
+        log.write_line(line);
+    }
 }
 
 /// The arrival record, stamped and styled for stdout.

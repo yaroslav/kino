@@ -142,7 +142,9 @@
 
 # Run each worker's loop under your own fiber scheduler: called on the
 # worker thread with the worker, whose serve(concurrency:) hands your
-# scheduler each request as a job. In :ractor mode pass a
+# scheduler each request as a job. With it, Kino also serves plain
+# HTTP/1.1 connections inline, on the worker threads themselves, with no
+# hand-off between threads (inline serving). In :ractor mode pass a
 # Ractor.shareable_proc (a do...end block is never shareable). Needs the
 # async gem; see doc/worker-loop.md in the Kino repository.
 # require "async"

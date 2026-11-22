@@ -209,7 +209,7 @@ impl TestServer {
         let server = Arc::new(ServerInner::new(self.config));
         for _ in 0..self.workers {
             let doorbell = worker_loop.then(|| Doorbell::new().expect("a doorbell"));
-            let slot = WorkerSlot::new(lanes, self.inbox, doorbell);
+            let slot = WorkerSlot::new(lanes, self.inbox, doorbell, server.inline.is_some());
             server.slots.write().push(Arc::new(slot));
         }
         server

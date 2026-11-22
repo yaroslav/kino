@@ -14,7 +14,9 @@ and any `Fiber::Scheduler` works. How it works inside is in
 Turn it on when your requests spend their time waiting and you want
 many of them on one worker, or when your app is fiber-native already.
 For requests that never wait, Kino's own loop stays the leaner path
-(see [Per-request cost](#per-request-cost)).
+(see [Per-request cost](#per-request-cost)). A request on an
+[inline connection](#inline-connections) gets no fiber of its own: its
+connection's job runs it.
 
 ## Setting it up
 
@@ -70,11 +72,13 @@ needs the care any fiber-concurrent code needs.
 
 ### Requests
 
-Each request is one job, which does what Kino's own loop does for a
-request, from the env to `after_request_complete`. A job raises into
-your scheduler only when Kino's own handling failed, after the client
-got its 500. Stopping a request's job from outside aborts its request
-(a 500, or a cut connection mid-stream) and frees its slot.
+Each request that comes through the worker's lane is one job (an inline
+connection's requests run on its job instead: see
+[Inline connections](#inline-connections)), which does what Kino's own
+loop does for a request, from the env to `after_request_complete`. A job
+raises into your scheduler only when Kino's own handling failed, after
+the client got its 500. Stopping a request's job from outside aborts its
+request (a 500, or a cut connection mid-stream) and frees its slot.
 
 `concurrency` counts a request from the moment the loop takes it until
 its job ends, `after_request_complete` included. A native WebSocket
@@ -86,6 +90,22 @@ streaming body). A partial hijack with any other status is a streamed
 response and counts until it ends. With `concurrency` requests running,
 the loop takes no more requests, though it keeps taking socket events
 and wakes.
+
+### What carries over between requests
+
+Requests run on fibers that outlive them: every request a worker takes
+in Kino's own loop runs on its thread, every request of an
+[inline connection](#inline-connections) on that connection's job, and
+under the [runner recipe](#per-request-cost) every request a runner
+takes on that runner. So fiber-local state one request sets
+(`Thread.current[]`, `Fiber[]`, task-local state) is still there for a
+later one, which can be another client's (on an inline connection,
+behind a proxy that reuses its connections to Kino). Kino resets none
+of it: reset what you set, per request, as on any server that reuses
+threads; Rails' executor resets its own state. Only a request on a new
+task (each lane request under the spawn block above; under the recipe,
+one that starts a runner or finds every runner busy) begins with a
+fiber of its own, its `Fiber[]` a copy of the loop's.
 
 ### WebSockets
 
@@ -152,12 +172,16 @@ Whatever waits through the scheduler suspends only its fiber:
 - `sleep`, Ruby's socket and pipe I/O, `Thread::Queue#pop`, `Mutex`, and
   the scheduler's own primitives;
 - Kino's body I/O: `rack.input` reads, and the writes of a streamed
-  response (an enumerable body, or a Rack 3 stream). While the client
-  is slower than the app, the fiber waits on a descriptor and costs no
-  wake-ups meanwhile. Each such request holds up to four descriptors
-  that `max_connections` does not count: near the open-file limit, many
-  slow clients can run the process out of descriptors, and a wait then
-  raises an `IOError` in the app. Leave room for them in `ulimit -n`.
+  response (an enumerable body, or a Rack 3 stream). On a request that
+  came through hyper, while the client is slower than the app, the fiber
+  waits on a descriptor and costs no wake-ups meanwhile. Each such
+  request holds up to four descriptors that `max_connections` does not
+  count: near the open-file limit, many slow clients can run the process
+  out of descriptors, and a wait then raises an `IOError` in the app.
+  Leave room for them in `ulimit -n`. On an
+  [inline connection](#inline-connections), Kino reads the body whole
+  before the app runs, so `rack.input` never waits, and a streamed write
+  waits on the connection's own socket.
 
 Whatever blocks the thread instead holds every fiber on the worker:
 
@@ -190,13 +214,15 @@ blocking way.
 
 ## Shutdown and retirement
 
-When the server drains, or the elastic pool retires the worker, the
-loop takes nothing more and `serve` waits for every job: suspended
-requests, work in `after_request_complete`, jobs serving switched
-connections, and each socket's remaining events up to its `on_close`.
-A drain waits up to `shutdown_timeout` for that, and past it gives up
-on what still runs as it does on a stuck handler: clients still waiting
-get a 500 or a cut connection, and body reads still waiting raise.
+When the server drains, or the elastic pool retires the worker, the loop
+takes nothing more and `serve` waits for every job: suspended requests,
+work in `after_request_complete`, jobs serving switched connections,
+inline connections' jobs, and each socket's remaining events up to its
+`on_close`. How each inline connection ends then is in
+[architecture.md](architecture.md#inline-connections). A drain waits up
+to `shutdown_timeout` for that, and past it gives up on what still runs
+as it does on a stuck handler: clients still waiting get a 500 or a cut
+connection, and body reads still waiting raise.
 
 A drain closes connections that switched protocols once requests have
 drained, so the jobs serving them read EOF and can end. A hijacked
@@ -212,7 +238,9 @@ judges the thread, not the requests: a worker is busy while its thread
 stays away from its loop and there is work for it. A worker whose
 fibers only wait reads at most about 50 ms of `busy_ms`; a job that
 computes without waiting adds its own run time. Keep
-`quarantine_timeout` well above that. A fiber that spins while the
+`quarantine_timeout` well above that: a quarantined worker's inline
+connections end as
+[architecture.md](architecture.md#inline-connections) says. A fiber that spins while the
 worker has no work at all, or after the loop got its end (a drain or a
 retirement), is not seen: that worker reads 0. `request_timeout` works
 as usual: the client gets its 504 while the job runs on, holding its
@@ -220,13 +248,16 @@ slot until it ends.
 
 ## Dispatch
 
-[Lane dispatch](architecture.md#lane-dispatch) counts what a worker has
-open: a worker whose fibers all wait counts as idle, one with
+Requests that come through hyper reach a worker by
+[lane dispatch](architecture.md#lane-dispatch), which counts what a
+worker has open: a worker whose fibers all wait counts as idle, one with
 `concurrency` requests open gets no more, and with every worker full a
 request waits its turn, in the order requests came, up to
 `queue_timeout`, then gets a 503. While a sibling sits idle, a worker
 holding a request it has not answered yet is passed over, so a few
-clients spread over the workers.
+clients spread over the workers. A request on an
+[inline connection](#inline-connections) never passes through it: it
+runs on the worker its connection was placed on.
 
 What the app controls is when a job starts: dispatch sees a worker's
 loop, not its fibers. A job left queued (on a `Thread::Queue`, or on
@@ -241,7 +272,82 @@ answered requests still run (in `after_request_complete`, or past a
 waits in the worker's lane until a job ends, or until an idle sibling
 takes it, within 50 ms.
 
+## Inline connections
+
+Over plain TCP or a `unix://` bind, a `worker_loop` server serves
+HTTP/1.1 connections on its worker threads, with nothing to turn on.
+Kino places each connection it accepts on a worker with room for it,
+and that worker's loop runs the connection as a job of its own: Kino's
+Rust code reads each request on the worker's thread, the app runs on
+that job, and Kino writes the answer straight to the socket, with no
+hand-off between threads, no wake of the loop and no task per request.
+There is no setting: a server with TLS serves nothing inline. How it works inside, the deadlines, and how each connection
+ends at a drain, a retirement, a quarantine or a crash are in
+[architecture.md](architecture.md#inline-connections).
+
+### What an app sees
+
+- A connection's requests run one after another on its job, each
+  counting toward `concurrency` while it runs, and a worker takes at
+  most `concurrency` connections. Between requests the job waits on the
+  socket through your scheduler, after stepping aside once (the
+  scheduler's `yield`, else `kernel_sleep(0)`) when another inline
+  connection shares the worker. The requests share the job's fiber and
+  task (see [What carries over](#what-carries-over-between-requests));
+  stopping that task ends the connection.
+- A worker serves its inline connections in turn: a request that holds
+  the thread (computing, or blocking outside your scheduler) delays the
+  worker's other connections, and none of them moves to another worker.
+  A lower `concurrency` leaves fewer connections behind each slow
+  request; more workers spread them.
+- Kino reads a request's body whole before the app runs, so
+  `rack.input` never waits.
+- A streamed answer goes out as through hyper. What the socket does not
+  take yet waits on the job, never on the worker's thread, so a slow
+  reader holds back its own connection only.
+- Answers, deadlines and the drain follow hyper's, with a few
+  [recorded differences](architecture.md#recorded-differences) over
+  headers an app should not set, a first head's deadline and the drain.
+- The only inline connection on a worker with nothing else to do spins
+  at its socket for up to 100 µs, with the GVL released, before its job
+  waits, so a client that sends its next request at once is served
+  without a wake. A client whose requests mostly come later backs it off
+  to one spin in 32 requests; nothing spins on a process that may use
+  one CPU.
+
+### What goes to hyper
+
+hyper, on Kino's I/O threads, serves everything else, as on a server
+without a `worker_loop`:
+
+- TLS and HTTP/2 (an h2c preface included);
+- every request outside a strict subset of HTTP/1.1 (no HTTP/1.0, an
+  origin-form target, a body of at most 64 KiB and `max_body_size` by one
+  `Content-Length`, no `Transfer-Encoding`, `Expect` or upgrade, a head
+  of at most 16 KiB and 100 headers), handed back before the app sees
+  it with the bytes read replayed, and a request read whole while its
+  worker has no room, which waits for room in the lanes up to
+  `queue_timeout`;
+- connections no worker takes at accept, and those of a worker that
+  retires, crashes or is quarantined.
+
+A connection never goes to hyper in the middle of an answer, and in the
+middle of a request body only as its worker retires, with what was
+read. Behind nginx, connections stay inline while nginx speaks
+HTTP/1.1 to Kino and keeps its connections open, as it does by default
+since 1.29.7; an older nginx needs `proxy_http_version 1.1`,
+`proxy_set_header Connection ""` and an upstream `keepalive` pool. One
+that speaks HTTP/1.0 has every request handed back.
+
 ## Per-request cost
+
+This section is about requests that reach a worker through its lane:
+everything hyper serves, such as TLS, HTTP/2 and hand-backs. A request
+on an
+[inline connection](#inline-connections) pays neither Kino's wake nor a
+task and fiber of its own: its connection's job waits on the socket
+through the scheduler, and runs the request itself. The numbers here
+were measured before Kino served connections inline.
 
 A request that reaches an idle `worker_loop` worker costs more than in
 Kino's own loop, which answers one request and takes the next in a
@@ -264,7 +370,7 @@ are its levers:
   an idle one**: no task and no fiber per request. It looks like
   this:
 
-<!-- spec/worker_loop_spec.rb runs this block as a kino.rb. -->
+<!-- spec/worker_loop_spec.rb and spec/inline_io_spec.rb run this block as a kino.rb. -->
 
 ```ruby
 worker_loop Ractor.shareable_proc { |worker|
@@ -332,3 +438,25 @@ refill: once no runner is idle, jobs get tasks of their own.
   run already waiting, so it can be higher than the hook's runs.
 - The access log leaves out the GC and allocation figures, as requests
   interleave: the breakdown is `(ruby; kino; wait)`.
+- `stats[:inline]` (`"inline"` in `/stats`, `null` on a server that
+  serves nothing inline) counts [inline serving](#inline-connections):
+  - `connections`: served inline now (`kino_inline_connections`);
+  - `requests`: served inline (`kino_inline_requests_total`), counted in
+    `served`, their worker's row, `timeouts` and `responses_cut` too, as
+    hyper's are;
+  - `declined`: connections left with hyper at accept, as no worker
+    could take one (`kino_inline_declined_total`);
+  - `handbacks` (`kino_inline_handbacks_total`): connections handed
+    back to hyper, whatever for
+    ([What goes to hyper](#what-goes-to-hyper));
+  - `closed` (`kino_inline_closed_total`): the connections Kino cut
+    off, at a deadline, a crash, the shutdown's deadline or a
+    quarantine. One its client or an answer closed never counts, nor
+    does one a `request_timeout` 504 ended (in `timeouts`);
+  - `spins` (`kino_inline_spins_total`): the spins of a lone
+    connection's job for its next request, whatever they caught.
+- `worker_status[].inline_connections` counts the connections the
+  worker serves inline now (`kino_worker_inline_connections`).
+- An inline request is logged as hyper logs one, with `wait 0.0ms`, as
+  it waits in no queue (nor counts in `queue_time`); one handed back is
+  logged by hyper alone.

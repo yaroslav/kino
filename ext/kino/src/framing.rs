@@ -2,9 +2,17 @@
 
 use http::header::CONTENT_LENGTH;
 
+/// As hyper's default: the most headers a head may have.
+pub const MAX_HEADERS: usize = 100;
+
 /// No body whatever the head declares (RFC 9110 6.4.1): a 1xx, 204 or 304, or a HEAD answer.
 pub fn bodiless(status: u16, head_request: bool) -> bool {
     head_request || matches!(status, 100..=199 | 204 | 304)
+}
+
+/// A 1xx or a 204: no Content-Length, which RFC 9110 forbids and h2 clients reject.
+pub fn lengthless(status: u16) -> bool {
+    matches!(status, 100..=199 | 204)
 }
 
 /// An answer that sends no body, and the one rule for what its head keeps of a Content-Length,
@@ -27,7 +35,7 @@ impl Bodiless {
         }
         Some(Bodiless {
             by_status,
-            lengthless: matches!(status, 100..=199 | 204),
+            lengthless: lengthless(status),
         })
     }
 
@@ -92,6 +100,11 @@ pub fn usable_length(headers: &http::HeaderMap) -> bool {
 }
 
 /// The items of a comma-separated header value, trimmed.
-pub fn tokens(value: &str) -> impl DoubleEndedIterator<Item = &str> {
-    value.split(',').map(str::trim)
+pub fn tokens(value: &[u8]) -> impl DoubleEndedIterator<Item = &[u8]> {
+    value.split(|&b| b == b',').map(<[u8]>::trim_ascii)
+}
+
+/// Whether a list header's `value` names `token`, in any case.
+pub fn has_token(value: &[u8], token: &[u8]) -> bool {
+    tokens(value).any(|t| t.eq_ignore_ascii_case(token))
 }

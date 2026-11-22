@@ -422,9 +422,10 @@ in the kernel's accept queue, as long a queue as the kernel allows
 bodies past `max_body_size` (default 50 MB, `nil` delegates to a
 fronting proxy) get a **413**; and fixed deadlines drop a client whose
 first bytes are not in 15 s after it connected (with HTTP/2, the whole
-preface), or whose request head is not whole 15 s after it began,
-stalled TLS handshakes (10 s), uploads stalled mid-body (30 s), and an
-HTTP/2 peer that leaves a ping unanswered (see
+preface; on an inline connection, the whole first head), or whose
+request head is not whole 15 s after it began, stalled TLS handshakes
+(10 s), uploads stalled mid-body (30 s), and an HTTP/2 peer that leaves
+a ping unanswered (see
 [Intake deadlines](doc/architecture.md#intake-deadlines)). A client that
 ends its side of the connection once its request is sent is taken as
 gone, as nginx takes it.
@@ -565,15 +566,16 @@ is busy or stuck, and reports `draining` through a graceful shutdown:
 Both `/stats` and `/metrics` also break the counters down per dispatch
 slot: `/stats` carries a `worker_status` array (`index`, `served`,
 `in_flight`, `busy_ms`, `quarantined`, `retired`, `websockets_open`,
-`hijacked_connections`) and `/metrics` emits `kino_worker_*{worker="N"}`
-series, one entry per execution slot (`workers × threads`). A crashed
-or retired worker's slot goes to a later worker, its counters starting
-over, once its sockets and hijacked connections are gone. `busy_ms` is
-how long the slot's current request, WebSocket callback or wake hook
-has been running (0 when idle; under a
+`hijacked_connections`, `inline_connections`) and `/metrics` emits
+`kino_worker_*{worker="N"}` series, one entry per execution slot
+(`workers × threads`). A crashed or retired worker's slot goes to a
+later worker, its counters starting over, once its sockets, hijacked
+connections and inline connections are gone. `busy_ms` is how long the
+slot's current request, WebSocket callback or wake hook has been running
+(0 when idle; under a
 [`worker_loop`](doc/worker-loop.md#stats-and-logs), how long its thread
-has stayed away from its loop), so a single slot climbing while the
-rest sit at 0 is your stuck worker.
+has stayed away from its loop), so a single slot climbing while the rest
+sit at 0 is your stuck worker.
 
 The `/stats` response and `server.stats` carry `queue_time` (count and
 summed seconds), and `/metrics` exposes `kino_request_queue_seconds`—a
@@ -590,7 +592,9 @@ takes). `responses_cut` counts, for the whole process,
 `client_gone`, `shutdown` (the drain's deadline) and `crash`. The
 process's WebSocket counters sit under `websockets`;
 [doc/websockets.md](doc/websockets.md#stats) lists them and their
-`/metrics` series.
+`/metrics` series. Inline connections count under `inline` (nil on a
+server that serves none), listed with their `/metrics` series in
+[doc/worker-loop.md](doc/worker-loop.md#stats-and-logs).
 
 - `GET /ready`—`200` when serving, `503` while booting or draining:
   wire it to your load balancer or Kubernetes readiness probe.
@@ -805,7 +809,18 @@ worker_loop Ractor.shareable_proc { |worker|
 [doc/worker-loop.md](doc/worker-loop.md) is the guide: what counts
 toward `concurrency`, how requests, WebSocket callbacks and the wake
 hook share a worker, waiting the right way, shutdown, quarantine,
-dispatch, per-request cost and stats.
+dispatch, inline connections, per-request cost and stats.
+
+### Inline connections
+
+A `worker_loop` server serves plain HTTP/1.1 connections on its worker
+threads, with nothing to configure: Kino reads each request and writes
+its answer on the worker's own thread, with no hand-off, wake-up or task
+per request. TLS, HTTP/2 and anything outside a strict subset of
+HTTP/1.1 stay with hyper. A connection's requests share one
+fiber, so reset fiber-local state per request.
+[Inline connections](doc/worker-loop.md#inline-connections) is the
+guide.
 
 ## Rails
 

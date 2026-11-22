@@ -323,7 +323,7 @@ fn an_answer_leaves_a_full_worker_counted_full_until_its_take_with_room() {
 
     let responder = request.responder.clone();
     drop(request); // answered, its job maybe still running
-    slot.answered(&responder);
+    slot.answered(&responder, false);
     assert_eq!(
         slot.load.in_flight.load(Ordering::Relaxed),
         1,

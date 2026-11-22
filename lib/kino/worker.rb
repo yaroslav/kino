@@ -15,15 +15,24 @@ module Kino
       # All of `chunk`, onto the response stream, the way read_some waits.
       def write_all(chunk) = Fiber.current_scheduler ? cooperatively { write_chunk_nonblock(chunk) } : write_chunk(chunk)
 
+      # Off a scheduler an inline write waits a TICK at a time, so a Thread#raise reaches it here.
+      def write_chunk(chunk)
+        nil while write_chunk_or_wait(chunk)
+      end
+
       private
 
       # Every request's fiber shares the thread: never block it. While the client is slower than
       # the app, wait until the native side rings the descriptor it handed out.
+      # An inline request waits for its socket to take more ([:writable, fd]).
       def cooperatively
-        while (step = yield).is_a?(Integer)
-          wait_until_rung(step)
+        loop do
+          case (step = yield)
+          when Integer then wait_until_rung(step)
+          when Array then wait_until_writable(step.last)
+          else return step
+          end
         end
-        step
       end
 
       # The request's descriptor, open until #waited: this IO must never close it, and is made
@@ -32,6 +41,13 @@ module Kino
         IO.for_fd(fd, autoclose: false).wait_readable
       ensure
         waited
+      end
+
+      # The connection's descriptor, open until #waited_writable: this IO must never close it.
+      def wait_until_writable(fd)
+        IO.for_fd(fd, autoclose: false).wait_writable
+      ensure
+        waited_writable
       end
     end
   end

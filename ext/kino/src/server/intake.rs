@@ -14,7 +14,7 @@ use crate::registry::ServerInner;
 
 /// Slowloris guard for HTTP/1 heads; fixed, as tuning intake is the fronting proxy's job.
 /// hyper times the head once it reads; first_bytes (or preface, over TLS) what comes before.
-pub(super) const HEADER_READ_TIMEOUT: Duration = Duration::from_secs(15);
+pub(crate) const HEADER_READ_TIMEOUT: Duration = Duration::from_secs(15);
 
 /// hyper's HTTP/2 keep-alive: a client silent this long gets a PING, and is closed unless it
 /// answers within H2_PING_TIMEOUT. It reaps a peer that is gone; an idle client that answers
@@ -66,11 +66,11 @@ struct Sniff {
 }
 
 impl Sniff {
-    fn new() -> Sniff {
-        Sniff {
-            first: [0; H2_PREFACE.len()],
-            have: 0,
-        }
+    fn after(read: &[u8]) -> Sniff {
+        let mut first = [0; H2_PREFACE.len()];
+        let have = read.len().min(first.len());
+        first[..have].copy_from_slice(&read[..have]);
+        Sniff { first, have }
     }
 
     fn began(&self) -> Option<Began> {
@@ -104,17 +104,18 @@ impl Sniff {
     }
 }
 
-/// How a connection whose client sent too little for hyper's sniff began, once it
+/// How a connection whose client sent (past `read`) too little for hyper's sniff began, once it
 /// has: the sniff never times out a client that sends nothing or stops inside the h2 preface.
 /// None, and it closes unanswered, when nothing more comes `within`, or once the drain began with
 /// nothing there, as hyper closes an idle connection. Mostly the bytes are in by the accept: one
 /// peek.
 pub(super) async fn first_bytes(
     plain: Plain<'_>,
+    read: &[u8],
     within: Duration,
     server: &ServerInner,
 ) -> Option<Began> {
-    let (sniff, sock) = (Sniff::new(), socket(&plain));
+    let (sniff, sock) = (Sniff::after(read), socket(&plain));
     if let Some(began) = sniff.peek(&sock) {
         return Some(began);
     }
@@ -150,6 +151,19 @@ pub(super) async fn first_bytes(
     }
 }
 
+/// `read`, with what its client sent past it taken off `plain`, up to what tells HTTP/1 from h2,
+/// the end, or nothing more: hyper's sniff starts with it, as hyper's own first read of a
+/// handed-back socket waits for a readiness a drain may cancel. Each read takes some or stops.
+pub(super) fn took_first(plain: Plain<'_>, read: Bytes) -> Bytes {
+    let mut sniff = Sniff::after(&read);
+    if sniff.began().is_some() {
+        return read;
+    }
+    let sock = socket(&plain);
+    while sniff.began().is_none() && matches!(sniff.recv(&sock, 0), Ok(1..)) {}
+    Bytes::copy_from_slice(&sniff.first[..sniff.have])
+}
+
 /// How a TLS client began, read off `tls` until that tells within `within`, and those bytes for
 /// hyper to read again; None, and it closes, past that, at a drain with too little there, or at
 /// its end.
@@ -158,7 +172,7 @@ pub(super) async fn preface(
     within: Duration,
     server: &ServerInner,
 ) -> Option<(Began, Bytes)> {
-    let mut sniff = Sniff::new();
+    let mut sniff = Sniff::after(&[]);
     let mut drain = server.shutdown_tx.subscribe();
     let read = async {
         loop {

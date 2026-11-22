@@ -27,11 +27,16 @@ pub(crate) struct Symbols {
     /// The rooms Kino::Native::Worker#take_nonblock narrows to.
     pub(crate) events: Sym,
     pub(crate) requests: Sym,
+    pub(crate) connections: Sym,
     pub(crate) wake: Sym,
     pub(crate) message: Sym,
     pub(crate) shutdown: Sym,
     pub(crate) drained: Sym,
     pub(crate) close: Sym,
+    /// What an inline job or a write waits for or does next.
+    pub(crate) readable: Sym,
+    pub(crate) writable: Sym,
+    pub(crate) step_aside: Sym,
     pub(crate) websocket: Sym,
 }
 
@@ -43,11 +48,15 @@ pub(crate) fn init(ruby: &Ruby) {
     let _ = SYMBOLS.set(Symbols {
         events: sym("events"),
         requests: sym("requests"),
+        connections: sym("connections"),
         wake: sym("wake"),
         message: sym("message"),
         shutdown: sym("shutdown"),
         drained: sym("drained"),
         close: sym("close"),
+        readable: sym("readable"),
+        writable: sym("writable"),
+        step_aside: sym("yield"),
         websocket: sym("websocket"),
     });
 }

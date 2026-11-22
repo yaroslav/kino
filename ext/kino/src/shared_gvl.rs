@@ -40,7 +40,7 @@ pub fn pass(slot: &WorkerSlot) -> Result<(), Error> {
     passed
 }
 
-/// A worker_loop's take, held long by a clock read: a
+/// A worker_loop's take, or an inline connection's next request, held long by a clock read: a
 /// loop's busy stamps run ahead of the clock (Load::waits_on_doorbell).
 pub fn pass_in_loop(server: &ServerInner, slot: &WorkerSlot) -> Result<(), Error> {
     if held_long(server, slot, crate::mono::mono_us) {

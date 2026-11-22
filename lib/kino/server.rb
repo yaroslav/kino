@@ -59,6 +59,8 @@ module Kino
     # @example
     #   Kino::Server.new(app, config_file: "kino.rb", port: 3000)
     def initialize(app, config_file: nil, **options)
+      # Internal: false serves worker_loop connections through hyper, for specs of that path.
+      @inline = options.delete(:_inline) != false
       config = Configuration.new
       config.load_file(config_file) if config_file
       config.merge!(options)
@@ -107,6 +109,8 @@ module Kino
           tokio_threads: @tokio_threads,
           tls_cert: @tls&.fetch(:cert), tls_key: @tls&.fetch(:key),
           http2: @http2, lanes: @lanes, worker_loop: @worker_loop, log_requests: @log_requests,
+          # With one usable CPU a spinner would hold the CPU its client's request needs.
+          inline: @inline, inline_spin: Kino.available_parallelism >= 2,
           websocket_max_message: @websocket_max_message, websocket_max: @websocket_max,
           websocket_ping_interval_ms: @websocket_ping_interval_ms,
           mode: @mode.to_s, workers: @workers, max_workers: @max_workers,

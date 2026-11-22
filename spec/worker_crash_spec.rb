@@ -850,6 +850,7 @@ RSpec.describe "a worker thread the app kills" do
     capture_native_stderr do
       with_server(killing_app, mode: mode, workers: workers, threads: threads, **opts,
         on_worker_exit: ->(_worker, error) { exits << error }) do |_, port, server|
+        await_inline(server, port, workers * threads) if opts[:worker_loop]
         yield port, server, exits
       end
     end
@@ -954,29 +955,45 @@ RSpec.describe "a worker thread the app kills" do
       expect(log.scan("crashed; respawning at once · Kino::Error: #{killed}").size).to eq(2), log
     end
 
-    it "crashes a worker_loop worker killed: what it held is answered at once, and a new worker serves" do
+    it "crashes a worker_loop worker killed: what it held is answered at once, its idle connection goes to hyper, " \
+      "and a new worker serves" do
       with_killing_server(mode, worker_loop: async_loop(8)) do |port, server, _exits|
-        held = Array.new(2) do
-          client_socket(port).tap { |socket| socket.write("GET /sleep HTTP/1.1\r\nhost: x\r\n\r\n") }
-        end
+        idle = client_socket(port)
+        idle.write("GET / HTTP/1.1\r\nhost: x\r\n\r\n")
+        expect(read_response(idle).last).to eq("ok")
+        inline = client_socket(port)
+        inline.write("GET /sleep HTTP/1.1\r\nhost: x\r\n\r\n")
+        # Not served inline: through hyper and the worker's lane.
+        queued = client_socket(port)
+        queued.write("GET /sleep HTTP/1.0\r\n\r\n")
         wait_for("both requests in flight") { server.stats[:in_flight] == 2 }
 
-        # Its connection ends with its answer, before the kill.
+        # Its connection ends with its answer, before the kill: the idle
+        # one alone is left on the worker for hyper.
         expect(raw_exchange(port, "GET /kill HTTP/1.1\r\nhost: x\r\nconnection: close\r\n\r\n"))
           .to start_with("HTTP/1.1 200 OK\r\n")
         statuses = nil
-        took = timed { statuses = held.map { |socket| read_response(socket, within: 1).first } }
-        expect(statuses).to all(start_with("HTTP/1.1 500 "))
+        took = timed { statuses = [inline, queued].map { |socket| read_response(socket, within: 1).first } }
+        expect(statuses).to all(match(%r{\AHTTP/1\.[01] 500 }))
         expect(took).to be < 0.5, "the 500s came #{took.round(2)} s after the kill"
+        wait_for("no inline connection counted on the killed worker", timeout: 1) do
+          server.stats[:inline][:connections].zero?
+        end
         expect(server.stats[:worker_status].sum { it[:in_flight] }).to eq(0)
 
         # Its replacement serves from here on.
         wait_for("the killed worker replaced", timeout: 1) { server.stats[:respawns] == 1 }
         expect(get_response(port, "/", within: 1)).to have_attributes(code: "200", body: "ok")
+        # Its client kept the idle connection, hyper's from then on.
+        idle.write("GET / HTTP/1.1\r\nhost: x\r\n\r\n")
+        expect(read_response(idle, within: 1).first).to eq("HTTP/1.1 200 OK")
+        # The HTTP/1.0 request's, and the idle connection's at the kill.
+        expect(server.stats[:inline][:handbacks]).to eq(2)
+        expect(server.stats).to include(respawns: 1)
         took = timed { server.shutdown }
         expect(took).to be < 1, "the shutdown took #{took.round(2)} s"
       ensure
-        held&.each(&:close)
+        [idle, inline, queued].compact.each(&:close)
       end
     end
 

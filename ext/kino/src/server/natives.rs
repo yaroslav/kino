@@ -16,10 +16,7 @@ pub fn register_worker(ruby: &Ruby, server_id: u64) -> Result<usize, Error> {
 
 pub fn stop_accepting(server_id: u64) {
     if let Some(server) = registry::try_get(server_id) {
-        server
-            .state
-            .store(registry::STATE_DRAINING, Ordering::Relaxed);
-        let _ = server.shutdown_tx.send(true);
+        server.stop_accepting();
     }
 }
 

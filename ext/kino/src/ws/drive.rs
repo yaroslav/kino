@@ -528,7 +528,7 @@ mod tests {
         let budget = Arc::new(Abort::default());
         let socket = Socket {
             id: 1,
-            owner: Arc::new(WorkerSlot::new(true, 1, None)),
+            owner: Arc::new(WorkerSlot::new(true, 1, None, false)),
             abort: budget.clone(),
             liveness: Arc::new(Liveness::new()),
         };

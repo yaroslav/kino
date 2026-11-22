@@ -36,8 +36,6 @@ use crate::upgrade::Claim;
 
 /// Longest response head the app may write; past it, the client gets 502.
 const MAX_HEAD: usize = 16 * 1024;
-/// hyper's own default.
-const MAX_HEADERS: usize = 100;
 const READ_CHUNK: usize = 16 * 1024;
 /// Body frames that may wait for a slow client, as for streamed responses.
 const BODY_FRAMES: usize = 8;
@@ -397,7 +395,7 @@ async fn read_head(
 
 /// Takes a whole head off `buf`; Ok(None) while it is partial.
 fn parse_head(buf: &mut BytesMut) -> Result<Option<hyper::Response<()>>, ()> {
-    let mut slots = [httparse::EMPTY_HEADER; MAX_HEADERS];
+    let mut slots = [httparse::EMPTY_HEADER; framing::MAX_HEADERS];
     let mut parsed = httparse::Response::new(&mut slots);
     let length = match parsed.parse(buf) {
         Ok(httparse::Status::Complete(length)) if length <= MAX_HEAD => length,

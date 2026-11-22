@@ -11,15 +11,19 @@ tokio (Rust threads)                          Ruby
 └──────────────────────────┘                     └────────────────────────────┘
 ```
 
-All network I/O lives in Rust on tokio runtimes; hyper parses HTTP/1.1 and
-handles keep-alive; rustls terminates TLS. The default is Tokio's
-multi-thread runtime. With `io_shards true`, one current-thread runtime
-accepts connections and assigns them to current-thread I/O shards, where
-each connection stays for its lifetime. Ruby never reads, writes or
+All network I/O lives in Rust. On tokio runtimes, hyper parses HTTP/1.1
+and handles keep-alive, and rustls terminates TLS. The default is
+Tokio's multi-thread runtime. With `io_shards true`, one current-thread
+runtime accepts connections and assigns them to current-thread I/O
+shards, where each connection stays for its lifetime. Each request
+becomes a Rust-side `RequestCtx` pushed to a bounded flume MPMC queue;
+Ruby workers pull from it. On a `worker_loop` server, plain HTTP/1.1
+connections are served inline instead: Kino's Rust code reads and writes
+them on the worker threads, whose fibers wait on their descriptors
+through the app's scheduler (see
+[Inline connections](#inline-connections)). Ruby never reads, writes or
 closes a client's socket: an app that hijacks a request gets a socket of
-its own, which Kino bridges to the client's. Each request becomes a
-Rust-side `RequestCtx` pushed to a bounded flume MPMC queue; Ruby
-workers pull from it.
+its own, which Kino bridges to the client's.
 
 ## Topology
 
@@ -183,10 +187,10 @@ and the 99th percentile falls from 56 to 3 ms.
   a clock read the slot already keeps (one of its own cost 1-2.5% of
   throughput), so a worker holds the GVL for 1 ms plus an item, a batch
   passes only before it, and a take that rides an answer takes nothing
-  when a pass is due, so the answered body closes first. A `worker_loop`
-  reads the clock, and its hold runs from its last pass: its scheduler's
-  waits go unseen, so after one it may pass at once and wait a round of
-  the line.
+  when a pass is due, so the answered body closes first. A
+  `worker_loop`'s takes and an inline connection's next request read the
+  clock, and its hold runs from its last pass: its scheduler's waits go
+  unseen, so after one it may pass at once and wait a round of the line.
 - **Fused crossing:** the common complete-body response rides
   `respond_and_take_one`: answer the previous request and take the next in
   one FFI call, ~one crossing per request once the loop is warm. The env
@@ -236,7 +240,12 @@ wakes (a full worker does not park, so dispatch does not read it as
 idle); with its backlog of 64 taken events full, only requests, so the
 inbox fills and pushes back on the sockets' readers. With room for one
 kind only and none of it ready, the loop waits on its doorbell, which a
-job that frees a slot or a backlog that drains also rings.
+job that frees a slot or a backlog that drains also rings. Every take
+also takes the inline connections placed on the worker (see
+[Inline connections](#inline-connections)), so one placed just before
+the worker filled up hands its first request to hyper rather than
+wait for a job to end; with room for neither events nor requests,
+the loop takes the placed connections alone, back every tick.
 
 **Open requests.** A take with room prunes the slot's list of open
 requests instead of resetting it, and answering a request prunes it
@@ -245,8 +254,10 @@ too, so dispatch sees the worker's load at once. A slot at its
 count, as that take is what tells the request first in line for lane
 room.
 
-**Jobs.** Socket events and wakes queue in Ruby, per socket and for the
-wake hook: the first event of a queue starts a job that drains it in
+**Jobs.** Each request taken from the lane is a job, and so is each
+inline connection, whose job runs its requests itself (see
+[Inline connections](#inline-connections)). Socket events and wakes
+queue in Ruby, per socket and for the wake hook: the first event of a queue starts a job that drains it in
 order, and a socket's `on_open` holds its queue on the handshake's job.
 At most one wake run waits beside the running one. Jobs report their
 end through a queue the scheduler waits on: a request's job frees its
@@ -273,7 +284,289 @@ when it stops, and the response body rings the second each time hyper
 takes a frame or drops it, so a read and a write of one request can
 wait at once. The bells close when the job ends, or once the last wait
 on them is back. Past the shutdown deadline a step that would wait
-fails as interrupted, and what already waits is rung.
+fails as interrupted, and what already waits is rung. An inline request
+needs no bell: Kino reads its body whole before the app runs, and a streamed write that has to wait is
+handed its connection's own descriptor (*Serving*, 3, under
+[Inline connections](#inline-connections)).
+
+## Inline connections
+
+What an app sees is in
+[worker-loop.md](worker-loop.md#inline-connections); this is how it
+works inside.
+
+**Placement.** At accept, on the I/O thread, a plain TCP connection to a
+`worker_loop` server, or one on its `unix://` bind, goes to a worker
+picked under one lock, so two I/O threads never both take the least
+loaded. A server with TLS has no inline side. Of the
+workers whose `serve` started, with an open lane, fewer inline
+connections than their `concurrency` and room for another request,
+placement takes the one with the fewest inline connections, then the
+fewest requests open, then the one that parked last, so a client that
+connects anew for each request finds the worker that served its last
+one. A worker at capacity, by the slot's count (see *Many requests per
+slot* under [Worker loops](#worker-loops)), takes none, so with every
+worker full a connection stays with hyper from accept, whose lanes line
+its request up for room until `queue_timeout`, as they line up any
+other. That counts as `declined`, and so does a connection whose worker
+turns it down as it is sent (it retired, was quarantined or left its
+slot, or its lane closed meanwhile). The connections a worker counts as
+open leave out those whose answer is out until their job looks for the
+next request, or steps aside just before (*Serving*, 4). The connection
+reaches its worker through an inbox of its own beside the lane, which
+no sibling's steal reads, ringing the worker's doorbell, and its socket
+leaves tokio for the worker's scheduler.
+
+A connection stays on its worker for its life unless it goes to hyper
+(*Hand-back*): nothing moves one off a worker busy with slow requests.
+Handing such a worker's connections to hyper was tried and did worse at
+the 99th percentile, at 5 ms and at 20 ms of CPU a request, as the
+requests it moved waited behind the slow ones in the lanes. Against the
+lanes, inline cost 2-4% of the requests a second on pages of 270-850 µs
+of CPU, as the lanes let whichever worker is free take the next request.
+These and the measurements below ran in Docker, in an arm64 Linux VM on
+an M1 Pro, with the server (4 workers) on 4 pinned CPUs.
+
+A unix-socket connection is placed, served, timed and handed back as a
+TCP one is. Rust peeks at it with `recv` and `MSG_PEEK` (std's peek for
+a unix stream is not stable), a hand-back registers it with tokio as a
+unix stream, and its env has the addresses hyper gives one:
+`REMOTE_ADDR` 127.0.0.1, and `SERVER_PORT` 80 unless its Host names a
+port.
+
+**Serving.** A request on an inline connection crosses no thread:
+
+1. The worker's take hands Ruby the connection as a
+   `Kino::Native::Conn`, and the loop starts a job for it.
+2. The job asks `Conn#next_request(room)`. Rust first flushes what the
+   last answer left in the connection's buffer, then reads what the
+   socket has, nonblocking (but see 4), parses a head in the strict
+   subset, reads its body whole, and admits the request as hyper's are
+   admitted (the same `RequestCtx`, env and in-flight guard). With
+   nothing more to read or flush yet, it answers `:readable` or
+   `:writable`, and the job waits on the socket through the scheduler,
+   on an IO that never closes the descriptor.
+3. The app runs on the job. Its answer is encoded and written to the
+   socket nonblocking under the connection's lock, from whichever
+   thread answers: a complete one at once, a streamed one chunk by
+   chunk. What the socket does not take stays in the connection's
+   buffer for the job's next look, and a streamed write that finds the
+   socket still holding the last one hands its fiber the descriptor to
+   wait on (`[:writable, fd]`).
+4. The job looks for the next request, and the connection's state
+   decides whether it goes on, ends, or goes to hyper. Before its first
+   look after a request, if the answer went out whole, nothing of the
+   next request was read and another inline connection shares the
+   worker, the job steps aside once (`:yield`): the scheduler's `yield`
+   (io-event's selectors put the fiber on the ready list for the next
+   pass), else `kernel_sleep(0)`. Every fiber already ready runs first,
+   as async-http's server yields after each response. The step counts
+   as the look, for placement and as an idle wait (`Idle`, below), lest
+   a busy worker read emptier than it is during a burst of accepts. Then
+   that first look reads nothing and answers `:readable`, so a request
+   that came while the worker finished the last one runs behind the
+   worker's connections whose requests came first: io-event's kqueue
+   selector arms a socket anew as its job waits, and the step makes its
+   epoll selector, which keeps a socket registered level-triggered
+   within the wake-up that resumed it, re-register it too. A pipelined
+   request runs at once. The only inline connection on its worker skips
+   the step (there it cost 2.6% of the requests a second, for nothing),
+   as does an answer still going out. On requests that do almost
+   nothing, the step costs about 3% more CPU at 16 to 64 connections,
+   and took their 99th percentile at 64 connections down by 15%. While
+   the server drains, or once the worker is quarantined, the look reads
+   first, as either ends an idle connection unless a request came; a
+   retired worker's connection goes to hyper at that look.
+
+**Spin.** The look's wait parks the worker's thread until the client's
+next request wakes it, and waking a thread whose CPU went idle costs
+tens of microseconds in a VM, on every request of a client that sends
+its next at once. So the only inline connection on a worker with
+nothing else to do first `poll`s its socket, waiting for nothing, for up
+to 100 µs, with the GVL released (see
+[The Rust ↔ Ruby boundary](#the-rust--ruby-boundary)). It runs under a
+gate (at most half the CPUs' worth of requests in flight, as each keeps
+up to two threads busy; no drain; a process that may use two CPUs or
+more), with nothing open on
+the worker or waiting for it, the worker neither retired nor
+quarantined, and fewer connections spinning server-wide than the gate
+lets requests be in flight; all of it is read again on every pass (the
+lane and the inboxes, behind locks, every 8th). The VM's unblock
+function stops a spin too, and what it saw is left to the job's wait,
+where a `Thread#raise` meets it. A connection spins once per request it
+read and once as it opens, never while an answer is owed, before the
+look's lock, waiting on nothing as the drain and a quarantine see it.
+A worker with `concurrency: 1` never spins: at capacity, it counts its
+last request open until its next take.
+
+A request the spin catches skips the job's wait, and so a pass of the
+scheduler: the worker's other fibers wait. So a job reads at most 16
+requests in a row through its spins, and for at most 1 ms from its last
+wait; past either, a catch is left to the job's wait, on a socket that
+reads ready already, with no park and no wake. A lone keep-alive client
+got 22% more requests a second on a trivial route and 7% on a page,
+every percentile better or tied, for about 8% more CPU per request; at
+16 connections nothing changed.
+
+A spin that runs out costs its whole budget, so each connection backs
+off on its own, with no timer, on its recent share of requests that came
+within the spin (`inline::spin::Backoff`), an average
+that weighs each chance 1/8: it spins while that share is at least
+9/16, and once in 32 chances otherwise, so a client that keeps coming
+late pays one spin in 32 requests, about 3 µs of CPU per request. A
+chance it skips counts by when its request was read: within 100 µs as
+caught (the gap from that chance is the client's plus the wake), past
+200 µs as missed, between not at all, as the wake alone may have taken
+it past; without that band, a client whose wake makes its gap look past
+the budget would never come back. A lone client pausing 500 µs between
+requests paid 1.6% more CPU per request, one with random gaps averaging
+500 µs 2.3%, and one pausing 5 ms tied. A skipped chance costs two clock
+reads.
+
+**Hand-back.** Anything outside the subset goes to hyper as its head is
+parsed, before the app sees it; so does a request whose worker has no
+room for it once it is read whole (reading a body takes none), and
+every connection of a retired worker at its job's next look. The job
+lets go of the socket, which is registered with tokio again on the I/O
+runtime that accepted the connection, and hyper serves it from then on,
+every byte read so far replayed to its codec first, so the request goes
+through lane dispatch as any other. One handed over with too little
+read for hyper-util's version sniff waits out what is left of its
+header time (see [Intake deadlines](#intake-deadlines)), and one already
+cut off is closed instead: hyper must not serve what was cut. Each
+hand-back counts once, in one total, whatever sent it: a head outside
+the subset ([worker-loop.md](worker-loop.md#what-goes-to-hyper) lists
+it) or one httparse or the `http` crate refuse; a request read whole
+while its worker runs `concurrency` requests; a retired worker's
+connection; one placed on a worker that never took it (it crashed, was
+quarantined or left its slot, or the queues closed); or one waiting idle
+for its next request as its worker crashed or its job ended. An nginx
+that speaks HTTP/1.0 to Kino, every request handed back, cost 13% of the
+requests a second, for 23% more CPU, against hyper serving them all.
+
+**Timeouts.** Nothing is timed per request: no timer in the app's
+scheduler, no clock read. Each connection keeps its deadline in one
+atomic, set from the server's inline clock, a microsecond stamp the
+ticker moves on each TICK (50 ms), so a deadline costs a load and a
+store and falls up to 50 ms either side of its mark: 15 s after the
+accept or an answer's last byte, for the next head, and 30 s after a
+body's last bytes. Each TICK the ticker reads the deadlines off every
+worker's list and, once it let go of the lists, shuts down the socket of
+a connection past its deadline that still waits on its client, which
+wakes its job to close it: the client reads the end, and the app never
+sees the request. One serving a request or writing an answer waits on
+no client and is looked at again 15 s on; but on a worker that leaves
+(retired, or quarantined), an answer's deadline moves on only as the
+socket takes some of it, so a client that stopped reading cannot keep
+the worker. While its worker is not quarantined, one whose client's
+bytes wait unread, or whose job holds a whole request read, is passed
+over until its job reads them. A cut between the job's read of a
+request and its admission is found under the lock the request is
+admitted under, as if it came first. With `request_timeout` set,
+admission sets the deadline from a clock read instead (the one cost on
+the request path), so the 504 is never early; the ticker claims the
+unanswered request under the connection's lock and writes hyper's 504
+with `connection: close`, now or never. The app runs on; its answer
+goes nowhere, and a stream it starts ends at its first write.
+
+**Lifecycle.** Only a connection's job, or the last write waiting on
+it, closes its descriptor, until hyper takes the connection over; any
+other thread at most shuts its socket down, which wakes the job, or
+hands an idle connection of a crashed worker to hyper. A write that has
+to wait on the socket (from any of the app's fibers or threads) is
+handed the descriptor and counted out until its wait is back, and a job
+that lets go meanwhile leaves the close to the last such wait, so no
+wait meets a closed or reused descriptor. Either close puts the FIN
+behind what the socket still holds of an answer and first reads off
+what the client sent that nothing will read (up to 64 KiB): a close
+with such bytes unread resets the connection, dropping the rest of the
+answer. A connection's seat on its worker, its answered mark and its
+`max_connections` permit are given back once, under its lock, by its
+job or by the slot's abandonment. A connection joins its worker's list
+only as `send_placed` hands it over, under the lane lock a crash
+retires the slot under, so a crash never cuts one it would refuse. A
+worker's handle, let go as it leaves its slot by any path, takes the
+slot's capacity with it and hands what was placed and never taken to
+hyper; a slot is recycled only once no inline connection counts on it.
+
+**Events.** What an event does to a connection turns on what its job
+last told the connection's lock it waits for (`Waits`): `Idle` while it
+waits for a next request with nothing of it read, or steps aside just
+before; `MidHead` while a kept-alive connection waits for the rest of
+its next head; `Other` otherwise. The drain shuts down the sockets of
+`Idle` and `MidHead` connections whose clients' bytes do not wait
+unread, and a quarantine those of `Idle` ones, whatever came; a job
+about to wait checks for both under the same lock. Every other
+connection meets either at its job's next look. A retirement's look
+comes as the worker's loop, its take loop over, closes the IO each job
+waits on, which wakes a waiting fiber under a scheduler with
+`fiber_interrupt` (Async has it; under one without, the job looks when
+its client next sends, or at the idle deadline). A crash or the shutdown
+deadline (`abandon_slot`) waits for no look: it answers every request
+held, flushes each connection as far as the socket takes it and shuts it
+down. A worker whose thread is killed crashes as one that raised does.
+The table says what happens to each connection, and what it counts
+where it is handed back (`handbacks`) or cut off (`closed`):
+
+| The connection is | Drain | Retirement | Quarantine | Crash | Its job ends | Shutdown deadline |
+|---|---|---|---|---|---|---|
+| Placed, not taken yet | served at its job's first look if a request came, else closed; or to hyper as the queues close (`handbacks`) | to hyper (`handbacks`) | to hyper (`handbacks`) | to hyper (`handbacks`) | no job yet | to hyper (`handbacks`) |
+| Waiting for a request, nothing of it read: new, between requests, or stepping aside | closed, unless its client's bytes came, which it reads first and serves if they make a request | to hyper at its job's next look (`handbacks`) | shut at once (`closed`) | to hyper, which serves a request just sent (`handbacks`) | to hyper (`handbacks`) | closed (`closed`) |
+| Part of a request read: a head or a body | a first head or a body reads on and is served; a next head closes, unless more of it came, which it reads first and serves if that completes a request | to hyper at its job's next look, with what was read (`handbacks`) | reads on and is served, or is cut at its deadline (`closed`) | closed (`closed`) | closed (`closed`) | closed (`closed`) |
+| Serving a request: the app runs, or its answer goes out | answered, then closed | answered, then to hyper with what came of the next request (`handbacks`) | answered, then closed (`closed` if its answer began before the quarantine) | a 500 or its stream cut, then closed (`closed`) | a 500 or its stream cut, then closed (`closed`) | a 500 or its stream cut, then closed (`closed`) |
+| Answer out whole, its job not back yet | at its job's next look, a request that came is served, else closed | to hyper at its job's next look (`handbacks`) | at its job's next look, a request that came is served, else closed (`closed`) | closed (`closed`) | closed (`closed`) | closed (`closed`) |
+
+A quarantine shuts a waiting connection with whatever its client sent
+just then, a race a client that reuses a kept-alive connection meets
+anyway, and retries. On a worker both retired and quarantined, the
+quarantine's column holds only where it shuts a connection or ends an
+answer; the rest go to hyper. A connection that is to go to
+hyper while a write still waits on its socket is closed instead, and
+counts as cut off.
+
+**Counters.** A request served inline counts on its worker's slot, as
+`served` does, and so do the spins its jobs end and the connections cut
+off (`closed`, one total); a stats read sums the slots, whose counts
+never start over. Hand-backs and `declined` are the server's, counted
+once per connection. A cut counts once, by whichever look ends the
+connection first, and not when it was ending already (an answer that
+closes it, a 504) or is no longer its worker's. The access log writes an inline
+request's arrival line as its job admits it, under the connection's
+lock, so it comes before any completion line, and its completion line
+where its answer begins, through the same nonblocking sink as hyper's
+(a 504 or a give-up's 500 with no breakdown); with the log off, each end
+costs one branch.
+
+### Recorded differences
+
+Inline answers go out as hyper writes them, interim statuses, framing
+refusals and lengths included, but for three differences, each over a
+header an app should not set and all but the last on a streamed answer:
+
+- A streamed answer's own `Transfer-Encoding` is dropped and Kino frames
+  the body itself, where hyper passes it on (`gzip, chunked`): the
+  framing is the server's to choose, and `Content-Encoding` goes out as
+  the app set it. On a complete answer both drop it.
+- A streamed answer to a HEAD with both a `Content-Length` and a
+  `Transfer-Encoding` goes out with its length, where hyper, in one of
+  the two orders, refuses it and closes the connection.
+- A `Connection` value that names `close` among bytes outside ASCII
+  closes the connection after the answer, where hyper cannot read it and
+  keeps the connection open.
+
+A connection's first head is due 15 s after the accept, where hyper
+gives 15 s for a first byte and 15 more for the head; a head over 16 KiB
+goes to hyper part read and gets hyper's 15 s afresh. A client that ends
+its side once its request is sent is answered inline (see
+[Intake deadlines](#intake-deadlines)). The drain differs four ways:
+a connection whose answer was whole before the drain, its job not back
+yet, ends at its job's next look, where hyper ends it at once; one
+placed and not taken yet ends at its job's first look or goes to hyper
+as the queues close, where hyper ends it unless its client's bytes are
+there; a new connection holding only a start of the h2 preface (or the
+`P` of a `POST`) reads its head on, where hyper closes it; and a next
+head past 16 KiB on a kept-alive connection ends unanswered, where
+hyper reads it on. Only the last loses a request.
 
 ## Backpressure, in both directions
 
@@ -332,24 +625,27 @@ first-claimant-wins flag on the per-request `Responder`:
    I/O runtime as a new arrival does (up to `queue_timeout`, then the
    503 a new arrival gets, counted in `rejected`). That wait starts
    `queue_timeout` over, by design, so behind workers that keep crashing
-   a client can wait longer than `queue_timeout`. Only the threads Kino
-   kills itself, past the shutdown deadline, and those the process kills
-   as it exits, end no crash. Then it is replaced on a slot from the
-   pool's bank while its siblings serve on: in `:threaded` mode by the
-   pool, in `:ractor` mode by its ractor's main thread, which asks the
-   ractor's supervisor thread (on the main ractor) for the slot. The
-   supervisor reads those reports and `Ractor#monitor`'s end notice from
-   one port (a report has a class of its own: the notice is a Symbol up
-   to Ruby 4.0 and an Array from 4.1), and respawns a ractor that dies
-   as a whole. A worker that keeps crashing within a second of starting,
-   before it served a request, is respawned with a doubling delay (0.1 s
-   up to 5 s), each thread paced by its own crashes.
+   a client can wait longer than `queue_timeout`. Its inline connections
+   end as [Inline connections](#inline-connections) says. Only the
+   threads Kino kills itself, past the shutdown deadline, and those the
+   process kills as it exits, end no crash. Then it is replaced on a
+   slot from the pool's bank while its siblings serve on: in `:threaded`
+   mode by the pool, in `:ractor` mode by its ractor's main thread,
+   which asks the ractor's supervisor thread (on the main ractor) for
+   the slot. The supervisor reads those reports and `Ractor#monitor`'s
+   end notice from one port (a report has a class of its own: the notice
+   is a Symbol up to Ruby 4.0 and an Array from 4.1), and respawns a
+   ractor that dies as a whole. A worker that keeps crashing within a
+   second of starting, before it served a request, is respawned with a
+   doubling delay (0.1 s up to 5 s), each thread paced by its own
+   crashes.
 
-   A crashed worker's slot is retired under its lane lock (the
-   dispatcher skips it) and goes back to the bank, which hands it to a
-   later worker only once it is quiet: no socket still owed its close,
-   no hijacked connection open, its last worker's handle let go of it
-   (so a late end never touches its successor), not quarantined. Crashes
+   A crashed worker's slot is retired under its lane lock (neither the
+   dispatcher nor inline placement picks it) and goes back to the bank,
+   which hands it to a later worker only once it is quiet: no socket
+   still owed its close, no hijacked or inline connection open, its last
+   worker's handle let go of it (so a late end never touches its
+   successor), not quarantined. Crashes
    therefore do not grow the slot table, and with lanes a request that
    arrives while the replacement starts waits for a worker, up to
    `queue_timeout`. Each slot carries a
@@ -442,7 +738,13 @@ Kino reads the 24-byte preface itself within those 15 s and replays it.
 Without ALPN it reads until the bytes tell HTTP/1 from h2. With
 `http2 false` only HTTP/1 is offered. A client must speak what it
 negotiated: the codec ends one that chose h2 and sends HTTP/1, or the
-reverse, serving it nothing.
+reverse, serving it nothing. An inline connection handed back with too
+little read for the sniff waits out what is left of its header time the
+same way, and what came is read onto what the worker read (a `recv` of
+at most 24 bytes), so hyper starts with it: hyper's own first read of a
+handed-back socket waits for tokio to report it readable, by when a
+drain may have cancelled the sniff. A connection placed on a worker that
+turned it down goes to hyper the same way, with nothing read.
 
 A connection whose first bytes are in by the accept, as they mostly
 are, pays one peek; one whose are not pays a timer and the readiness
@@ -456,13 +758,15 @@ served closes the connection unanswered and drops the request's future,
 and a request still waiting for room in the queue or a lane leaves it.
 One already queued runs, and its answer goes nowhere; an answer written
 before hyper reads the end still goes out. A connection that ends
-before a whole request closes at once with no app call.
+before a whole request closes at once with no app call. Inline, a whole
+request then an end is answered and the connection closes after it, as
+seeing the end before the app runs would take a peek per request.
 
 ## HTTP/2
 
-Plaintext connections go through hyper-util's auto builder, which picks
-h2 by the 24-byte preface sniff (prior-knowledge h2c) and HTTP/1.x
-otherwise; TLS connections get the codec ALPN chose,
+Plaintext connections that hyper serves go through hyper-util's auto
+builder, which picks h2 by the 24-byte preface sniff (prior-knowledge
+h2c) and HTTP/1.x otherwise; TLS connections get the codec ALPN chose,
 or without ALPN the one the preface tells (see
 [Intake deadlines](#intake-deadlines)); `http2 false` pins the HTTP/1
 codec and skips the sniff entirely. Streams multiplex into the same

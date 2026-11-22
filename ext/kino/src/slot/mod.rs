@@ -3,10 +3,13 @@
 //! (lane.rs), the park flag (park.rs), what is in flight (load.rs), and who is on the slot
 //! (life.rs).
 
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::Arc;
 
+use parking_lot::Mutex;
+
 use crate::doorbell::Doorbell;
+use crate::inline::InlineConn;
 use crate::registry::{BoxedCtx, LaneItem, ServerInner};
 use crate::response::{Cut, Responder};
 
@@ -29,8 +32,8 @@ pub const WS_INBOX: usize = 1024;
 /// A held lane lock: retire, quarantine and recycle check the generation under it.
 type LaneGuard<'a> = parking_lot::MutexGuard<'a, Option<flume::Sender<LaneItem>>>;
 
-/// Park, Load, Life, the lane lock and the Arc's count sit on cache lines of their own (128
-/// bytes): dispatch locks the lane and reads Park and Load for every request while
+/// Park, Load, Life, the lane lock and the Arc's count sit on cache lines of their own (128 bytes,
+/// as inline's Spinners): dispatch locks the lane and reads Park and Load for every request while
 /// the worker writes them, and a field added anywhere moves none of them onto another's line.
 #[derive(Default)]
 pub struct WorkerSlot {
@@ -43,12 +46,27 @@ pub struct WorkerSlot {
     /// Open hijack bridges of this worker's requests. In :ractor mode the app serves them
     /// from the worker's Ractor, so a worker holding any is not idle.
     pub hijacked: AtomicUsize,
+    pub inline: InlineSeats,
+}
+
+/// worker_loop serving inline: its open connections and their sockets, those answered whose job
+/// has not looked since (placement skips them), and counters never reset.
+#[derive(Default)]
+pub struct InlineSeats {
+    pub conns: AtomicUsize,
+    pub ios: Mutex<Vec<crate::inline::Listed>>,
+    pub answered: AtomicUsize,
+    pub requests: AtomicU64,
+    /// Connections Kino cut off, whatever for (IoState::ends).
+    pub closed: AtomicU64,
+    /// Spins its connections' jobs ended, whatever they caught.
+    pub spins: AtomicU64,
 }
 
 impl WorkerSlot {
-    pub fn new(lanes: bool, inbox: usize, doorbell: Option<Doorbell>) -> Self {
+    pub fn new(lanes: bool, inbox: usize, doorbell: Option<Doorbell>, inline: bool) -> Self {
         WorkerSlot {
-            lane: Lane::new(lanes, inbox, doorbell),
+            lane: Lane::new(lanes, inbox, doorbell, inline),
             ..WorkerSlot::default()
         }
     }
@@ -108,9 +126,19 @@ impl WorkerSlot {
     }
 
     /// A worker_loop worker answered the request (Load::answered); nothing to any other.
-    pub fn answered(&self, responder: &Arc<Responder>) {
-        if self.lane.is_worker_loop() {
-            self.load.answered(responder);
+    /// The thread that served an `inline` one goes back to its loop's doorbell wait or a job.
+    pub fn answered(&self, responder: &Arc<Responder>, inline: bool) {
+        if !self.lane.is_worker_loop() {
+            return;
+        }
+        self.load.answered(responder);
+        if inline {
+            let now = crate::mono::mono_us();
+            if self.park.parked.load(Ordering::Relaxed) {
+                self.load.waits_on_doorbell(now);
+            } else {
+                self.load.last_started_us.store(now, Ordering::Relaxed);
+            }
         }
     }
 
@@ -124,6 +152,31 @@ impl WorkerSlot {
         let in_flight = self.load.in_flight();
         let away = self.load.away_since()?;
         (in_flight > 0 || self.lane.has_waiting()).then_some(away)
+    }
+
+    /// Hand a placed connection to this worker_loop worker and ring its doorbell; back if its
+    /// lane is closed or it retired, was quarantined or left its slot, checked under the lane
+    /// lock.
+    pub fn send_placed(&self, conn: Box<InlineConn>) -> Result<(), Box<InlineConn>> {
+        let lane = self.lane.tx.lock();
+        let (Some(_), Some(placed), Some(doorbell)) =
+            (lane.as_ref(), &self.lane.placed_tx, &self.lane.doorbell)
+        else {
+            return Err(conn);
+        };
+        if self.life.retired()
+            || self.life.quarantined.load(Ordering::SeqCst)
+            || self.load.capacity.load(Ordering::Relaxed) == 0
+        {
+            return Err(conn);
+        }
+        // Listed under the lane lock, under which a crash retires the slot before it gives up the
+        // slot's connections: one it would refuse is never among them.
+        conn.list();
+        placed.send(conn).map_err(|refused| refused.into_inner())?;
+        drop(lane);
+        doorbell.ring();
+        Ok(())
     }
 
     pub fn close_lane(&self) {
@@ -161,6 +214,7 @@ impl WorkerSlot {
     /// the dispatcher holds while it checks and sends, so every dispatch that saw "not
     /// retired" is in the lane before the worker drains it. The sockets close with 1001
     /// first, so a later worker on the slot cannot inherit the close.
+    /// Its inline connections go to hyper at their jobs' next look, their clients keeping them.
     pub fn retire_at(&self, generation: u64) -> bool {
         let lane = self.lane.tx.lock();
         let current = self.generation() == generation;
@@ -177,6 +231,8 @@ impl WorkerSlot {
 
     /// Give the slot up as wedged if still at `generation` (the sample may predate a crash):
     /// its sockets' events are dropped and they close with 1011.
+    /// Its idle inline connections close and unplaced ones go to hyper (flag set under the lane
+    /// lock).
     pub fn quarantine_at(&self, generation: u64) -> bool {
         {
             let _lane = self.lane.tx.lock();
@@ -186,17 +242,19 @@ impl WorkerSlot {
             self.life.quarantined.store(true, Ordering::SeqCst);
         }
         crate::ws::give_up_slot(self);
+        crate::inline::quarantine(self);
         true
     }
 
     /// Hand the slot to a new worker once quiet: no socket of the last worker counts on it,
-    /// no hijacked connection is open, its last worker's handle let go (Life::holder),
+    /// no hijacked or inline connection is open, its last worker's handle let go (Life::holder),
     /// and it is not quarantined (its worker may come back).
     /// Slots are never removed. Returns the new generation.
     pub fn recycle(&self) -> Option<u64> {
         let lane = self.lane.tx.lock();
         let quiet = self.sockets.open() == 0
             && self.hijacked.load(Ordering::SeqCst) == 0
+            && self.inline.conns.load(Ordering::SeqCst) == 0
             && !self.life.is_held()
             && !self.life.quarantined.load(Ordering::SeqCst);
         if !quiet {
@@ -207,30 +265,32 @@ impl WorkerSlot {
         Some(self.generation())
     }
 
-    /// Retire the slot first, so dispatch does not pick the dead worker, then 500 or cut (for
-    /// `why`) what it was serving. Out come the requests that waited in its lane.
+    /// Retire the slot first, so neither dispatch nor placement picks the dead worker, then 500
+    /// or cut (for `why`) what it was serving. Out come the requests that waited in its lane.
     pub fn abort(&self, why: Cut) -> Vec<BoxedCtx> {
         self.retire_dead();
+        crate::inline::giving_up(self, Cut::Crash);
         for responder in self.load.current.lock().drain(..) {
             responder.close_bells();
             responder.give_up(why);
         }
-        self.clear_dead()
+        self.clear_dead(Cut::Crash)
     }
 
     /// The worker may still run, so its requests stay listed for interrupt_all_workers.
     /// Its lane's requests get their 500 as they drop.
     pub fn abort_held(&self) {
+        crate::inline::giving_up(self, Cut::Shutdown);
         for responder in self.load.current.lock().iter() {
             responder.give_up(Cut::Shutdown);
         }
         self.interrupt();
         self.retire_dead();
-        drop(self.clear_dead());
+        drop(self.clear_dead(Cut::Shutdown));
     }
 
-    /// Retired under the lane lock as in retire_at, so dispatch does not reach the dead worker;
-    /// the lane and a worker_loop doorbell stay for the slot's next worker.
+    /// Retired under the lane lock as in retire_at, so neither dispatch nor placement reaches the
+    /// dead worker; the lane and a worker_loop doorbell stay for the slot's next worker.
     fn retire_dead(&self) {
         {
             let _lane = self.lane.tx.lock();
@@ -241,17 +301,22 @@ impl WorkerSlot {
     }
 
     /// What the dead worker left: its sensors reset, its lane's requests out for the caller to
-    /// dispatch again or drop.
-    fn clear_dead(&self) -> Vec<BoxedCtx> {
+    /// dispatch again or drop, its inline connections ended for `why`.
+    fn clear_dead(&self, why: Cut) -> Vec<BoxedCtx> {
         self.load.clear();
-        self.lane.rx.as_ref().map_or_else(Vec::new, |rx| {
+        let queued = self.lane.rx.as_ref().map_or_else(Vec::new, |rx| {
             rx.try_iter()
                 .filter_map(|item| match item {
                     LaneItem::Request(ctx) => Some(ctx),
                     LaneItem::Bell => None,
                 })
                 .collect()
-        })
+        });
+        // Unplaced connections go to hyper with nothing read; served ones end here whatever their
+        // jobs do next, but for those a crash finds idle, which go to hyper too.
+        crate::inline::unplace(self);
+        crate::inline::abandon_slot(self, why);
+        queued
     }
 
     /// Abort, and close its sockets with 1011 (their handlers died with it); how many.
@@ -264,11 +329,13 @@ impl WorkerSlot {
     }
 
     /// Body I/O under a fiber scheduler waits on its requests' bells, rung after the halt.
+    /// Inline connections not serving a request (reading one, or still writing an answer) close.
     pub fn interrupt(&self) {
         self.halt();
         for responder in self.load.current.lock().iter() {
             responder.ring_bells();
         }
+        crate::inline::shut_unserved(self);
     }
 
     pub fn halt(&self) {

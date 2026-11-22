@@ -30,9 +30,8 @@ fn admit(
     let env = crate::request::build_env(ruby, &ctx)?;
     let websocket = ctx.offers_websocket();
     let hijack = crate::hijack::offered(&ctx);
-    let request = ruby.obj_wrap(Request(RefCell::new(*ctx)));
     let strings = crate::env_strings::get();
-    env.aset(ruby.get_inner(strings.kino_request), request.as_value())?;
+    let request = embed(ruby, strings, env, ctx)?;
     if hijack {
         // The request handle is its own hijack callable (Request#call).
         env.aset(ruby.get_inner(strings.rack_hijack_offered), true)?;
@@ -69,7 +68,43 @@ pub(super) fn enlist(server: &ServerInner, slot: &Arc<WorkerSlot>, ctx: &mut Req
     }
 }
 
-/// A request as its env Hash, a socket event as WsEvent::into_ruby makes it, or :wake.
+/// An inline request, admitted on its connection's job as admit admits one from a lane, except
+/// that it waited in no queue, took no lane's room and counts in flight from its parse. Never a
+/// hijack or a WebSocket.
+pub(crate) fn admit_inline(
+    ruby: &Ruby,
+    server: &ServerInner,
+    slot: &Arc<WorkerSlot>,
+    ctx: BoxedCtx,
+) -> Result<RHash, Error> {
+    enlist_inline(server, slot, &ctx);
+    let env = crate::request::build_env(ruby, &ctx)?;
+    embed(ruby, crate::env_strings::get(), env, ctx)?;
+    Ok(env)
+}
+
+pub(crate) fn enlist_inline(server: &ServerInner, slot: &WorkerSlot, ctx: &RequestCtx) {
+    server.counters.served.fetch_add(1, Ordering::Relaxed);
+    slot.load.admit(&ctx.responder, std::time::Instant::now());
+    if slot.lane.is_worker_loop() {
+        slot.load.hold(Arc::as_ptr(&ctx.responder) as usize);
+    }
+}
+
+/// `ctx` wrapped in the calling Ractor, which owns it from here on, under the "kino.request" key.
+#[inline]
+fn embed(
+    ruby: &Ruby,
+    strings: &crate::env_strings::EnvStrings,
+    env: RHash,
+    ctx: BoxedCtx,
+) -> Result<magnus::typed_data::Obj<Request>, Error> {
+    let request = ruby.obj_wrap(Request(RefCell::new(*ctx)));
+    env.aset(ruby.get_inner(strings.kino_request), request.as_value())?;
+    Ok(request)
+}
+
+/// A request as its env Hash, a socket event as WsEvent::into_ruby makes it, :wake, or a Conn.
 #[inline]
 fn item_value(
     ruby: &Ruby,
@@ -81,6 +116,7 @@ fn item_value(
         Item::Ctx(ctx) => Ok(admit(ruby, server, slot, ctx)?.as_value()),
         Item::Ws(event) => event.into_ruby(ruby),
         Item::Wake => Ok(crate::symbols::get().wake.value()),
+        Item::Conn(conn) => Ok(crate::inline::wrap(ruby, conn)),
     }
 }
 
@@ -299,6 +335,8 @@ impl Worker {
     }
 
     /// The worker leaves its slot; its wakers stop waking.
+    /// Whatever ended it, placement passes over the slot from now on: its capacity goes under the
+    /// lane lock send_placed checks, and its unplaced connections go to hyper.
     pub fn release(rb_self: &Worker) {
         let slot = &rb_self.slot;
         // Once only, and never once the slot is another worker's.
@@ -306,9 +344,15 @@ impl Worker {
             return;
         }
         slot.load.let_go();
-        if slot.life.let_go(rb_self.generation) {
-            slot.release();
+        if !slot.life.let_go(rb_self.generation) {
+            return;
         }
+        slot.release();
+        {
+            let _lane = slot.lane.tx.lock();
+            slot.load.set_capacity(0);
+        }
+        crate::inline::unplace(slot);
     }
 
     /// Kino::Native::Worker#crashed: answer what it held and retire its slot (WorkerSlot::crash)
@@ -326,8 +370,9 @@ impl Worker {
 
     /// Kino::Native::Worker#take_nonblock(only = nil): an env Hash, a socket event, :wake; false
     /// when nothing is ready (the doorbell then armed: wait on #ready_fd); nil once the lane is
-    /// closed or a retired worker has nothing left. `only` (:events, :requests) narrows it, and
-    /// then it never returns nil.
+    /// closed or a retired worker has nothing left. `only` (:events, :requests, :connections)
+    /// narrows it, and then it never returns nil. A connection to serve inline comes as a
+    /// Kino::Native::Conn.
     pub fn take_nonblock(ruby: &Ruby, rb_self: &Worker, args: &[Value]) -> Result<Value, Error> {
         rb_self.take(ruby, "take_nonblock", args, false)
     }
@@ -349,11 +394,12 @@ impl Worker {
             None => Room::All,
             Some(&only) if symbols.events.is(only) => Room::Events,
             Some(&only) if symbols.requests.is(only) => Room::Requests,
+            Some(&only) if symbols.connections.is(only) => Room::Connections,
             Some(&only) => {
                 let other = magnus::Symbol::try_convert(only)?.name()?;
                 return Err(Error::new(
                     ruby.exception_arg_error(),
-                    format!("{native} takes :events or :requests, not :{other}"),
+                    format!("{native} takes :events, :requests or :connections, not :{other}"),
                 ));
             }
         };

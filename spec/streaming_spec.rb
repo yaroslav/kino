@@ -245,16 +245,17 @@ RSpec.describe "streaming bodies" do
     # The response head and first chunk go out (with the access log
     # timing the app call) while the helper waits for the body; the client
     # sends the body only once it has them, and the helper's read ends the
-    # stream.
+    # stream. Chunked, as a body short enough to read whole before the app
+    # runs (inline) never waits.
     it_in_both_loops "streams a response while a helper thread is blocked reading the request body" do
       received = +""
       log = capture_native_stderr do
         capture_native_stdout do
           with_streaming_server(mode, log_requests: true) do |_host, port, server|
             TCPSocket.open("127.0.0.1", port) do |client|
-              client.write("POST /relay HTTP/1.1\r\nHost: kino.test\r\ncontent-length: 5\r\nconnection: close\r\n\r\n")
+              client.write("POST /relay HTTP/1.1\r\nHost: kino.test\r\ntransfer-encoding: chunked\r\nconnection: close\r\n\r\n")
               read_until(client, received, "streaming; ")
-              client.write("hello")
+              client.write("5\r\nhello\r\n0\r\n\r\n")
               read_until(client, received, "read: hello")
             end
 

@@ -1,5 +1,6 @@
 //! One request through hyper: body forwarding, the queue, the answer and the access log.
 
+use std::ops::Deref;
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
 use std::time::Duration;
@@ -7,6 +8,7 @@ use std::time::Duration;
 use http_body_util::BodyExt;
 
 use super::accept::Peer;
+use crate::access_log::{Logged, Timing};
 use crate::framing::content_length;
 use crate::registry::ServerInner;
 use crate::request::RequestCtx;
@@ -21,26 +23,27 @@ fn branded(mut response: HyperResponse) -> HyperResponse {
 }
 
 /// Idle deadline between body frames, so a silent client cannot pin a worker in read_body.
-pub(super) const BODY_READ_TIMEOUT: Duration = Duration::from_secs(30);
+pub(crate) const BODY_READ_TIMEOUT: Duration = Duration::from_secs(30);
 
-/// A request counted in Counters::in_flight while this lives. It borrows its connection's
-/// server, keeping the server's Arc count, which every worker take moves, off the I/O threads.
+/// A request counted in Counters::in_flight while this lives. hyper's borrows its connection's
+/// server, keeping the server's Arc count, which every worker take moves, off the I/O threads;
+/// an inline request's holds an Arc.
 /// A Drop guard: hyper drops this future at an await when the client aborts, and a
 /// plain decrement after it would never run.
-struct InFlight<'a> {
-    server: &'a ServerInner,
+pub(crate) struct InFlight<S: Deref<Target = ServerInner> = Arc<ServerInner>> {
+    server: S,
     /// A switching request's responder, which leaves the count when the app takes it over.
     switching: Option<Arc<Responder>>,
 }
 
-impl<'a> InFlight<'a> {
-    fn enter(server: &'a ServerInner, switching: Option<Arc<Responder>>) -> Self {
+impl<S: Deref<Target = ServerInner>> InFlight<S> {
+    pub(crate) fn enter(server: S, switching: Option<Arc<Responder>>) -> Self {
         server.counters.in_flight.fetch_add(1, Ordering::Relaxed);
         InFlight { server, switching }
     }
 }
 
-impl Drop for InFlight<'_> {
+impl<S: Deref<Target = ServerInner>> Drop for InFlight<S> {
     fn drop(&mut self) {
         // A hijacked request left the count when the app took it over.
         if self.switching.as_ref().is_none_or(|r| r.leave_in_flight()) {
@@ -61,7 +64,11 @@ pub(super) async fn handle_request(
     let upgrade = crate::upgrade::capture(&mut req, server);
     let (parts, body) = req.into_parts();
     let head = parts.method == http::Method::HEAD;
-    let logged = Logged::arrival(server, &parts, &peer);
+    // Only when logging.
+    let logged = server.access_log.as_ref().map(|log| {
+        let logged = Logged::arrival(log, &parts.method, &parts.uri, peer.remote.ip());
+        (log, logged)
+    });
 
     // A declared oversize body gets a 413 before any worker runs; the forwarder caps
     // chunked or lying clients, and read_body raises.
@@ -78,7 +85,7 @@ pub(super) async fn handle_request(
     let body_rx = (!bodyless).then(|| forward_body(body, &responder, max_body));
     let ctx = RequestCtx::new(parts, peer, server, responder, body_rx, upgrade);
 
-    let in_flight = InFlight::enter(server, switching);
+    let in_flight = InFlight::enter(&**server, switching);
 
     // One exit, so the access log sees every outcome, 503s included.
     let response = if oversize {
@@ -89,64 +96,15 @@ pub(super) async fn handle_request(
     } else {
         await_head(server, in_flight.switching.as_deref(), &mut head_rx).await
     };
-    if let Some(logged) = logged {
-        logged.completion(&response);
+    if let Some((log, logged)) = logged {
+        // A 503 or 504 never reached a worker and carries no timing.
+        let timing = response.extensions().get::<Timing>().copied();
+        let total = logged.elapsed();
+        logged.completion(log, response.status().as_u16(), total, timing);
     }
     Ok(branded(crate::response::without_forbidden_body(
         response, head,
     )))
-}
-
-/// A request's lines in the access log.
-struct Logged<'a> {
-    log: &'a crate::logsink::Sink,
-    start: std::time::Instant,
-    method: String,
-    target: String,
-}
-
-impl<'a> Logged<'a> {
-    /// Only when logging. The arrival line goes out before the app sees the request, so a
-    /// hang shows as an arrow with no answer.
-    fn arrival(
-        server: &'a ServerInner,
-        parts: &http::request::Parts,
-        peer: &Peer,
-    ) -> Option<Logged<'a>> {
-        let log = server.access_log.as_ref()?;
-        let target = match parts.uri.query() {
-            Some(q) => format!("{}?{}", parts.uri.path(), q),
-            None => parts.uri.path().to_string(),
-        };
-        let method = parts.method.to_string();
-        log.write_line(crate::access_log::arrival(
-            &method,
-            &target,
-            peer.remote.ip(),
-        ));
-        let start = std::time::Instant::now();
-        Some(Logged {
-            log,
-            start,
-            method,
-            target,
-        })
-    }
-
-    /// A 503 or 504 never reached a worker and carries no timing.
-    fn completion(self, response: &HyperResponse) {
-        let timing = response
-            .extensions()
-            .get::<crate::access_log::Timing>()
-            .copied();
-        self.log.write_line(crate::access_log::completion(
-            response.status().as_u16(),
-            &self.method,
-            &self.target,
-            self.start.elapsed(),
-            timing,
-        ));
-    }
 }
 
 /// The request's body, forwarded by a task of its own through a bounded channel, so hyper is

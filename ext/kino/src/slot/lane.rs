@@ -22,6 +22,10 @@ pub struct Lane {
     pub wake_pending: AtomicBool,
     /// worker_loop only: what its worker's scheduler waits on.
     pub doorbell: Option<Doorbell>,
+    /// Placed inline connections not taken yet, apart from its lane: no sibling's steal meets
+    /// one.
+    pub placed_tx: Option<flume::Sender<Box<crate::inline::InlineConn>>>,
+    pub placed_rx: Option<flume::Receiver<Box<crate::inline::InlineConn>>>,
 }
 
 /// The dispatcher's lock on the lane, which it takes for every send: on a line of its own, apart
@@ -40,7 +44,8 @@ impl std::ops::Deref for LaneTx {
 
 impl Lane {
     /// A worker_loop lane is unbounded: its depth follows its worker's room (lane_depth).
-    pub(super) fn new(lanes: bool, inbox: usize, doorbell: Option<Doorbell>) -> Self {
+    /// Only an `inline` server's gets an inbox for placed connections.
+    pub(super) fn new(lanes: bool, inbox: usize, doorbell: Option<Doorbell>, inline: bool) -> Self {
         if !lanes {
             return Lane::default();
         }
@@ -49,12 +54,21 @@ impl Lane {
             Some(_) => flume::unbounded(),
         };
         let (ws_tx, ws_rx) = flume::bounded(inbox);
+        let (placed_tx, placed_rx) = match &doorbell {
+            Some(_) if inline => {
+                let (tx, rx) = flume::unbounded();
+                (Some(tx), Some(rx))
+            }
+            _ => (None, None),
+        };
         Lane {
             tx: LaneTx(Mutex::new(Some(tx))),
             rx: Some(rx),
             ws_tx: Some(ws_tx),
             ws_rx: Some(ws_rx),
             doorbell,
+            placed_tx,
+            placed_rx,
             ..Lane::default()
         }
     }
@@ -88,6 +102,12 @@ impl Lane {
         self.wake_pending.load(Ordering::Relaxed)
             || self.ws_rx.as_ref().is_some_and(|inbox| !inbox.is_empty())
             || self.holds_items()
+            || self.placed_waiting()
+    }
+
+    pub fn placed_waiting(&self) -> bool {
+        let placed = self.placed_rx.as_ref();
+        placed.is_some_and(|placed| !placed.is_empty())
     }
 
     /// The wake hook's turn, if due. The load first keeps the every-take check from writing
