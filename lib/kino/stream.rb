@@ -4,7 +4,7 @@ module Kino
   # @private
   # The stream handed to Rack 3 streaming bodies (`body.call(stream)`).
   # Rack 3 requires it to be full-duplex: writes go to the native response
-  # channel (a slow client blocks the writer with the GVL released), reads
+  # channel (a slow client blocks the writer, or suspends its fiber under a scheduler), reads
   # pull the remaining request body through the request's own rack.input.
   class Stream
     def initialize(request, input)
@@ -23,7 +23,7 @@ module Kino
     def write(chunk)
       raise IOError, "stream is closed for writing" if @write_closed
 
-      @request.write_chunk(chunk)
+      @request.write_all(chunk)
       chunk.bytesize
     end
 

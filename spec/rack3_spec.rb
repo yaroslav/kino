@@ -149,6 +149,51 @@ RSpec.describe "Rack 3 compliance" do
     end
   end
 
+  describe "a stream closed while another thread writes to it" do
+    # /stream's body writes 12.5 MiB from a thread of its own, which
+    # blocks on a client that reads nothing, then closes the stream from
+    # the request's thread; each step reports to `port`.
+    def closing_under_a_writer(port)
+      Ractor.shareable_proc do |env|
+        next [200, {}, ["ok"]] unless env["PATH_INFO"] == "/stream"
+
+        body = lambda do |stream|
+          writer = Thread.new do
+            200.times { stream.write("x" * 65_536) }
+            port << :written
+          rescue IOError => e
+            port << e.class.name
+          end
+          sleep 0.3
+          stream.close
+          port << :closed
+          writer.join
+        end
+        [200, {}, body]
+      end
+    end
+
+    each_mode do |mode|
+      it "fails the blocked writer once its client leaves, and keeps the worker serving" do
+        with_server(closing_under_a_writer(reports.port), mode: mode, workers: 1, threads: 1) do |_host, port|
+          client = Socket.new(:INET, :STREAM)
+          client.setsockopt(:SOCKET, :RCVBUF, 4096)
+          client.connect(Socket.sockaddr_in(port, "127.0.0.1"))
+          client.write("GET /stream HTTP/1.1\r\nHost: x\r\n\r\n")
+          client.readpartial(4096)
+
+          expect(reports.next(awaiting: "the stream's close")).to eq(:closed)
+          client.close
+          # The client left while the write waited: Kino::ClientGone.
+          expect(reports.next(awaiting: "the writer's end")).to eq("Kino::ClientGone")
+          expect(get(port, "/")).to eq("ok")
+        ensure
+          client&.close
+        end
+      end
+    end
+  end
+
   describe "concurrency" do
     it "overlaps slow requests across worker threads" do
       app = lint(lambda do |_env|

@@ -10,10 +10,13 @@ use hyper::body::Frame;
 use hyper::client::conn::http2::SendRequest;
 use hyper_util::rt::{TokioExecutor, TokioIo};
 
-use crate::registry::ServerInner;
-use crate::request::RequestCtx;
+use crate::queue::testing::{admit_next, rings};
+use crate::registry::{BoxedCtx, ServerInner};
+use crate::request::{RequestCtx, Step, WaitError};
 use crate::response::{full_body, plain_response, Cut};
-use crate::testing::{connect, get, h2_get, take_ctx, TestServer};
+use crate::testing::{
+    connect, eventually, get, h2_get, response_to, slot, take_ctx, until, Pending, TestServer,
+};
 
 /// A prior-knowledge HTTP/2 client connection to `server`.
 async fn h2(server: &Arc<ServerInner>) -> SendRequest<Full<Bytes>> {
@@ -339,4 +342,208 @@ async fn rapid_stream_resets_do_not_wedge_the_pipeline() {
     let response = sender.send_request(h2_get("/done")).await;
     assert_eq!(body_of(response.expect("still served")).await, "ok\n");
     worker.await.expect("worker loop");
+}
+
+type Chunk = Result<hyper::body::Frame<bytes::Bytes>, std::io::Error>;
+type Trickled = http_body_util::StreamBody<flume::r#async::RecvStream<'static, Chunk>>;
+
+/// A POST through a real connection, as slot 0's worker_loop worker
+/// admits it. Its body comes chunk by chunk through the returned
+/// sender, and ends when that drops; the client goes away when its
+/// connection task (returned too) is aborted.
+async fn admitted(
+    server: &Arc<ServerInner>,
+) -> (
+    flume::Sender<Chunk>,
+    Pending,
+    tokio::task::JoinHandle<()>,
+    BoxedCtx,
+) {
+    let io = TokioIo::new(super::testing::spawn_conn(server.clone()));
+    let (mut sender, conn) = hyper::client::conn::http1::handshake::<_, Trickled>(io)
+        .await
+        .expect("h1 handshake");
+    let conn = tokio::spawn(async move {
+        let _ = conn.await;
+    });
+    let (chunks, body) = flume::bounded(16);
+    let request = hyper::Request::post("/upload")
+        .header("host", "kino.test")
+        .body(http_body_util::StreamBody::new(body.into_stream()))
+        .expect("request");
+    let pending = tokio::spawn(async move { sender.send_request(request).await });
+    let slot = slot(server, 0);
+    until("the request in the worker's lane", || {
+        slot.lane.holds_items()
+    })
+    .await;
+    let ctx = admit_next(server, &slot);
+    (chunks, pending, conn, ctx)
+}
+
+fn chunk(text: &'static str) -> Chunk {
+    Ok(hyper::body::Frame::data(bytes::Bytes::from_static(
+        text.as_bytes(),
+    )))
+}
+
+/// The descriptor a read that has to wait hands out.
+fn waiting_read(ctx: &RequestCtx) -> std::os::fd::RawFd {
+    match ctx.read_nonblock().expect("a read") {
+        Step::Wait(fd) => fd,
+        Step::Done(read) => panic!("expected to wait, read {read:?}"),
+    }
+}
+
+/// Writes 16 KiB frames until one has to wait and the wait holds
+/// while the connection runs, the client reading nothing: the
+/// descriptor it waits on.
+async fn stalled_write(ctx: &RequestCtx) -> std::os::fd::RawFd {
+    for _ in 0..1000 {
+        match ctx
+            .write_nonblock(|_| bytes::Bytes::from(vec![b'x'; 16 * 1024]))
+            .expect("an open stream")
+        {
+            Step::Done(()) => tokio::task::yield_now().await,
+            Step::Wait(fd) => {
+                tokio::time::sleep(Duration::from_millis(20)).await;
+                if rings(fd) == 0 {
+                    return fd;
+                }
+                ctx.waited();
+            }
+        }
+    }
+    panic!("the stream never filled");
+}
+
+#[tokio::test]
+async fn reads_and_writes_that_never_wait_open_no_descriptor() {
+    let server = TestServer::worker_loop().workers(1).build();
+    let (chunks, pending, _conn, ctx) = admitted(&server).await;
+    chunks.send(chunk("all of it")).expect("client body open");
+    drop(chunks);
+    let body_rx = ctx.body_rx.clone().expect("a body channel");
+    eventually("the whole body forwarded", || {
+        body_rx.is_disconnected().then_some(())
+    })
+    .await;
+
+    assert!(matches!(ctx.read_nonblock(), Ok(Step::Done(Some(_)))));
+    assert_eq!(ctx.read_nonblock().expect("a read"), Step::Done(None));
+    assert!(ctx
+        .responder
+        .send_stream_head(hyper::Response::builder().status(200), false)
+        .expect("head"));
+    for _ in 0..4 {
+        let written = ctx.write_nonblock(|_| bytes::Bytes::from_static(b"event\n"));
+        assert_eq!(written.expect("an open stream"), Step::Done(()));
+    }
+    ctx.responder.finish_stream();
+    let body = response_to(pending).await.into_body().collect();
+    let body = tokio::time::timeout(Duration::from_secs(5), body)
+        .await
+        .expect("the stream ended within 5 s")
+        .expect("body")
+        .to_bytes();
+    assert_eq!(&body[..], b"event\n".repeat(4).as_slice());
+
+    assert!(ctx.responder.body_bell.sockets().is_none());
+    assert!(ctx.responder.room_bell.sockets().is_none());
+}
+
+#[tokio::test]
+async fn ending_a_stream_rings_a_write_still_waiting_on_it() {
+    // Given up (a crash, an error mid-stream), or finished by another
+    // fiber of the request.
+    type End = fn(&RequestCtx);
+    let ends: [(End, &str); 2] = [
+        (|ctx| ctx.responder.give_up(Cut::Crash), "Gone"),
+        (|ctx| ctx.responder.finish_stream(), "Closed"),
+    ];
+    for (end, fails) in ends {
+        let server = TestServer::worker_loop().workers(1).build();
+        let (chunks, pending, _conn, ctx) = admitted(&server).await;
+        drop(chunks);
+        assert!(ctx
+            .responder
+            .send_stream_head(hyper::Response::builder().status(200), false)
+            .expect("head"));
+        let _body = response_to(pending).await;
+
+        let fd = stalled_write(&ctx).await;
+        end(&ctx);
+        assert_eq!(
+            rings(fd),
+            1,
+            "the waiting write is rung, then fails as {fails}"
+        );
+        ctx.waited();
+        let late = ctx.write_nonblock(|_| bytes::Bytes::from_static(b"late"));
+        assert!(
+            matches!(
+                (fails, late),
+                ("Gone", Err(WaitError::Gone)) | ("Closed", Err(WaitError::Closed))
+            ),
+            "{fails}"
+        );
+    }
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_body_that_stalls_past_its_timeout_rings_the_waiting_read() {
+    let server = TestServer::worker_loop().workers(1).build();
+    let (chunks, _pending, _conn, ctx) = admitted(&server).await;
+
+    let fd = waiting_read(&ctx);
+    tokio::time::sleep(super::handle::BODY_READ_TIMEOUT + Duration::from_secs(1)).await;
+    assert_eq!(rings(fd), 1);
+    ctx.waited();
+    assert_eq!(ctx.read_nonblock().expect("a read"), Step::Done(None));
+    assert_eq!(
+        ctx.responder.body_abandoned(),
+        Some(crate::response::BodyAbandon::TimedOut)
+    );
+    drop(chunks);
+}
+
+#[test]
+fn a_body_cut_by_the_runtime_going_away_reads_as_interrupted() {
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(1)
+        .enable_all()
+        .build()
+        .expect("runtime");
+    let server = TestServer::worker_loop().workers(1).build();
+    let (chunks, ctx) = runtime.block_on(async {
+        let (chunks, _pending, _conn, ctx) = admitted(&server).await;
+        chunks.send(chunk("half")).expect("client body open");
+        (chunks, ctx)
+    });
+    let body_rx = ctx.body_rx.clone().expect("a body channel");
+    crate::testing::eventually_blocking("the chunk in the body channel", || {
+        (!body_rx.is_empty()).then_some(())
+    });
+    assert!(matches!(ctx.read_nonblock(), Ok(Step::Done(Some(_)))));
+    let fd = waiting_read(&ctx);
+
+    runtime.shutdown_timeout(Duration::from_secs(1));
+    assert_eq!(rings(fd), 1);
+    ctx.waited();
+    assert_eq!(ctx.read_nonblock().expect("a read"), Step::Done(None));
+    assert_eq!(
+        ctx.responder.body_abandoned(),
+        Some(crate::response::BodyAbandon::Interrupted)
+    );
+    drop(chunks);
+}
+
+#[tokio::test]
+async fn a_crashed_workers_requests_close_their_bells() {
+    let server = TestServer::worker_loop().workers(1).build();
+    let (_chunks, _pending, _conn, ctx) = admitted(&server).await;
+    waiting_read(&ctx);
+
+    slot(&server, 0).abort(crate::response::Cut::Crash);
+    assert!(ctx.responder.body_bell.sockets().is_none());
 }

@@ -108,8 +108,10 @@ RSpec.describe "native WebSocket failures" do
     end
   end
 
+  # A thread of the app's own that waits on the body holds the request
+  # under a worker_loop too, so the switch cannot take it.
   each_mode do |mode|
-    it "answers 500 to a switch while another of the app's threads waits on the request body" do
+    it_in_both_loops "answers 500 to a switch while another of the app's threads waits on the request body" do
       reported = reports.port
       on_error = Ractor.shareable_proc { |error, _env| reported << [:error, error.message] }
       busy = "another of the app's threads is waiting on this request"
@@ -145,9 +147,7 @@ RSpec.describe "native WebSocket failures" do
             expect(error).to match([:error, a_string_including(busy)]), "#{path}: #{seen}"
             expect(seen - [error]).to eq(callbacks), path
           end
-          id = server_id(server)
-          wait_for("the socket to stop counting") { Kino::Native.queue_stats(id)[2].zero? }
-          expect(server.stats[:worker_status].sum { |row| row[:websockets_open] }).to eq(0)
+          wait_for("the socket to stop counting") { server.stats[:worker_status].sum { |row| row[:websockets_open] }.zero? }
           expect(server.stats[:respawns]).to eq(0)
           expect(Net::HTTP.get("127.0.0.1", "/", port)).to eq("plain")
         end

@@ -8,7 +8,6 @@
 //! Ruby) loops, so pending VM interrupts are processed between chunks and
 //! Thread#kill / shutdown stay responsive within one tick.
 
-use std::ffi::c_void;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
@@ -46,10 +45,7 @@ pub fn sleep_chunk(ruby: &Ruby, seconds: f64) -> Result<f64, Error> {
                 std::thread::sleep(deadline - now);
             }
         },
-        Some(Ubf {
-            func: gvl::ubf_interrupt,
-            data: &interrupted as *const _ as *mut c_void,
-        }),
+        Some(Ubf::interrupt(&interrupted)),
     )?;
 
     let remaining = requested.saturating_sub(chunk);

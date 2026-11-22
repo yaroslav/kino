@@ -21,6 +21,7 @@ use parking_lot::Mutex;
 use tokio::sync::oneshot;
 
 use crate::counters::{tallied, Tallied, Tally};
+use crate::doorbell::Doorbell;
 
 pub type BodyFrame = hyper::body::Frame<Bytes>;
 pub type FrameResult = Result<BodyFrame, io::Error>;
@@ -55,6 +56,8 @@ pub fn responses_cut() -> [(&'static str, u64); Cut::ALL.len()] {
 pub enum BodyAbandon {
     Oversize = 1,
     TimedOut = 2,
+    /// The forwarder went with the runtime mid-body (shutdown).
+    Interrupted = 3,
 }
 
 impl TryFrom<u8> for BodyAbandon {
@@ -64,6 +67,7 @@ impl TryFrom<u8> for BodyAbandon {
         match code {
             1 => Ok(BodyAbandon::Oversize),
             2 => Ok(BodyAbandon::TimedOut),
+            3 => Ok(BodyAbandon::Interrupted),
             none => Err(none),
         }
     }
@@ -84,7 +88,7 @@ pub struct Responder {
     sink: HyperSink,
     responded: AtomicBool,
     /// The forwarder's abandonment flag rides in the one per-request shared
-    /// allocation rather than its own Arc. 0 = none, 1/2 = BodyAbandon.
+    /// allocation rather than its own Arc. 0 = none, else a BodyAbandon.
     body_abandoned: AtomicU8,
     /// Out of in_flight: once hijacked or once handle_request ended, whichever came first.
     left_in_flight: AtomicBool,
@@ -93,6 +97,10 @@ pub struct Responder {
     stream_cut: AtomicBool,
     /// No cut counts: a bodiless answer, or a head that never went out (answered_first).
     uncounted: AtomicBool,
+    /// Body I/O under a fiber scheduler waits on these: the next chunk or the body's end rings
+    /// `body_bell`, room in the response stream or its end `room_bell`.
+    pub body_bell: Doorbell,
+    pub room_bell: Doorbell,
 }
 
 impl Responder {
@@ -112,6 +120,16 @@ impl Responder {
         !self.left_in_flight.swap(true, Ordering::AcqRel)
     }
 
+    pub fn ring_bells(&self) {
+        self.body_bell.ring();
+        self.room_bell.ring();
+    }
+
+    pub fn close_bells(&self) {
+        self.body_bell.release();
+        self.room_bell.release();
+    }
+
     /// Record why the body forwarder gave up; the store happens before the
     /// sender drops, so a reader that saw Disconnected sees the flag too.
     pub fn abandon_body(&self, why: BodyAbandon) {
@@ -121,6 +139,12 @@ impl Responder {
     /// Whether (and why) the forwarder abandoned the request body.
     pub fn body_abandoned(&self) -> Option<BodyAbandon> {
         BodyAbandon::try_from(self.body_abandoned.load(Ordering::Relaxed)).ok()
+    }
+
+    /// The app still owes its answer, or the rest of a stream that was not cut.
+    pub fn open(&self) -> bool {
+        !self.responded.load(Ordering::SeqCst)
+            || (!self.stream_cut() && self.sink.body.lock().is_some())
     }
 
     /// Claim the right to respond. First caller wins; everyone else gets None.
@@ -215,6 +239,7 @@ impl Responder {
     /// Clean end of stream: dropping the sender ends the hyper body.
     pub fn finish_stream(&self) {
         self.sink.body.lock().take();
+        self.room_bell.ring();
     }
 
     pub fn cut_stream(&self, why: Cut) {
@@ -241,6 +266,8 @@ impl Responder {
             // Flagged before the send: without room for the frame, hyper fails it once drained.
             self.cut_stream(why);
             let _ = body_tx.try_send(Err(abandoned()));
+            // A write waiting for room fails now, not once the client reads.
+            self.room_bell.ring();
         }
     }
 }
@@ -262,8 +289,9 @@ pub fn stream_body_holding(
 }
 
 pub struct Streamed {
-    frames: StreamBody<flume::r#async::RecvStream<'static, FrameResult>>,
-    cut_by: Option<Arc<Responder>>,
+    frames: Option<StreamBody<flume::r#async::RecvStream<'static, FrameResult>>>,
+    /// A worker's stream's; each frame hyper takes, and the body's drop, rings its room bell.
+    responder: Option<Arc<Responder>>,
     _held: Option<Arc<dyn Send + Sync>>,
     /// hyper took something (the head, then data) since the body last made it wait.
     taken_since_wait: bool,
@@ -273,12 +301,12 @@ pub struct Streamed {
 impl Streamed {
     fn new(
         frames: flume::Receiver<FrameResult>,
-        cut_by: Option<Arc<Responder>>,
+        responder: Option<Arc<Responder>>,
         held: Option<Arc<dyn Send + Sync>>,
     ) -> Streamed {
         Streamed {
-            frames: StreamBody::new(frames.into_stream()),
-            cut_by,
+            frames: Some(StreamBody::new(frames.into_stream())),
+            responder,
             _held: held,
             taken_since_wait: true,
             failed: None,
@@ -298,11 +326,17 @@ impl hyper::body::Body for Streamed {
         if let Some(error) = this.failed.take() {
             return Poll::Ready(Some(Err(error)));
         }
-        let mut polled = Pin::new(&mut this.frames).poll_frame(cx);
-        if matches!(polled, Poll::Ready(None))
-            && this.cut_by.as_ref().is_some_and(|r| r.stream_cut())
-        {
-            polled = Poll::Ready(Some(Err(abandoned())));
+        let Some(frames) = this.frames.as_mut() else {
+            return Poll::Ready(None);
+        };
+        let mut polled = Pin::new(frames).poll_frame(cx);
+        if let Some(responder) = &this.responder {
+            if polled.is_ready() {
+                responder.room_bell.ring();
+            }
+            if matches!(polled, Poll::Ready(None)) && responder.stream_cut() {
+                polled = Poll::Ready(Some(Err(abandoned())));
+            }
         }
         match polled {
             // Once a body fails, hyper drops what it took but has not written (h1: the
@@ -327,11 +361,26 @@ impl hyper::body::Body for Streamed {
     }
 
     fn is_end_stream(&self) -> bool {
-        self.frames.is_end_stream()
+        self.frames
+            .as_ref()
+            .is_none_or(|frames| frames.is_end_stream())
     }
 
     fn size_hint(&self) -> hyper::body::SizeHint {
-        self.frames.size_hint()
+        self.frames.as_ref().map_or_else(
+            || hyper::body::SizeHint::with_exact(0),
+            |frames| frames.size_hint(),
+        )
+    }
+}
+
+impl Drop for Streamed {
+    /// The channel closes before the ring, so the writer it wakes finds it closed.
+    fn drop(&mut self) {
+        self.frames.take();
+        if let Some(responder) = &self.responder {
+            responder.room_bell.ring();
+        }
     }
 }
 

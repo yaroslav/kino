@@ -53,6 +53,7 @@ runs on Ractors too (see [Rails on Ractors](doc/rails-on-ractors.md)).
 - [Rack 3 compliance](#rack-3-compliance)
 - [Streaming responses](#streaming-responses)
 - [WebSockets](#websockets-experimental)
+- [Fibers inside Kino workers](#fibers-inside-kino-workers-experimental)
 - [Rails](#rails)
 
 ## Why
@@ -495,8 +496,10 @@ cause) for every one it retires.
 
 `quarantine_timeout: seconds` (or `quarantine_timeout 60` in `kino.rb`)
 quarantines a dispatch slot whose request (or WebSocket callback, or wake
-hook) has run longer than the deadline and spawns a replacement worker to
-restore capacity—distinct from
+hook) has run longer than the deadline (under a
+[`worker_loop`](doc/worker-loop.md#stuck-workers-and-quarantine), whose
+thread has stayed away from its loop that long) and spawns a replacement
+worker to restore capacity—distinct from
 `request_timeout`, which gives the client a 504 but leaves the slot
 occupied. `quarantine_max` (default: the worker count in `:ractor` mode,
 workers × threads in `:threaded`) caps the total number of replacement
@@ -553,7 +556,9 @@ series, one entry per execution slot (`workers × threads`). A crashed
 or retired worker's slot goes to a later worker, its counters starting
 over, once its sockets and hijacked connections are gone. `busy_ms` is
 how long the slot's current request, WebSocket callback or wake hook
-has been running (0 when idle), so a single slot climbing while the
+has been running (0 when idle; under a
+[`worker_loop`](doc/worker-loop.md#stats-and-logs), how long its thread
+has stayed away from its loop), so a single slot climbing while the
 rest sit at 0 is your stuck worker.
 
 The `/stats` response and `server.stats` carry `queue_time` (count and
@@ -564,7 +569,9 @@ not `queue_time`.
 
 A hijacked request leaves `in_flight` when the app takes it over and
 counts in `hijacked_connections` until its connection closes; `wakes`
-counts wake hook runs. `responses_cut` counts, for the whole process,
+counts wake hook runs (under a
+[`worker_loop`](doc/worker-loop.md#stats-and-logs), every wake its loop
+takes). `responses_cut` counts, for the whole process,
 [streamed responses](#streaming-responses) that ended early, by cause:
 `client_gone`, `shutdown` (the drain's deadline) and `crash`. The
 process's WebSocket counters sit under `websockets`;
@@ -604,9 +611,10 @@ mutex and never make a write syscall:
 
   The GC and allocation figures come from the VM's process-wide
   counters, so they appear only where one request at a time can own
-  them: in `:threaded` mode, or in `:ractor` mode with `workers 1`.
-  Parallel ractors would bill each other's work, so there the breakdown
-  is `(ruby; kino; wait)` alone.
+  them: in `:threaded` mode, or in `:ractor` mode with `workers 1`, and
+  never under a [`worker_loop`](doc/worker-loop.md#stats-and-logs),
+  whose requests interleave. Parallel ractors would bill each other's
+  work, so there the breakdown is `(ruby; kino; wait)` alone.
 
 - **`Kino::Logger`**: a `::Logger` over the same async sink, for your
   app's own logging (`Kino::Logger.new("log/production.log")`, or no
@@ -675,7 +683,9 @@ and `.error`; it is safe inside worker ractors.
 `Kino.sleep(seconds)` is a high-resolution sleep on the OS clock with
 the GVL released. MRI's own `sleep` wakes up late inside non-main
 ractors (details and numbers in [doc/benchmarks.md](doc/benchmarks.md)).
-Use `Kino.sleep` for explicit timer waits in handlers. Ordinary blocking
+Use `Kino.sleep` for explicit timer waits in handlers (but not under a
+[`worker_loop`](doc/worker-loop.md#waiting-the-right-way), where it
+holds every fiber on the worker: use `sleep` there). Ordinary blocking
 I/O does not need it.
 
 ## Rack 3 compliance
@@ -756,6 +766,32 @@ topic's subscribers, and `Kino::Worker.on_wake` runs background work on
 a worker's own thread. [doc/websockets.md](doc/websockets.md) is the
 guide: callbacks, flow control, topics, limits, close codes,
 `rack.hijack` and Action Cable, stats.
+
+## Fibers inside Kino workers (experimental)
+
+Kino serves from Ractors; with `worker_loop`, your own fiber scheduler
+runs inside each worker. A request that waits (a database permit, an
+upstream call, a slow client) suspends only its fiber, and the worker
+takes the next request meanwhile, with no extra thread and no extra
+wake-up per request. Kino still owns the Ractors, threads, dispatch and
+HTTP, and ships no scheduler and depends on none; Async is the example:
+
+```ruby
+# kino.rb
+require "async"
+
+threads 1
+worker_loop Ractor.shareable_proc { |worker|
+  Sync do |task|
+    worker.serve(concurrency: 32) { |job| task.async { job.call } }
+  end
+}
+```
+
+[doc/worker-loop.md](doc/worker-loop.md) is the guide: what counts
+toward `concurrency`, how requests, WebSocket callbacks and the wake
+hook share a worker, waiting the right way, shutdown, quarantine,
+dispatch, per-request cost and stats.
 
 ## Rails
 

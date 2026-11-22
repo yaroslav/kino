@@ -16,6 +16,7 @@ use crate::ws::{Cause, Refusal, WsCount, WsSnapshot};
 
 /// One dispatch slot's sensors, captured for a response. busy_ms is the
 /// age of the current in-flight work (0 when idle), the wedge signal.
+/// A worker_loop worker's is how long its thread has been away from its loop with work waiting.
 pub struct WorkerStat {
     pub index: usize,
     pub served: u64,
@@ -50,7 +51,7 @@ pub fn collect_worker_status(server: &ServerInner) -> Vec<WorkerStat> {
                 in_flight: slot.load.in_flight(),
                 // A quarantined slot is a known, handled wedge: report 0 so
                 // it never re-trips detection or reads as a live wedge.
-                busy_ms: match slot.load.busy_since() {
+                busy_ms: match slot.busy_since() {
                     Some(started) if !quarantined => now.saturating_sub(started) / 1000,
                     _ => 0,
                 },
@@ -529,10 +530,13 @@ impl Emit for RubyHash<'_> {
 #[cfg(test)]
 mod tests {
     use std::sync::atomic::Ordering::Relaxed;
+    use std::sync::Arc;
+    use std::time::{Duration, Instant};
 
     use super::*;
+    use crate::queue::TICK;
     use crate::registry::{QueueHistogramSnapshot, STATE_BOOTING, STATE_READY};
-    use crate::testing::{slot, TestServer};
+    use crate::testing::{assign, slot, TestServer};
 
     /// A snapshot with every count distinct: lanes, a busy worker that owns
     /// two WebSockets, and a retired idle one whose requests handed three
@@ -731,5 +735,66 @@ mod tests {
 
         let row = &Snapshot::take(&server).worker_status[0];
         assert_eq!((row.quarantined, row.busy_ms), (true, 0));
+    }
+
+    /// How long a worker_loop worker's thread stays away from its loop in
+    /// these tests, past any wait on its doorbell.
+    const AWAY: Duration = Duration::from_millis(100);
+
+    fn busy_ms(server: &ServerInner) -> u64 {
+        collect_worker_status(server)[0].busy_ms
+    }
+
+    #[test]
+    fn a_worker_loop_worker_reads_busy_once_its_thread_stays_away_with_work_waiting() {
+        use crate::queue::testing::{admit_next, nonblock, socket_sends};
+        use crate::queue::Room::{All, Events, Requests};
+        use crate::registry::BoxedCtx;
+        type Leave = fn(&ServerInner, &Arc<crate::slot::WorkerSlot>) -> Option<BoxedCtx>;
+        // How its thread left the loop, what came after, and whether it
+        // reads busy once the thread stayed away past any wait.
+        // One row per case; rustfmt would split each row field by field.
+        #[rustfmt::skip]
+        let rows: [(&str, Leave, bool); 8] = [
+            ("to wait on its doorbell, nothing to run",
+                |server, slot| { nonblock(server, slot, All); None }, false),
+            ("with a request it took", |server, slot| { assign(slot); Some(admit_next(server, slot)) }, true),
+            ("to wait on its doorbell, a request half a tick in",
+                |server, slot| { assert_eq!(nonblock(server, slot, All), "nothing"); std::thread::sleep(TICK / 2); assign(slot); None }, true),
+            ("to wait for events, an event half a tick in",
+                |server, slot| { assert_eq!(nonblock(server, slot, Events), "nothing"); std::thread::sleep(TICK / 2); socket_sends(slot, 0); None }, true),
+            ("to wait for requests, its wake hook due, its doorbell taken",
+                |server, slot| { assert!(slot.wake()); nonblock(server, slot, Requests); None }, true),
+            ("handed its end at the drain, then woken",
+                |server, slot| { server.close_queues(); nonblock(server, slot, All); slot.wake(); None }, false),
+            ("handed its end at its retirement, then woken",
+                |server, slot| { slot.retire(); nonblock(server, slot, All); slot.wake(); None }, false),
+            ("as its worker crashed, then woken",
+                |_, slot| { slot.abort(crate::response::Cut::Crash); slot.wake(); None }, false),
+        ];
+        for (left, leave, busy) in rows {
+            let server = TestServer::worker_loop().workers(1).build();
+            let slot = slot(&server, 0);
+            let left_at = Instant::now();
+            let open = leave(&server, &slot);
+            let read = busy_ms(&server);
+            // Against the time that really passed: a loaded runner can
+            // oversleep half a tick by more than half a tick.
+            let grace = if open.is_some() { Duration::ZERO } else { TICK };
+            let overdue = left_at.elapsed().saturating_sub(grace).as_millis() as u64;
+            assert!(
+                read <= overdue,
+                "{left}: a wait on the doorbell is time in the loop until it is overdue: read {read} ms busy, at most {overdue} ms overdue"
+            );
+
+            std::thread::sleep(TICK + AWAY);
+
+            let read = busy_ms(&server);
+            assert_eq!(
+                read >= AWAY.as_millis() as u64,
+                busy,
+                "a worker_loop worker whose thread left its loop {left}, {AWAY:?} past any wait, read {read} ms busy"
+            );
+        }
     }
 }

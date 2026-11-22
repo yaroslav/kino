@@ -1,6 +1,7 @@
 # frozen_string_literal: true
 
 require "net/http"
+require "timeout"
 
 RSpec.describe Kino::CrashBackoff do
   def boom = RuntimeError.new("boom").tap { |error| error.set_backtrace(["app.rb:3:in 'explode'"]) }
@@ -163,7 +164,7 @@ RSpec.describe "worker crashes" do
       server = client = nil
       log = capture_native_stderr do
         server = Kino::Server.new(app, mode: mode, workers: 1, threads: 1).start
-        client = TCPSocket.new("127.0.0.1", server.port)
+        client = client_socket(server.port)
         client.write("POST / HTTP/1.1\r\nHost: kino\r\nContent-Length: 10\r\n\r\n")
         wait_for("the request in flight") { server.stats[:in_flight] == 1 }
 
@@ -477,6 +478,295 @@ RSpec.describe "worker crashes" do
       end
 
       expect(log).to include("crashed at /uncopyable (spec/worker_crash_spec.rb:")
+    end
+  end
+end
+
+# Another of the app's threads interrupts the worker while it waits for
+# its next request: Thread#wakeup only wakes it (as #run does, which
+# also yields to it), and #raise raises there, out of the take, as
+# anywhere in the worker.
+RSpec.describe "Ruby interrupts into an idle worker" do
+  # GET /poke/<how> leaves a thread behind that, each time the worker
+  # waits for its next request, pokes it (wakeup: 5 times, 20 ms apart;
+  # raise, a RuntimeError, and crash, an Exception: once, a few
+  # milliseconds into the wait), then reports :poked.
+  def poking_app(reports)
+    Ractor.shareable_proc do |env|
+      how = env["PATH_INFO"][%r{\A/poke/(\w+)\z}, 1]
+      if how
+        worker = Thread.current
+        Thread.new do
+          pokes = %w[raise crash].include?(how) ? 1 : 5
+          pokes.times do |poke|
+            sleep 0.02 if poke.positive?
+            sleep 0.002 while worker.alive? && worker.status != "sleep"
+            break unless worker.alive?
+
+            case how
+            when "wakeup" then worker.wakeup
+            when "raise"
+              sleep 0.005
+              worker.raise(RuntimeError, "raised into an idle worker")
+            when "crash"
+              sleep 0.005
+              worker.raise(Exception, "crashed an idle worker")
+            end
+          end
+          reports << :poked
+        end
+      end
+      [200, {}, ["ok"]]
+    end
+  end
+
+  # One worker on one thread, serving poking_app (it reports to `reports`); yields the server
+  # and the worker exits (on_worker_exit's errors).
+  def with_poked_server(mode, lanes)
+    exits = Thread::Queue.new
+    server = Kino::Server.new(poking_app(reports.port), mode: mode, workers: 1, threads: 1, **lanes,
+      on_worker_exit: ->(_worker, error) { exits << error }).start
+    yield server, exits
+  ensure
+    server&.shutdown(timeout: 1)
+  end
+
+  each_mode do |mode|
+    [{lanes: false}, {lanes: true}].each do |lanes|
+      context "#{lanes[:lanes] ? "with" : "without"} lanes" do
+        it "keeps serving after Thread#wakeup on an idle worker, and drains promptly" do
+          with_poked_server(mode, lanes) do |server, exits|
+            expect(get(server.port, "/poke/wakeup")).to eq("ok")
+            expect(reports.next(awaiting: "report of its pokes")).to eq(:poked)
+
+            expect(Array.new(3) { get(server.port, "/") }).to all(eq("ok"))
+            expect(Array.new(exits.size) { exits.pop }).to be_empty, "no worker may leave"
+            expect(server.stats).to include(respawns: 0)
+
+            # Woken once more, so the drain meets a worker that has taken nothing since.
+            expect(get(server.port, "/poke/wakeup")).to eq("ok")
+            expect(reports.next(awaiting: "report of its pokes")).to eq(:poked)
+            client = client_socket(server.port)
+            client.write("GET / HTTP/1.1\r\nHost: kino\r\n\r\n")
+            wait_for("the request at the server") do
+              stats = server.stats
+              stats[:served] + stats[:queued] + stats[:in_flight] + stats.fetch(:lane_depths, []).sum > 5
+            end
+
+            took = timed { server.shutdown(timeout: 3) }
+            expect(took).to be < 1, "the drain took #{took.round(2)} s"
+            expect(client.read).to start_with("HTTP/1.1 200")
+          ensure
+            client&.close
+          end
+        end
+
+        # A StandardError raised out of the take that rode a response is
+        # that request's, as any failure of its delivery is: logged and
+        # handed to on_error; out of any other take, it crashes the worker.
+        # The request sent right after it lands within the tick of the wait
+        # the raise woke, which takes it with the raise pending.
+        it "answers a request sent right after Thread#raise into an idle worker, and keeps serving" do
+          log = capture_native_stderr do
+            with_poked_server(mode, lanes) do |server, _exits|
+              expect(get(server.port, "/poke/raise")).to eq("ok")
+              expect(reports.next(awaiting: "report of its raise")).to eq(:poked)
+              client = client_socket(server.port)
+              client.write("GET / HTTP/1.1\r\nHost: kino\r\n\r\n")
+
+              answer = client.wait_readable(2) ? client.readpartial(4096) : "no answer within 2 s"
+              expect(answer).to start_with("HTTP/1.1 200")
+              expect(server.stats[:served]).to eq(2), "the request was taken more than once"
+              expect(Array.new(2) { get(server.port, "/") }).to all(eq("ok"))
+            ensure
+              client&.close
+            end
+          end
+
+          expect(log).to include("RuntimeError: raised into an idle worker")
+        end
+
+        it "replaces an idle worker that Thread#raise crashed" do
+          log = capture_native_stderr do
+            with_poked_server(mode, lanes) do |server, exits|
+              expect(get(server.port, "/poke/crash")).to eq("ok")
+              expect(reports.next(awaiting: "report of its raise")).to eq(:poked)
+
+              error = exits.pop(timeout: 5)
+              expect(error.class).to eq(Exception)
+              expect(error.message).to eq("crashed an idle worker")
+              wait_for("the replacement") { server.stats[:respawns] == 1 }
+              expect(Array.new(3) { get(server.port, "/") }).to all(eq("ok"))
+            end
+          end
+
+          expect(log).to include("Exception: crashed an idle worker")
+        end
+      end
+    end
+  end
+end
+
+# Another of the app's threads interrupts the worker while it waits on
+# its client, for the rest of a request body or for room for the next
+# chunk of a response: Thread#wakeup only wakes it, and Thread#raise,
+# which Timeout.timeout uses, raises in the app as anywhere.
+RSpec.describe "Ruby interrupts into a worker waiting on its client" do
+  # POST /read reads the body under Timeout.timeout(0.3): 200 with the
+  # body, or 408 once the read timed out (with ?hijack, written through
+  # rack.hijack); with ?wake, without a timeout, the worker is woken 5
+  # times as it reads.
+  # GET /write streams 256 KiB chunks under Timeout.timeout(0.3) until
+  # it times out; with ?wake, 64 chunks while the worker is woken 5
+  # times. Each reports what happened: :timed_out, :hijacked, :woke.
+  def client_app(reports)
+    Ractor.shareable_proc do |env|
+      worker = Thread.current
+      wake = lambda do
+        Thread.new do
+          5.times do
+            sleep 0.002 while worker.alive? && worker.status != "sleep"
+            worker.wakeup if worker.alive?
+            sleep 0.02
+          end
+          reports << :woke
+        end
+      end
+      wake.call if env["QUERY_STRING"] == "wake"
+      case env["PATH_INFO"]
+      when "/read"
+        next [200, {}, [env["rack.input"].read]] if env["QUERY_STRING"] == "wake"
+
+        begin
+          [200, {}, [Timeout.timeout(0.3) { env["rack.input"].read }]]
+        rescue Timeout::Error
+          reports << :timed_out
+          next [408, {}, ["timed out"]] unless env["QUERY_STRING"] == "hijack"
+
+          io = env["rack.hijack"].call
+          io.write("HTTP/1.1 408 Request Timeout\r\ncontent-length: 9\r\nconnection: close\r\n\r\ntimed out")
+          io.close
+          reports << :hijacked
+          [200, {}, []]
+        end
+      when "/write"
+        piece = "x" * 262_144
+        body = Object.new
+        if env["QUERY_STRING"] == "wake"
+          body.define_singleton_method(:each) { |&write| 64.times { write.call(piece) } }
+        else
+          body.define_singleton_method(:each) do |&write|
+            Timeout.timeout(0.3) { loop { write.call(piece) } }
+          rescue Timeout::Error
+            reports << :timed_out
+          end
+        end
+        [200, {}, body]
+      else
+        [200, {}, ["ok"]]
+      end
+    end
+  end
+
+  # One worker on one thread, serving client_app (it reports to `reports`); yields the server.
+  def with_client_server(mode, **opts)
+    server = Kino::Server.new(client_app(reports.port), mode: mode, workers: 1, threads: 1, **opts).start
+    yield server
+  ensure
+    server&.shutdown(timeout: 1)
+  end
+
+  # A request on a connection of its own, its body cut short at `sent`.
+  def send_request(server, head, sent = "")
+    client_socket(server.port).tap { |socket| socket.write("#{head}\r\nHost: kino\r\n\r\n#{sent}") }
+  end
+
+  # The response on `socket`, its body de-chunked: [status, body].
+  def response(socket)
+    Timeout.timeout(5) do
+      head = socket.gets("\r\n\r\n") or raise "the connection closed without a response"
+      status = head[%r{\AHTTP/1\.1 (\d+)}, 1]
+      length = head[/^content-length: (\d+)/i, 1]
+      next [status, socket.read(Integer(length))] if length
+
+      body = +""
+      loop do
+        line = socket.gets("\r\n") or raise "the connection closed mid-response, #{body.bytesize} bytes in"
+        break if (size = line.to_i(16)).zero?
+
+        body << socket.read(size)
+        socket.read(2)
+      end
+      [status, body]
+    end
+  rescue Timeout::Error
+    raise "the response did not end within 5 s"
+  end
+
+  each_mode do |mode|
+    it "answers what the app makes of a Timeout.timeout around a body read, and keeps serving" do
+      with_client_server(mode) do |server|
+        client = send_request(server, "POST /read HTTP/1.1\r\nContent-Length: 10", "12345")
+        expect(reports.next(awaiting: "report of the timeout")).to eq(:timed_out)
+
+        expect(response(client)).to eq(["408", "timed out"])
+        expect(Array.new(2) { get(server.port, "/") }).to all(eq("ok"))
+      ensure
+        client&.close
+      end
+    end
+
+    it "leaves a request whose body read Timeout.timeout cut to the app, which can take its connection over" do
+      with_client_server(mode) do |server|
+        head = "POST /read?hijack HTTP/1.1\r\nUpgrade: chat\r\nConnection: Upgrade\r\nContent-Length: 10"
+        client = send_request(server, head, "12345")
+        expect(reports.next(awaiting: "report of the timeout")).to eq(:timed_out)
+
+        expect(response(client)).to eq(["408", "timed out"])
+        expect(reports.next(awaiting: "report of the hijack")).to eq(:hijacked)
+        expect(get(server.port, "/")).to eq("ok")
+      ensure
+        client&.close
+      end
+    end
+
+    it "does not fail a body read that Thread#wakeup interrupts" do
+      with_client_server(mode) do |server|
+        client = send_request(server, "POST /read?wake HTTP/1.1\r\nContent-Length: 10", "12345")
+        expect(reports.next(awaiting: "report of the wakes")).to eq(:woke)
+        client.write("67890")
+
+        expect(response(client)).to eq(["200", "1234567890"])
+      ensure
+        client&.close
+      end
+    end
+
+    it "ends the response cleanly when Timeout.timeout cuts a streamed write the client is slow to take" do
+      with_client_server(mode) do |server|
+        client = send_request(server, "GET /write HTTP/1.1")
+        expect(reports.next(awaiting: "report of the timeout")).to eq(:timed_out)
+
+        status, body = response(client)
+        expect(status).to eq("200")
+        expect(body.bytesize % 262_144).to eq(0)
+        expect(get(server.port, "/")).to eq("ok")
+      ensure
+        client&.close
+      end
+    end
+
+    it "does not fail a streamed write that Thread#wakeup interrupts" do
+      with_client_server(mode) do |server|
+        client = send_request(server, "GET /write?wake HTTP/1.1")
+        expect(reports.next(awaiting: "report of the wakes")).to eq(:woke)
+
+        status, body = response(client)
+        expect(status).to eq("200")
+        expect(body.bytesize).to eq(64 * 262_144)
+      ensure
+        client&.close
+      end
     end
   end
 end

@@ -1,5 +1,6 @@
 # frozen_string_literal: true
 
+require "async"
 require "socket"
 
 # An endless event stream: an event every 10 ms until a write fails.
@@ -85,7 +86,8 @@ end
 
 # A streaming body's client can leave, or stop reading, at any time:
 # the body's next write raises, so it ends and frees its worker; and
-# cutting a stream short never waits for its client to read.
+# cutting a stream short never waits for its client to read. The same
+# under a worker_loop, whose writes wait as fibers instead of blocking.
 RSpec.describe "streaming bodies" do
   include_context "native WebSocket server"
 
@@ -120,7 +122,8 @@ RSpec.describe "streaming bodies" do
       after_request_complete: Ractor.shareable_proc { |env, status| port << [:complete, env["PATH_INFO"], status] },
       on_error: Ractor.shareable_proc { |error, _env| port << [:error, error.class] }
     }
-    with_server(streaming_app(port), mode: mode, workers: 1, threads: 1, **hooks, **options, &block)
+    with_server(streaming_app(port), mode: mode, workers: 1, threads: 1, **hooks, **server_defaults, **options,
+      &block)
   end
 
   def request(path, method = "GET", headers = "") = "#{method} #{path} HTTP/1.1\r\nHost: kino.test\r\n#{headers}\r\n"
@@ -160,7 +163,7 @@ RSpec.describe "streaming bodies" do
   each_mode do |mode|
     # A Rack 3 streaming body has no close of its own.
     {"/events" => [:closed], "/events3" => []}.each do |path, closed|
-      it "ends an endless #{path} body once its client hangs up, quietly, counts it cut, and frees its worker" do
+      it_in_both_loops "ends an endless #{path} body once its client hangs up, quietly, counts it cut, and frees its worker" do
         log = capture_native_stderr do
           with_streaming_server(mode) do |_host, port, server|
             cut = server.stats[:responses_cut]
@@ -183,7 +186,7 @@ RSpec.describe "streaming bodies" do
 
     # Kino answered 504 before the /late app started its stream. Either
     # way the body's first write ends it, quietly, and no stream was cut.
-    it "ends an endless body at once when its response carries none, a HEAD's or one a 504 answered" do
+    it_in_both_loops "ends an endless body at once when its response carries none, a HEAD's or one a 504 answered" do
       with_streaming_server(mode, request_timeout: 0.2) do |host, port, server|
         cut = server.stats[:responses_cut]
         Net::HTTP.start(host, port, read_timeout: 3) do |http|
@@ -200,7 +203,7 @@ RSpec.describe "streaming bodies" do
     # body's error: its write fails rather than wait on the client for
     # good.
     %w[/helper /helper3].each do |path|
-      it "keeps serving after a #{path} body raises while its helper thread is blocked writing" do
+      it_in_both_loops "keeps serving after a #{path} body raises while its helper thread is blocked writing" do
         client = nil
         log = capture_native_stderr do
           with_streaming_server(mode) do |_host, port, server|
@@ -218,8 +221,8 @@ RSpec.describe "streaming bodies" do
       end
     end
 
-    it "shuts down by its deadline past a streaming client that stopped reading" do
-      server = Kino::Server.new(streaming_app(reports.port), mode: mode, workers: 1, threads: 1).start
+    it_in_both_loops "shuts down by its deadline past a streaming client that stopped reading" do
+      server = Kino::Server.new(streaming_app(reports.port), mode: mode, workers: 1, threads: 1, **server_defaults).start
       client = stalled_client(server.port, "/flood")
       # The flood's writes stopped going out: none reported for 0.3 s.
       reports.next(awaiting: "the flood's first write")
@@ -243,7 +246,7 @@ RSpec.describe "streaming bodies" do
     # timing the app call) while the helper waits for the body; the client
     # sends the body only once it has them, and the helper's read ends the
     # stream.
-    it "streams a response while a helper thread is blocked reading the request body" do
+    it_in_both_loops "streams a response while a helper thread is blocked reading the request body" do
       received = +""
       log = capture_native_stderr do
         capture_native_stdout do
@@ -267,7 +270,7 @@ RSpec.describe "streaming bodies" do
     # The body's read waits for the client, then gets what it sent, while
     # the helper stays blocked on the client that reads nothing; the
     # helper's write fails once the client leaves.
-    it "reads the request body while a helper thread is blocked writing the response" do
+    it_in_both_loops "reads the request body while a helper thread is blocked writing the response" do
       client = nil
       with_streaming_server(mode) do |_host, port, server|
         client = stalled_client(port, "/duplex", "POST", "transfer-encoding: chunked\r\n")

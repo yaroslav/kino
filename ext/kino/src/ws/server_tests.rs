@@ -479,7 +479,7 @@ async fn a_handshake_is_refused_while_its_worker_closes_its_sockets_or_the_serve
     refused(&server, 1, || {
         let _ = server.shutdown_tx.send(true);
         leave_all(&server, Duration::ZERO);
-        server.register_worker();
+        server.register_worker().expect("a worker slot");
     })
     .await;
     assert_eq!(server.open_sockets(), 0);

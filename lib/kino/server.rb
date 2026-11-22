@@ -106,7 +106,7 @@ module Kino
           io_threads: @io_threads,
           tokio_threads: @tokio_threads,
           tls_cert: @tls&.fetch(:cert), tls_key: @tls&.fetch(:key),
-          http2: @http2, lanes: @lanes, log_requests: @log_requests,
+          http2: @http2, lanes: @lanes, worker_loop: @worker_loop, log_requests: @log_requests,
           websocket_max_message: @websocket_max_message, websocket_max: @websocket_max,
           websocket_ping_interval_ms: @websocket_ping_interval_ms,
           mode: @mode.to_s, workers: @workers, max_workers: @max_workers,
@@ -284,14 +284,14 @@ module Kino
       # Idle workers see the closed queue and exit their loops.
       # Switched hijacked connections close too, so an app serving one sees EOF.
       Native.close_queue(@id)
-      @pool.shutdown([deadline - Kino.monotonic, 0].max)
+      join_workers(deadline)
 
       unless @pool.done?
         # Past the deadline with stuck handlers: free the clients first,
         # then try to unblock and reap the workers.
         Native.abort_all_inflight(@id)
         Native.interrupt_all_workers(@id)
-        @pool.shutdown(0.2)
+        join_workers(Kino.monotonic + 0.2)
         @pool.kill_stragglers
       end
     end
@@ -314,6 +314,10 @@ module Kino
       worker_hooks = WORKER_HOOKS.to_h { |name| [name, validate_hook(settings[name], name)] }
       @after_boot = validate_hook(settings[:after_boot], :after_boot)
       @on_worker_exit = validate_hook(settings[:on_worker_exit], :on_worker_exit)
+      @worker_loop = !worker_hooks[:worker_loop].nil?
+      # Unset, lanes follow worker_loop, which runs on them.
+      @lanes = settings[:lanes].nil? ? @worker_loop : !!settings[:lanes]
+      raise ArgumentError, "worker_loop needs lanes; drop `lanes false`" if @worker_loop && !@lanes
       @mode = resolve_mode(settings[:mode], worker_hooks)
       @workers = Integer(settings[:workers] || default_workers)
       # The pool ceiling; equal to the floor for a fixed pool.
@@ -326,15 +330,14 @@ module Kino
       if !settings[:scale_down_after].nil? && !elastic?
         Log.warn("scale_down_after has no effect unless max_workers is above workers")
       end
-      @lanes = !!settings[:lanes]
       @worker_hooks = WorkerHooks.new(
         **worker_hooks,
         # The access log's GC and allocation figures come from the VM's
         # process-wide counters, so they are measured only where one
         # request at a time can own them: the GVL serializes :threaded
         # mode, and a single ractor (a pool that can never grow past one)
-        # has nothing to race.
-        access_timing: !!settings[:log_requests] && (@mode == :threaded || @max_workers == 1)
+        # has nothing to race. A worker_loop interleaves its requests.
+        access_timing: !!settings[:log_requests] && !@worker_loop && (@mode == :threaded || @max_workers == 1)
       )
       # Default threads per mode: 1 in :ractor (threads inside a ractor
       # share its lock; a measured +17% on fast handlers; raise `workers`
@@ -351,6 +354,7 @@ module Kino
       @max_connections = settings[:max_connections] ? Integer(settings[:max_connections]) : default_max_connections
       @max_body_size = Integer(settings[:max_body_size] || 0)
       @batch = [Integer(settings[:batch]), 1].max
+      Log.warn("batch has no effect with worker_loop") if @worker_loop && @batch > 1
       @websocket_max_message = positive_integer(settings[:websocket_max_message], :websocket_max_message)
       @websocket_max = settings[:websocket_max] && positive_integer(settings[:websocket_max], :websocket_max)
       @websocket_ping_interval_ms = milliseconds(settings[:websocket_ping_interval], :websocket_ping_interval)
@@ -558,6 +562,21 @@ module Kino
         @started = false if stopped
         @shutdown_error = failure
         @shutdown_ended.broadcast
+      end
+    end
+
+    JOIN_SLICE = 0.1
+    private_constant :JOIN_SLICE
+
+    # Join the workers up to the monotonic `deadline`; a worker_loop's a slice at a time, with
+    # Worker::Loop.warn_lingering between slices.
+    def join_workers(deadline)
+      return @pool.shutdown([deadline - Kino.monotonic, 0].max) unless @worker_loop
+
+      loop do
+        @pool.shutdown((deadline - Kino.monotonic).clamp(0, JOIN_SLICE))
+        Worker::Loop.warn_lingering(@id)
+        break if @pool.done? || Kino.monotonic >= deadline
       end
     end
 

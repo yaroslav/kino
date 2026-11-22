@@ -9,7 +9,9 @@ use magnus::{Error, Ruby};
 use crate::registry::{self, Counters};
 
 pub fn register_worker(ruby: &Ruby, server_id: u64) -> Result<usize, Error> {
-    Ok(registry::get(ruby, server_id)?.register_worker())
+    registry::get(ruby, server_id)?
+        .register_worker()
+        .map_err(|e| super::io_error(ruby, "worker doorbell failed", e))
 }
 
 pub fn stop_accepting(server_id: u64) {
@@ -80,7 +82,7 @@ pub fn abort_inflight(ruby: &Ruby, server_id: u64, worker_id: usize) -> Result<(
 pub fn abort_all_inflight(server_id: u64) {
     if let Some(server) = registry::try_get(server_id) {
         for slot in server.slots.read().iter() {
-            slot.abort(crate::response::Cut::Shutdown);
+            slot.abort_held();
             // Its sockets stop waiting on their handlers too.
             crate::ws::abandon(slot);
         }
@@ -97,6 +99,10 @@ pub fn interrupt_all_workers(server_id: u64) {
 
 pub fn shutdown_runtime(server_id: u64, timeout_ms: u64) {
     if let Some(server) = registry::remove(server_id) {
+        let ticker = server.ticker.lock().take();
+        if let Some(ticker) = ticker {
+            ticker.stop();
+        }
         let _ = server.shutdown_tx.send(true);
         std::mem::take(&mut *server.runtime.lock()).shutdown(Duration::from_millis(timeout_ms));
         // The listener is closed with the runtime; its socket file is not.

@@ -21,7 +21,7 @@ fn branded(mut response: HyperResponse) -> HyperResponse {
 }
 
 /// Idle deadline between body frames, so a silent client cannot pin a worker in read_body.
-const BODY_READ_TIMEOUT: Duration = Duration::from_secs(30);
+pub(super) const BODY_READ_TIMEOUT: Duration = Duration::from_secs(30);
 
 pub(super) async fn handle_request(
     server: Arc<ServerInner>,
@@ -137,7 +137,11 @@ fn forward_body(
     max_body: u64,
 ) -> flume::Receiver<bytes::Bytes> {
     let (body_tx, body_rx) = flume::bounded::<bytes::Bytes>(8);
-    let responder = responder.clone();
+    let feed = BodyFeed {
+        tx: Some(body_tx),
+        responder: responder.clone(),
+        ended: false,
+    };
     tokio::spawn(async move {
         let mut total: u64 = 0;
         loop {
@@ -146,7 +150,8 @@ fn forward_body(
                 Ok(Some(Ok(frame))) => frame,
                 Ok(Some(Err(_))) | Ok(None) => break, // body error or clean EOF
                 Err(_) => {
-                    responder.abandon_body(crate::response::BodyAbandon::TimedOut);
+                    feed.responder
+                        .abandon_body(crate::response::BodyAbandon::TimedOut);
                     break;
                 }
             };
@@ -155,14 +160,16 @@ fn forward_body(
                 total += data.len() as u64;
                 if max_body > 0 && total > max_body {
                     // Past the cap: dropping the sender unblocks read_body, which raises.
-                    responder.abandon_body(crate::response::BodyAbandon::Oversize);
+                    feed.responder
+                        .abandon_body(crate::response::BodyAbandon::Oversize);
                     break;
                 }
-                if body_tx.send_async(data).await.is_err() {
+                if !feed.send(data).await {
                     break; // request handle dropped; stop pulling
                 }
             }
         }
+        feed.end();
     });
     body_rx
 }
@@ -182,6 +189,44 @@ async fn await_head(
     match tokio::time::timeout(deadline, &mut *head_rx).await {
         Ok(result) => result.unwrap_or_else(dropped),
         Err(_elapsed) => timed_out(server, switching, head_rx),
+    }
+}
+
+/// The forwarder's end of a request body: each chunk, and the body's end however it comes,
+/// rings a reader waiting on the request's body bell.
+struct BodyFeed {
+    tx: Option<flume::Sender<bytes::Bytes>>,
+    responder: Arc<Responder>,
+    /// Dropped before its loop ended, the forwarder went with the runtime: no end at all.
+    ended: bool,
+}
+
+impl BodyFeed {
+    /// False once the request's handle is gone.
+    async fn send(&self, data: bytes::Bytes) -> bool {
+        let Some(tx) = &self.tx else {
+            return false;
+        };
+        let sent = tx.send_async(data).await.is_ok();
+        self.responder.body_bell.ring();
+        sent
+    }
+
+    fn end(mut self) {
+        self.ended = true;
+    }
+}
+
+impl Drop for BodyFeed {
+    /// The channel closes before the ring, so the reader it wakes finds
+    /// the body's end; a body cut by the shutdown reads as interrupted.
+    fn drop(&mut self) {
+        if !self.ended {
+            self.responder
+                .abandon_body(crate::response::BodyAbandon::Interrupted);
+        }
+        self.tx.take();
+        self.responder.body_bell.ring();
     }
 }
 

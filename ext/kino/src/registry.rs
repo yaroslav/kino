@@ -9,6 +9,7 @@ use std::time::{Duration, Instant};
 
 use parking_lot::{Mutex, RwLock};
 
+use crate::doorbell::Doorbell;
 use crate::request::RequestCtx;
 use crate::server::ServerConfig;
 use crate::slot::{WorkerSlot, WS_INBOX};
@@ -102,6 +103,8 @@ pub struct ServerInner {
     /// Lane dispatch: stamps each park, so the dispatcher can tell which
     /// idle worker parked last (see Park::parked_at).
     pub park_seq: AtomicU64,
+    pub lane_room: crate::lane_room::LaneRoom,
+    pub ticker: Mutex<Option<crate::ticker::Ticker>>,
     /// GC roots for zero-copy response buffers (pin.rs). The Ruby Server
     /// object holds the marking PinKeeper for this slab.
     pub pin_slab: Arc<crate::pin::PinSlab>,
@@ -241,6 +244,8 @@ impl ServerInner {
                 .then(|| crate::logsink::Sink::new(std::io::stdout())),
             lane_cursor: AtomicUsize::new(0),
             park_seq: AtomicU64::new(0),
+            lane_room: Default::default(),
+            ticker: Mutex::new(None),
             pin_slab: Arc::new(crate::pin::PinSlab::for_responses(
                 config.topology.mode == "ractor",
             )),
@@ -260,17 +265,19 @@ impl ServerInner {
         Some(slots.iter().filter_map(|s| s.lane.requests()).collect())
     }
 
-    /// Requests waiting anywhere: the global queue plus any open lanes.
+    /// Requests waiting anywhere: the global queue, any open lanes, the line for lane room.
     pub fn queued(&self) -> usize {
-        self.req_rx.len() + self.lane_depths().map_or(0, |d| d.iter().sum())
+        let lanes = self.lane_depths().map_or(0, |d| d.iter().sum::<usize>());
+        self.req_rx.len() + lanes + self.lane_room.waiting()
     }
 
-    /// The drain is over: every queue closes.
+    /// The drain is over: every queue closes, and requests waiting for lane room find it so.
     pub fn close_queues(&self) {
         self.req_tx.lock().take();
         for slot in self.slots.read().iter() {
             slot.close_lane();
         }
+        self.lane_room.notify();
     }
 
     /// WebSockets whose on_close some worker of this server is still owed.
@@ -283,14 +290,16 @@ impl ServerInner {
     }
 
     /// One registered after close_queue (a late respawn) gets a closed lane, so its worker leaves.
-    pub fn register_worker(&self) -> usize {
+    /// Fails only for a worker_loop slot whose doorbell cannot be made (out of descriptors).
+    pub fn register_worker(&self) -> std::io::Result<usize> {
+        let doorbell = self.config.worker_loop.then(Doorbell::new).transpose()?;
         let mut slots = self.slots.write();
-        let slot = WorkerSlot::new(self.config.lanes, WS_INBOX);
+        let slot = WorkerSlot::new(self.config.lanes, WS_INBOX, doorbell);
         if self.req_tx.lock().is_none() {
             slot.close_lane();
         }
         slots.push(Arc::new(slot));
-        slots.len() - 1
+        Ok(slots.len() - 1)
     }
 
     pub fn slot(
@@ -357,7 +366,7 @@ mod tests {
         server.req_tx.lock().take(); // close_queue
         slot(&server, 0).lane.tx.lock().take();
 
-        server.register_worker();
+        server.register_worker().expect("a worker slot");
 
         let lane = slot(&server, 1).lane.rx.clone().expect("lane");
         let why = "a worker that comes up during shutdown must see its lane closed and leave";

@@ -2,6 +2,7 @@
 
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 
+use crate::doorbell::Doorbell;
 use crate::queue::Item;
 use crate::registry::ServerInner;
 
@@ -21,6 +22,7 @@ pub struct Park {
 impl Park {
     /// A worker that has taken only wakes since its parked_at was stamped
     /// keeps it: periodic wakes must not reorder the hot-lane dispatch.
+    /// On a worker_loop server, the first request waiting for room looks again.
     pub fn park(&self, server: &ServerInner) {
         if !self.woke.load(Ordering::Relaxed) {
             let seq = server.park_seq.fetch_add(1, Ordering::Relaxed) + 1;
@@ -28,10 +30,21 @@ impl Park {
         }
         self.woke.store(true, Ordering::Relaxed);
         self.parked.store(true, Ordering::SeqCst);
+        if server.config.worker_loop {
+            server.lane_room.notify();
+        }
     }
 
     pub fn unpark(&self) {
         self.parked.store(false, Ordering::SeqCst);
+    }
+
+    /// A worker_loop worker found work: a parked one disarms its doorbell.
+    pub fn awake(&self, doorbell: &Doorbell) {
+        if self.parked.load(Ordering::Relaxed) {
+            doorbell.disarm();
+            self.unpark();
+        }
     }
 
     #[inline]

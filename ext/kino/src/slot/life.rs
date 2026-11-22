@@ -2,6 +2,8 @@
 
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
+use parking_lot::Mutex;
+
 /// Which worker is on the slot, and how it is to leave.
 #[derive(Default)]
 pub struct Life {
@@ -13,8 +15,13 @@ pub struct Life {
     pub retired: AtomicBool,
     /// Abandoned as wedged: out of wedge detection, busy_ms reported as 0.
     pub quarantined: AtomicBool,
-    /// The UBF target and the shutdown kick, polled between bounded waits.
-    pub interrupted: AtomicBool,
+    /// Past the shutdown deadline (see WorkerSlot::halt): the slot's waits, polling it between
+    /// bounded ticks, end as a shutdown. Kino's alone: never the target of a VM unblock
+    /// function, and lowered only for the slot's next worker. Private, so that nothing but
+    /// halt and reset_halt writes it.
+    halted: AtomicBool,
+    /// worker_loop: when serve returned (mono us) and its label, for lingering_loops' warning.
+    pub drained: Mutex<Option<(u64, String)>>,
 }
 
 impl Life {
@@ -32,6 +39,41 @@ impl Life {
     #[inline]
     pub fn seems_retired(&self) -> bool {
         self.retired.load(Ordering::Relaxed)
+    }
+
+    /// The stop flag a park or a blocked body read polls.
+    #[inline]
+    pub fn halted(&self) -> &AtomicBool {
+        &self.halted
+    }
+
+    #[inline]
+    pub fn is_halted(&self) -> bool {
+        self.halted.load(Ordering::SeqCst)
+    }
+
+    /// Past the shutdown deadline: the slot's waits end.
+    pub(super) fn halt(&self) {
+        self.halted.store(true, Ordering::SeqCst);
+    }
+
+    /// For the slot's next worker.
+    pub(super) fn reset_halt(&self) {
+        self.halted.store(false, Ordering::SeqCst);
+    }
+
+    /// worker_loop: its serve returned now, under `label`.
+    pub fn drained(&self, label: String) {
+        *self.drained.lock() = Some((crate::mono::mono_us(), label));
+    }
+
+    /// worker_loop: the label of a loop whose serve returned by `due` (mono us), once.
+    pub fn take_drained_by(&self, due: u64) -> Option<String> {
+        let mut drained = self.drained.lock();
+        match drained.as_ref() {
+            Some((at, _)) if *at <= due => drained.take().map(|(_, label)| label),
+            _ => None,
+        }
     }
 
     /// Advisory, for the stats.

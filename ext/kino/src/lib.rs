@@ -9,11 +9,13 @@ mod control;
 mod counters;
 mod cpus;
 mod dispatch;
+mod doorbell;
 mod env_strings;
 mod framing;
 mod gvl;
 mod hijack;
 mod io_shards;
+mod lane_room;
 mod listen;
 mod log;
 mod logsink;
@@ -30,6 +32,7 @@ mod style;
 mod test_support;
 #[cfg(test)]
 mod testing;
+mod ticker;
 mod timer;
 mod tls;
 mod upgrade;
@@ -64,11 +67,14 @@ fn init(ruby: &Ruby) -> Result<(), Error> {
 
     let native = module.define_module("Native")?;
     native.define_class("PinKeeper", ruby.class_object())?;
+    // A worker's tick; the ticker rings a worker_loop's doorbell wait as often.
+    native.const_set("TICK_SECONDS", queue::TICK.as_secs_f64())?;
     functions!(native:
         "server_start" => server::server_start, 1;
         "register_worker" => server::register_worker, 1;
         "worker" => queue::worker, 2;
         "wake_worker" => queue::wake_worker, 3;
+        "lingering_loops" => queue::lingering_loops, 2;
         "stop_accepting" => server::stop_accepting, 1;
         "close_queue" => server::close_queue, 1;
         "close_bridges" => server::close_bridges, 1;
@@ -106,18 +112,30 @@ fn init(ruby: &Ruby) -> Result<(), Error> {
         "take_batch" => queue::Worker::take_batch, 1;
         "identity" => queue::Worker::identity, 0;
         "release" => queue::Worker::release, 0;
+        "drained" => queue::Worker::drained, 1;
+        "ring" => queue::Worker::ring, 0;
+        "ready_fd" => queue::Worker::ready_fd, 0;
+        "woke" => queue::Worker::woke, 0;
+        "capacity=" => queue::Worker::set_capacity, 1;
         "lanes?" => queue::Worker::lanes, 0;
         "claim_warning" => queue::Worker::claim_warning, 1;
     );
+    // Variadic (an optional `only`), which the table's one-token arity cannot say.
+    worker.define_method("take_nonblock", method!(queue::Worker::take_nonblock, -1))?;
+    worker.define_method("take_woken", method!(queue::Worker::take_woken, -1))?;
 
     let request = native.define_class("Request", ruby.class_object())?;
     methods!(request:
         "respond_and_take" => queue::respond_and_take, 5;
         "respond_and_take_one" => queue::respond_and_take_one, 4;
         "read_body" => Request::read_body, 1;
+        "read_body_nonblock" => Request::read_body_nonblock, 1;
         "send_simple" => crate::request::respond_simple, 3;
         "send_headers" => Request::send_headers, 2;
         "write_chunk" => Request::write_chunk, 1;
+        "write_chunk_nonblock" => Request::write_chunk_nonblock, 1;
+        "waited" => Request::waited, 0;
+        "close_waits" => Request::close_waits, 0;
         "finish" => Request::finish, 0;
         "abort" => Request::abort, 0;
         "timing" => Request::set_timing, 2;

@@ -1,8 +1,38 @@
 # frozen_string_literal: true
 
+require "async"
 require "net/http"
+require "socket"
 
 module ServerHelper
+  # A worker_loop that runs each job as an Async task, `concurrency` at
+  # a time; with `returned` (a port), it reports :returned there once
+  # serve returned.
+  def async_loop(concurrency, returned: nil)
+    Ractor.shareable_proc do |worker|
+      Sync { |task| worker.serve(concurrency: concurrency) { |job| task.async { job.call } } }
+      returned << :returned if returned
+    end
+  end
+
+  # A worker_loop that runs each job as a task on a reactor of
+  # `reactor_class` (an Async::Reactor, such as one that tallies what its
+  # fibers do), `concurrency` at a time.
+  def loop_on(reactor_class, concurrency)
+    Ractor.shareable_proc do |worker|
+      Fiber.blocking do
+        reactor = reactor_class.new
+        reactor.run(finished: false) { |task| worker.serve(concurrency: concurrency) { |job| task.async { job.call } } }.wait
+      ensure
+        Fiber.set_scheduler(nil)
+      end
+    end
+  end
+
+  # What every server of an example starts with: none, unless it runs
+  # under a worker_loop (BothLoops#it_in_both_loops).
+  def server_defaults = {}
+
   # Boot a server on an ephemeral port, yield the address, always shut down.
   # Specs default to a small threaded topology; ractor-mode specs override.
   def with_server(app, **opts)
@@ -19,6 +49,13 @@ module ServerHelper
     http.use_ssl = true
     http.verify_mode = OpenSSL::SSL::VERIFY_NONE
     http.start { |session| session.get(path) }
+  end
+
+  # A new connection to `target`: a port on 127.0.0.1, or the path of a unix socket.
+  def client_socket(target)
+    socket = target.is_a?(String) ? UNIXSocket.new(target) : TCPSocket.new("127.0.0.1", target)
+    socket.timeout = WsClient::DEADLINE
+    socket
   end
 
   # Run the block with RUBY_MAX_CPU set to `value` (unset when nil), then
@@ -41,6 +78,30 @@ module ServerHelper
     id = server_id(server)
     generation = Kino::WorkerRow.all(id).find { |row| row.slot == slot }.generation
     Kino::Native.retire_slot(id, slot, generation)
+  end
+
+  # GET `path` from the server on `port`: the response body, or a failure
+  # naming the path if no answer comes within 5 s. Never retried, so a
+  # request the server loses fails here.
+  def get(port, path)
+    Net::HTTP.start("127.0.0.1", port, read_timeout: 5, max_retries: 0) { |http| http.get(path).body }
+  rescue Net::ReadTimeout
+    raise "GET #{path} got no answer within 5s"
+  end
+
+  # POST `kib` KiB to `path` as a chunked body, 1 KiB a chunk: the
+  # response's status line, or nil once the server dropped the connection.
+  def post_chunked(port, path, kib)
+    socket = client_socket(port)
+    socket.write("POST #{path} HTTP/1.1\r\nHost: x\r\nTransfer-Encoding: chunked\r\n\r\n")
+    kib.times { socket.write("400\r\n#{"x" * 0x400}\r\n") }
+    socket.write("0\r\n\r\n")
+    socket.gets
+  rescue Errno::EPIPE, Errno::ECONNRESET
+    # The server tore the connection down while the body was still going.
+    nil
+  ensure
+    socket&.close
   end
 
   # Spawn the real `kino` CLI as a subprocess on an ephemeral port (so
@@ -80,6 +141,19 @@ module ServerHelper
   end
 end
 
+# Defines an example twice: in Kino's own loop, then under a worker_loop
+# on Async, for servers started with server_defaults.
+module BothLoops
+  def it_in_both_loops(description, &example)
+    it(description, &example)
+    it("#{description}, under a worker_loop") do
+      define_singleton_method(:server_defaults) { {worker_loop: async_loop(8)} }
+      instance_exec(&example)
+    end
+  end
+end
+
 RSpec.configure do |config|
   config.include ServerHelper
+  config.extend BothLoops
 end

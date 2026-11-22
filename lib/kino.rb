@@ -9,7 +9,8 @@ require "kino/kino"
 # Ractor-shareable.
 #
 # The public API is {Kino::Server}, {Kino::Configuration}, {Kino::Check},
-# {Kino::Logger}, {Kino::WebSocket}, {Kino::Worker.on_wake}, and
+# {Kino::Logger}, {Kino::WebSocket}, {Kino::Worker.on_wake},
+# {Kino::Worker::Loop} (what a `worker_loop` serves with), and
 # {Kino.sleep}; the `kino` executable is implemented by {Kino::CLI}.
 module Kino
   # Base class for the errors Kino raises (ClientGone aside).
@@ -76,6 +77,7 @@ require_relative "kino/hook_fire"
 require_relative "kino/teardown"
 require_relative "kino/worker_hooks"
 require_relative "kino/worker"
+require_relative "kino/worker/loop"
 require_relative "kino/worker_row"
 require_relative "kino/slot_bank"
 require_relative "kino/crash_backoff"

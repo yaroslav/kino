@@ -35,6 +35,8 @@ pub struct ServerConfig {
     /// The TLS cert and key, both or neither.
     pub tls: Option<(String, String)>,
     pub lanes: bool,
+    /// Each worker runs its own loop under the app's fiber scheduler (lanes only).
+    pub worker_loop: bool,
     /// False pins every connection to HTTP/1.
     pub http2: bool,
     pub log_requests: bool,
@@ -72,6 +74,7 @@ impl TryFrom<RHash> for ServerConfig {
                 }
             },
             lanes: optional(hash, "lanes")?.unwrap_or(false),
+            worker_loop: optional(hash, "worker_loop")?.unwrap_or(false),
             // Default true guards embedders calling the native layer directly.
             http2: optional(hash, "http2")?.unwrap_or(true),
             log_requests: optional(hash, "log_requests")?.unwrap_or(false),
@@ -94,6 +97,12 @@ impl TryFrom<RHash> for ServerConfig {
             control_token: optional(hash, "control_token")?,
             unix_path: None,
         };
+        // Guards embedders calling the native layer directly; Ruby refuses this up front.
+        if config.worker_loop && !config.lanes {
+            let ruby = Ruby::get_with(hash);
+            let error = "worker_loop needs lanes";
+            return Err(Error::new(ruby.exception_arg_error(), error));
+        }
         // Absent or below the floor means a fixed pool.
         let topology = &mut config.topology;
         topology.max_workers = topology.max_workers.max(topology.workers);

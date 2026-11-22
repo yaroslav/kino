@@ -14,6 +14,7 @@ module Kino
   # once it has been idle for `scale_down_after`. "Idle" means no slot of
   # the worker held a request, an open socket or an open hijacked connection
   # at two consecutive samples, and its served count did not move between them.
+  # Each tick also warns about worker_loops running on past their drain.
   class PoolScaler < Monitor
     TICK = 0.1
     # Consecutive ticks with a non-empty queue before the pool grows.
@@ -55,6 +56,7 @@ module Kino
     def scan
       queued, _in_flight = Native.queue_stats(@server_id)
       step(Kino.monotonic, queued, WorkerRow.all(@server_id))
+      Worker::Loop.warn_lingering(@server_id)
     end
 
     def grow

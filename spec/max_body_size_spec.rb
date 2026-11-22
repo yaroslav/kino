@@ -1,7 +1,5 @@
 # frozen_string_literal: true
 
-require "socket"
-
 RSpec.describe "max_body_size" do
   # Echoes how many body bytes the app managed to read.
   let(:echo_len) do
@@ -44,25 +42,13 @@ RSpec.describe "max_body_size" do
   end
 
   it "aborts a chunked body that exceeds the limit mid-stream (no Content-Length to check up front)" do
-    with_server(echo_len, max_body_size: 1024) do |host, port, _server|
-      socket = TCPSocket.new(host, port)
-      socket.write("POST / HTTP/1.1\r\nHost: x\r\nTransfer-Encoding: chunked\r\n\r\n")
-      status = nil
-      begin
-        # 8 KiB across eight 1 KiB chunks: well past the 1 KiB cap.
-        8.times { socket.write("400\r\n#{"x" * 0x400}\r\n") }
-        socket.write("0\r\n\r\n")
-        status = socket.gets
-      rescue Errno::EPIPE, Errno::ECONNRESET
-        # The server tearing the connection down while we are still writing
-        # (or before the status line arrives) is the abort under test; treat
-        # it the same as a drop observed at read time.
-      end
+    with_server(echo_len, max_body_size: 1024) do |_host, port, _server|
+      # 8 KiB: well past the 1 KiB cap.
+      status = post_chunked(port, "/", 8)
+
       # Either an explicit error status or a dropped connection; never a 200
       # with the full body accepted.
       expect(status).to satisfy { |line| line.nil? || !line.include?(" 200 ") }
-    ensure
-      socket&.close
     end
   end
 end

@@ -16,6 +16,23 @@
   `on_shutdown` and closes each socket with 1001. A callback that
   raises drops only its own socket and goes to `on_error`. The Rails
   example app streams new posts to WebSocket clients in ractor mode.
+- Experimental `worker_loop`: an app can run its own fiber scheduler,
+  such as Async's, on every Kino worker thread, in both modes. Kino
+  hands the scheduler each request as a job, so a request that waits
+  suspends only its fiber while the worker takes the next one. Kino
+  still owns the Ractors, threads, dispatch and HTTP, and ships no
+  scheduler: the app's `worker_loop` proc starts one and calls
+  `worker.serve(concurrency: 32) { |job| task.async { job.call } }`.
+  At most `concurrency` requests run at once on a worker, WebSocket
+  callbacks and the wake hook run alongside them, and `rack.input`
+  reads and streamed writes wait by readiness under any fiber
+  scheduler. Dispatch spreads requests by what each worker has open,
+  and with every worker full a request waits its turn, in the order
+  requests came (counted in `queued`), up to `queue_timeout`.
+  Quarantine and `busy_ms` judge such a worker by how long its thread
+  stays away from its loop. `worker_loop` turns lanes on, refuses
+  `lanes false` and ignores `batch`; apps without it keep Kino's own
+  loop as it was.
 - `rack.hijack`, full and partial, is offered on HTTP/1.1 requests that
   ask to upgrade, in both modes and with or without lanes, over TLS too,
   so Action Cable runs unmodified in threaded mode. A full hijack
@@ -44,7 +61,9 @@
   writes; a `rack.hijack` call then raises an `IOError`, and a WebSocket
   handshake gets a 500. A Rack 3 streaming body that raises mid-stream
   now has its connection cut, as an enumerable body's is, instead of
-  ending as if complete.
+  ending as if complete. Likewise, a request body cut short by a
+  shutdown past its deadline now raises "request interrupted during
+  shutdown" when read, instead of ending early as if it were complete.
 - `stats`, `/stats` and `/metrics` now count WebSockets (process-wide,
   under `websockets`; `kino_websockets_*` and `kino_websocket_*_total`
   with causes in a `cause` label), wake hook runs (`kino_wakes_total`),
@@ -99,6 +118,21 @@
   exiting at all. They now return once the shutdown has ended and
   raise its error if it failed, so the process exits non-zero. A
   `shutdown` called during another now waits for it.
+- Fixed a worker that waited for its next request leaving for good when
+  another thread called `Thread#wakeup` or `Thread#run` on it: it took
+  the wake for a shutdown, nothing replaced it, and requests sent its
+  way hung until the drain gave up on them. It now goes back to
+  waiting, and a request it takes just as a `Thread#raise` arrives is
+  no longer lost: it goes back to wait for the next take, or, with
+  nowhere to go back to, is answered with a 500 at once, and the
+  exception is raised first. A request waiting on its client, for more
+  of its body or for room for the next chunk of a streamed response, no
+  longer fails with "request interrupted during shutdown" when woken
+  either, and a `Thread#raise`, which `Timeout.timeout` uses, reaches
+  the app's `rescue` with the request intact: a streamed response the
+  app then ends now ends for the client too, where it used to stay
+  open, and the app can still take the connection over with
+  `rack.hijack`, which used to fail.
 - Fixed a threaded worker killed by an exception outside
   `StandardError` (`raise Exception`, a stack overflow) leaving its
   client unanswered and its request in flight, so the next shutdown
