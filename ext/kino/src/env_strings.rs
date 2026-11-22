@@ -79,7 +79,8 @@ pub struct EnvStrings {
     /// module docs); a cache entry owns its slots and clears them when
     /// it is evicted.
     pub slab: Arc<PinSlab>,
-    /// Host-header or :authority bytes -> frozen host values, and peer
+    /// Host-header or :authority bytes (with the local port, when they
+    /// name none: request::host_key) -> frozen host values, and peer
     /// IP -> frozen REMOTE_ADDR value. Real traffic has low cardinality
     /// on both, so these kill 3 string allocations per request.
     /// LRU-bounded, so a rotating-host attack recycles cache slots
@@ -464,20 +465,20 @@ where
 pub fn set_host_env(
     ruby: &Ruby,
     env: magnus::RHash,
-    host: &[u8],
+    key: &[u8],
     make: impl FnOnce() -> (String, u16),
 ) -> Result<(), magnus::Error> {
     let s = get();
     let (name, port) = get_or_insert(
         &s.hosts,
-        host,
+        key,
         |entry| entry.name_port(ruby),
         || {
             let (name, port) = make();
             (frozen_str(ruby, &name), frozen_str(ruby, &port.to_string()))
         },
         |&(name, port)| HostEntry::root(&s.slab, name, port, None),
-        || host.to_vec(),
+        || key.to_vec(),
     );
     env.aset(ruby.get_inner(s.server_name), name)?;
     env.aset(ruby.get_inner(s.server_port), port)?;
@@ -493,11 +494,11 @@ pub fn set_host_env(
 pub fn set_authority_env(
     ruby: &Ruby,
     env: magnus::RHash,
+    key: &[u8],
     authority: &str,
     make: impl FnOnce() -> (String, u16),
 ) -> Result<(), magnus::Error> {
     let s = get();
-    let key = authority.as_bytes();
     let read = |entry: &HostEntry| {
         let (name, port) = entry.name_port(ruby);
         (name, port, entry.host.as_ref().map(|host| host.get(ruby)))

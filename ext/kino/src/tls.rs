@@ -52,11 +52,22 @@ fn server_config(cert: &str, key: &str, http2: bool) -> Result<ServerConfig, Str
     Ok(config)
 }
 
+/// A TLS server and client for tests: an acceptor for a fixture cert,
+/// and a connector that takes any certificate (the fixture is CA-flagged,
+/// which webpki refuses as an end-entity cert).
 #[cfg(test)]
-mod tests {
-    use super::{build_acceptor, server_config};
+pub(crate) mod testing {
+    use std::sync::Arc;
 
-    const CERT: &str = "-----BEGIN CERTIFICATE-----
+    use tokio_rustls::rustls::client::danger::{
+        HandshakeSignatureValid, ServerCertVerified, ServerCertVerifier,
+    };
+    use tokio_rustls::rustls::crypto::WebPkiSupportedAlgorithms;
+    use tokio_rustls::rustls::pki_types::{CertificateDer, ServerName, UnixTime};
+    use tokio_rustls::rustls::{ClientConfig, DigitallySignedStruct, Error, SignatureScheme};
+    use tokio_rustls::{TlsAcceptor, TlsConnector};
+
+    pub const CERT: &str = "-----BEGIN CERTIFICATE-----
 MIIBfjCCASWgAwIBAgIUTs9+cVJSzJjy4TSi9YLEd+i4KiIwCgYIKoZIzj0EAwIw
 FDESMBAGA1UEAwwJbG9jYWxob3N0MCAXDTI2MDYxMDE3MjUzNVoYDzIxMjYwNTE3
 MTcyNTM1WjAUMRIwEAYDVQQDDAlsb2NhbGhvc3QwWTATBgcqhkjOPQIBBggqhkjO
@@ -68,11 +79,77 @@ vdrY8C5A0QufP/Y1Bm0OrgIgQz+pJX47iTdoINM49gX/6ekLZgmfjwzilJK37E4z
 gw8=
 -----END CERTIFICATE-----";
 
-    const KEY: &str = "-----BEGIN PRIVATE KEY-----
+    pub const KEY: &str = "-----BEGIN PRIVATE KEY-----
 MIGHAgEAMBMGByqGSM49AgEGCCqGSM49AwEHBG0wawIBAQQgSlcfB39H6lv5IqYe
 Q+daLGVt9Bf/i5bf+OnLUKcaZYahRANCAAQCgKc2l0PwJW5CAWzp8uW8iIIaGaPk
 WJ2lRijROyX9v7f8aSQlb6kEwKhI8kG8SbeUc+zbKkzGgRXNaZHY/mAa
 -----END PRIVATE KEY-----";
+
+    /// An acceptor for the fixture cert, offering h2 when `http2` is.
+    pub fn acceptor(http2: bool) -> TlsAcceptor {
+        super::build_acceptor(CERT, KEY, http2).expect("valid PEM")
+    }
+
+    /// A connector that offers `alpn` and trusts any server.
+    pub fn connector(alpn: &[&[u8]]) -> TlsConnector {
+        let provider = tokio_rustls::rustls::crypto::ring::default_provider();
+        let verifier = AcceptAny(provider.signature_verification_algorithms);
+        let mut client = ClientConfig::builder()
+            .dangerous()
+            .with_custom_certificate_verifier(Arc::new(verifier))
+            .with_no_client_auth();
+        client.alpn_protocols = alpn.iter().map(|p| p.to_vec()).collect();
+        TlsConnector::from(Arc::new(client))
+    }
+
+    /// The fixture's name.
+    pub fn localhost() -> ServerName<'static> {
+        ServerName::try_from("localhost").expect("server name")
+    }
+
+    #[derive(Debug)]
+    struct AcceptAny(WebPkiSupportedAlgorithms);
+
+    impl ServerCertVerifier for AcceptAny {
+        fn verify_server_cert(
+            &self,
+            _end_entity: &CertificateDer<'_>,
+            _intermediates: &[CertificateDer<'_>],
+            _server_name: &ServerName<'_>,
+            _ocsp_response: &[u8],
+            _now: UnixTime,
+        ) -> Result<ServerCertVerified, Error> {
+            Ok(ServerCertVerified::assertion())
+        }
+
+        fn verify_tls12_signature(
+            &self,
+            _message: &[u8],
+            _cert: &CertificateDer<'_>,
+            _dss: &DigitallySignedStruct,
+        ) -> Result<HandshakeSignatureValid, Error> {
+            Ok(HandshakeSignatureValid::assertion())
+        }
+
+        fn verify_tls13_signature(
+            &self,
+            _message: &[u8],
+            _cert: &CertificateDer<'_>,
+            _dss: &DigitallySignedStruct,
+        ) -> Result<HandshakeSignatureValid, Error> {
+            Ok(HandshakeSignatureValid::assertion())
+        }
+
+        fn supported_verify_schemes(&self) -> Vec<SignatureScheme> {
+            self.0.supported_schemes()
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::testing::{acceptor, connector, localhost, CERT, KEY};
+    use super::{build_acceptor, server_config};
 
     #[test]
     fn inline_pem_builds_an_acceptor() {
@@ -133,76 +210,17 @@ WJ2lRijROyX9v7f8aSQlb6kEwKhI8kG8SbeUc+zbKkzGgRXNaZHY/mAa
     /// A real rustls handshake over an in-memory pipe: an h2-capable
     /// client must land on "h2", proving the advertisement is not just a
     /// config field but what the wire negotiates. The client skips
-    /// certificate verification (the fixture cert is CA-flagged, which
-    /// webpki refuses as an end-entity cert): ALPN is under test here,
-    /// not the trust chain.
+    /// certificate verification: ALPN is under test here, not the trust
+    /// chain.
     #[tokio::test]
     async fn handshake_negotiates_h2_with_a_capable_client() {
-        use std::sync::Arc;
-
-        use tokio_rustls::rustls::client::danger::{
-            HandshakeSignatureValid, ServerCertVerified, ServerCertVerifier,
-        };
-        use tokio_rustls::rustls::crypto::WebPkiSupportedAlgorithms;
-        use tokio_rustls::rustls::pki_types::ServerName;
-        use tokio_rustls::rustls::ClientConfig;
-        use tokio_rustls::{TlsAcceptor, TlsConnector};
-
-        #[derive(Debug)]
-        struct AcceptAny(WebPkiSupportedAlgorithms);
-
-        impl ServerCertVerifier for AcceptAny {
-            fn verify_server_cert(
-                &self,
-                _end_entity: &tokio_rustls::rustls::pki_types::CertificateDer<'_>,
-                _intermediates: &[tokio_rustls::rustls::pki_types::CertificateDer<'_>],
-                _server_name: &ServerName<'_>,
-                _ocsp_response: &[u8],
-                _now: tokio_rustls::rustls::pki_types::UnixTime,
-            ) -> Result<ServerCertVerified, tokio_rustls::rustls::Error> {
-                Ok(ServerCertVerified::assertion())
-            }
-
-            fn verify_tls12_signature(
-                &self,
-                _message: &[u8],
-                _cert: &tokio_rustls::rustls::pki_types::CertificateDer<'_>,
-                _dss: &tokio_rustls::rustls::DigitallySignedStruct,
-            ) -> Result<HandshakeSignatureValid, tokio_rustls::rustls::Error> {
-                Ok(HandshakeSignatureValid::assertion())
-            }
-
-            fn verify_tls13_signature(
-                &self,
-                _message: &[u8],
-                _cert: &tokio_rustls::rustls::pki_types::CertificateDer<'_>,
-                _dss: &tokio_rustls::rustls::DigitallySignedStruct,
-            ) -> Result<HandshakeSignatureValid, tokio_rustls::rustls::Error> {
-                Ok(HandshakeSignatureValid::assertion())
-            }
-
-            fn supported_verify_schemes(&self) -> Vec<tokio_rustls::rustls::SignatureScheme> {
-                self.0.supported_schemes()
-            }
-        }
-
-        let acceptor =
-            TlsAcceptor::from(Arc::new(server_config(CERT, KEY, true).expect("valid PEM")));
-
-        let provider = tokio_rustls::rustls::crypto::ring::default_provider();
-        let verifier = AcceptAny(provider.signature_verification_algorithms);
-        let mut client = ClientConfig::builder()
-            .dangerous()
-            .with_custom_certificate_verifier(Arc::new(verifier))
-            .with_no_client_auth();
-        client.alpn_protocols = vec![b"h2".to_vec(), b"http/1.1".to_vec()];
-        let connector = TlsConnector::from(Arc::new(client));
+        let acceptor = acceptor(true);
+        let connector = connector(&[b"h2", b"http/1.1"]);
 
         let (client_io, server_io) = tokio::io::duplex(16 * 1024);
         let server = tokio::spawn(async move { acceptor.accept(server_io).await });
-        let domain = ServerName::try_from("localhost").expect("server name");
         let client_stream = connector
-            .connect(domain, client_io)
+            .connect(localhost(), client_io)
             .await
             .expect("client handshake");
         let server_stream = server.await.expect("join").expect("server handshake");

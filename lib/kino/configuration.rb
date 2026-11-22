@@ -200,7 +200,7 @@ module Kino
       # Dispatch mode: :auto, :ractor, or :threaded.
       def mode(mode) = @config.set(:mode, mode.to_sym)
 
-      # Bounded request-queue depth; overflow earns clients a 503.
+      # Bounded request-queue depth, at least 1; overflow earns clients a 503.
       def queue_depth(depth) = @config.set(:queue_depth, Integer(depth))
 
       # Seconds a request may wait for queue space before the 503.
@@ -267,7 +267,7 @@ module Kino
       # lanes on; must be Ractor-shareable in :ractor mode.
       def worker_loop(handler = nil, &block) = @config.set(:worker_loop, handler || block)
 
-      # Graceful-shutdown drain deadline in seconds.
+      # Graceful-shutdown drain deadline in seconds, not negative (Float::INFINITY: no deadline).
       def shutdown_timeout(seconds) = @config.set(:shutdown_timeout, seconds)
 
       # Run native HTTP I/O on current-thread shards instead of Tokio's shared pool.

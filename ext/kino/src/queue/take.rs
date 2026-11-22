@@ -273,13 +273,12 @@ impl<'a> Taker<'a> {
     /// A VM interrupt only wakes the park, or raises out of it.
     pub(super) fn take<P: Parker>(self, parker: &mut P) -> Result<Taken, P::Error> {
         let (server, slot) = (self.server, self.slot);
-        let Some(lane) = &slot.lane.rx else {
-            return self.take_shared(parker);
-        };
-        if let Some(taken) = self.ready().found() {
-            slot.park.took(taken.as_ref());
+        if let Some(taken) = self.now().found() {
             return Ok(taken);
         }
+        let Some(lane) = &slot.lane.rx else {
+            return self.park_shared(parker);
+        };
 
         // Park. The flag-then-recheck order closes the race with a dispatcher
         // that read parked=false just before we set it: anything it sent lands
@@ -292,6 +291,7 @@ impl<'a> Taker<'a> {
         };
         let put_back = |taken| self.put_back_lane(taken);
         let taken = gvl::park(parker, slot.life.halted(), wait, put_back);
+        crate::shared_gvl::got_back(server, slot);
         // Unpark before propagating any panic, or the dispatcher shuns this
         // lane for good.
         slot.park.unpark();
@@ -300,18 +300,31 @@ impl<'a> Taker<'a> {
         Ok(taken)
     }
 
-    /// From the shared queue. A retired worker takes nothing new, and leaves as after_timeout
-    /// says, or at close.
-    fn take_shared<P: Parker>(self, parker: &mut P) -> Result<Taken, P::Error> {
+    /// What is there without a wait, the GVL held: `ready` for a lane worker, else the shared
+    /// queue's next request, which a retired worker leaves.
+    pub(super) fn now(self) -> Take {
+        if self.slot.lane.rx.is_some() {
+            let take = self.ready();
+            if !matches!(take, Take::Nothing) {
+                self.slot.park.took(take.item());
+            }
+            return take;
+        }
+        if self.slot.life.seems_retired() {
+            return Take::Nothing;
+        }
+        match self.server.req_rx.try_recv() {
+            Ok(ctx) => Take::Item(Item::Ctx(ctx)),
+            Err(flume::TryRecvError::Disconnected) => Take::Closed,
+            Err(flume::TryRecvError::Empty) => Take::Nothing,
+        }
+    }
+
+    /// A wait on the shared queue. A retired worker takes nothing new, and leaves as
+    /// after_timeout says, or at close.
+    fn park_shared<P: Parker>(self, parker: &mut P) -> Result<Taken, P::Error> {
         let (queue, life) = (&self.server.req_rx, &self.slot.life);
         let retired = || life.seems_retired();
-        if !retired() {
-            match queue.try_recv() {
-                Ok(ctx) => return Ok(Some(Item::Ctx(ctx))),
-                Err(flume::TryRecvError::Disconnected) => return Ok(None),
-                Err(flume::TryRecvError::Empty) => {}
-            }
-        }
         let wait = || {
             if !retired() {
                 return match queue.recv_timeout(TICK) {
@@ -329,7 +342,9 @@ impl<'a> Taker<'a> {
             })
         };
         let put_back = |taken| self.put_back_shared(taken);
-        Ok(gvl::park(parker, life.halted(), wait, put_back)?.flatten())
+        let taken = gvl::park(parker, life.halted(), wait, put_back);
+        crate::shared_gvl::got_back(self.server, self.slot);
+        Ok(taken?.flatten())
     }
 
     /// A request taken as a Thread#raise came goes back at the queue's end, for whichever worker

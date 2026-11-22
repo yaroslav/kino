@@ -11,6 +11,7 @@ module Kino
       @groups = {}
       @replacements = {}
       @wedged = {}
+      @stragglers_killed = false
     end
 
     # Groups that are staying: quarantine replacements aside, and minus
@@ -62,7 +63,9 @@ module Kino
       true
     end
 
+    # Threads the shutdown kills end no crash: their clients were freed by abort_all_inflight.
     def kill_stragglers
+      @stragglers_killed = true
       join_set.each { |thread| thread.kill if thread.alive? }
     end
 
@@ -100,15 +103,23 @@ module Kino
         Thread.current.name = "worker-#{worker_id}"
         backoff.started
         error = crashed_at = nil
+        ended = false
         begin
           Worker.run(@server_id, worker_id, @app, @batch, @hooks)
+          ended = true
         rescue Exception => e # rubocop:disable Lint/RescueException -- a crash, cleaned up after by Worker.run
           error = e
           crashed_at = Kino.monotonic
         ensure
+          # Neither its end nor an exception: killed, a crash unless by the shutdown or the VM's exit.
+          unless ended || error || @stragglers_killed || !Thread.main.alive?
+            error = Error.new(KILLED)
+            crashed_at = Kino.monotonic
+          end
           worker_exited(worker_id, error)
+          # Here, as a killed thread runs only its ensure.
+          replace_crashed(index, worker_id, backoff, error, crashed_at) if error
         end
-        replace_crashed(index, worker_id, backoff, error, crashed_at) if error
       end
     end
 

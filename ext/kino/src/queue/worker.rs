@@ -6,7 +6,7 @@ use std::sync::atomic::Ordering;
 use std::sync::Arc;
 
 use magnus::prelude::*;
-use magnus::{Error, RArray, RHash, RString, Ruby, Value};
+use magnus::{Error, RHash, RString, Ruby, Value};
 
 use super::take::{Room, Take, Taker};
 use super::Item;
@@ -39,7 +39,7 @@ fn admit(
         env.aset(ruby.get_inner(strings.rack_hijack), request.as_value())?;
     }
     if websocket {
-        env.aset("rack.upgrade?", ruby.to_symbol("websocket"))?;
+        env.aset("rack.upgrade?", crate::symbols::get().websocket.value())?;
     }
     Ok(env)
 }
@@ -48,12 +48,12 @@ fn admit(
 /// there for the first request waiting for some.
 #[inline]
 pub(super) fn enlist(server: &ServerInner, slot: &Arc<WorkerSlot>, ctx: &mut RequestCtx) {
-    let (counters, load) = (&server.counters, &slot.load);
-    counters.served.fetch_add(1, Ordering::Relaxed);
-    load.admit(&ctx.responder);
-    // One clock read serves the histogram and, for the access log, the
+    // One clock read serves the busy age, the histogram and, for the access log, the
     // request's queue wait and the start of its time in Ruby.
     let now = std::time::Instant::now();
+    let (counters, load) = (&server.counters, &slot.load);
+    counters.served.fetch_add(1, Ordering::Relaxed);
+    load.admit(&ctx.responder, now);
     let wait = now.duration_since(ctx.enqueued_at);
     counters.queue_histogram.record(wait.as_micros() as u64);
     ctx.wait = wait;
@@ -80,27 +80,29 @@ fn item_value(
     match item {
         Item::Ctx(ctx) => Ok(admit(ruby, server, slot, ctx)?.as_value()),
         Item::Ws(event) => event.into_ruby(ruby),
-        Item::Wake => Ok(ruby.to_symbol("wake").as_value()),
+        Item::Wake => Ok(crate::symbols::get().wake.value()),
     }
 }
 
-/// The item, false when nothing is ready, nil once the lane is closed; a wake counts toward
-/// the server's wakes, as at checkout.
-fn nonblock_value(
+/// A take as Ruby gets it: what `value` makes of an item, false when nothing is ready, nil at
+/// shutdown (the queues closed, a retired worker with nothing left).
+fn take_value(
     ruby: &Ruby,
-    server: &ServerInner,
-    slot: &Arc<WorkerSlot>,
-    found: Take,
+    take: Take,
+    value: impl FnOnce(Item) -> Result<Value, Error>,
 ) -> Result<Value, Error> {
-    match found {
-        Take::Nothing => Ok(ruby.qfalse().as_value()),
+    match take {
+        Take::Item(item) => value(item),
         Take::Closed => Ok(ruby.qnil().as_value()),
-        Take::Item(item) => {
-            if matches!(item, Item::Wake) {
-                server.counters.wakes.fetch_add(1, Ordering::Relaxed);
-            }
-            item_value(ruby, server, slot, item)
-        }
+        Take::Nothing => Ok(ruby.qfalse().as_value()),
+    }
+}
+
+/// What a take hands Ruby: a wake counts toward the server's wakes.
+#[inline]
+fn handed(server: &ServerInner, take: &Take) {
+    if matches!(take, Take::Item(Item::Wake)) {
+        server.counters.wakes.fetch_add(1, Ordering::Relaxed);
     }
 }
 
@@ -116,8 +118,17 @@ pub struct Worker {
     server_id: u64,
     worker_id: usize,
     slot: Arc<WorkerSlot>,
+    /// The slot's generation as it got it; it holds the slot as this plus one (Life::holder).
+    generation: u64,
     /// Its own hold on the doorbell's sockets, so ready_fd stays open while it may wait on it.
     doorbell: Option<Arc<DoorbellSockets>>,
+}
+
+impl Drop for Worker {
+    /// A handle gone without its release (its heap freed) holds its slot no more.
+    fn drop(&mut self) {
+        self.slot.life.let_go(self.generation);
+    }
 }
 
 /// Resolve a (server, worker) pair into a Worker handle; nil when the
@@ -161,13 +172,19 @@ impl Worker {
         slot: Arc<WorkerSlot>,
     ) -> Worker {
         let doorbell = slot.lane.doorbell.as_ref().and_then(|d| d.sockets());
+        let generation = slot.life.hold();
         Worker {
             server: Arc::downgrade(server),
             server_id: server.id,
             worker_id,
             slot,
+            generation,
             doorbell,
         }
+    }
+
+    fn holds(&self) -> bool {
+        self.slot.life.holds(self.generation)
     }
 
     fn worker_loop_only(&self, ruby: &Ruby, native: &str) -> Result<(), Error> {
@@ -180,53 +197,99 @@ impl Worker {
         }
     }
 
-    pub(super) fn checkout(&self) -> Result<Option<(Arc<ServerInner>, Item)>, Error> {
+    /// A classic worker's next take, by `take` (`waiting` or `fused`), as take_value hands it to
+    /// Ruby; nil too once the server is gone.
+    fn checkout(
+        &self,
+        ruby: &Ruby,
+        take: impl FnOnce(&Worker, &ServerInner) -> Result<Take, Error>,
+        value: impl FnOnce(&Arc<ServerInner>, Item) -> Result<Value, Error>,
+    ) -> Result<Value, Error> {
         let Some(server) = self.server.upgrade() else {
-            return Ok(None); // server torn down → clean shutdown signal
+            return Ok(ruby.qnil().as_value());
         };
+        let take = take(self, &server)?;
+        take_value(ruby, take, |item| value(&server, item))
+    }
 
-        // The previous batch is fully answered once the worker comes back.
-        let load = &self.slot.load;
-        load.idle();
+    /// Whether the worker is due a pass of a shared GVL, judged at its last item's start, a clock
+    /// read its admission made, so a classic take reads none of its own (shared_gvl.rs).
+    #[inline]
+    fn held_long(&self, server: &ServerInner) -> bool {
+        crate::shared_gvl::held_long(server, &self.slot, || self.slot.load.last_started())
+    }
 
-        let taken = Taker::new(&server, &self.slot).take(&mut crate::gvl::Released)?;
-        if matches!(taken, Some(Item::Ws(_) | Item::Wake)) {
-            if matches!(taken, Some(Item::Wake)) {
-                server.counters.wakes.fetch_add(1, Ordering::Relaxed);
-            }
-            load.runs_item();
+    /// The take that waits for an item, the GVL passed first if held long; Closed at shutdown.
+    pub(super) fn waiting(&self, server: &ServerInner) -> Result<Take, Error> {
+        if self.held_long(server) {
+            crate::shared_gvl::pass(&self.slot)?;
         }
-        Ok(taken.map(|item| (server, item)))
+        // The previous batch is fully answered once the worker comes back.
+        self.slot.load.idle();
+        let taken = Taker::new(server, &self.slot).take(&mut crate::gvl::Released)?;
+        Ok(self.took(server, taken.map_or(Take::Closed, Take::Item)))
+    }
+
+    /// The take that rides an answer: only what is already there. With nothing there the worker
+    /// stays the answered request's while its body closes, so a close that hangs reads as a
+    /// wedge. One due a pass takes nothing either: the body closes first, then `waiting` passes.
+    fn fused(&self, server: &ServerInner) -> Result<Take, Error> {
+        if self.held_long(server) {
+            return Ok(Take::Nothing);
+        }
+        let take = Taker::new(server, &self.slot).now();
+        if matches!(take, Take::Nothing) {
+            return Ok(take);
+        }
+        self.slot.load.idle();
+        Ok(self.took(server, take))
+    }
+
+    /// A socket callback or a wake hook is the worker's one item until its next take.
+    #[inline]
+    fn took(&self, server: &ServerInner, take: Take) -> Take {
+        if matches!(take, Take::Item(Item::Ws(_) | Item::Wake)) {
+            handed(server, &take);
+            self.slot.load.runs_item();
+        }
+        take
     }
 
     /// The next item as item_value makes it; nil on shutdown. Allocates no array.
-    pub fn take_one(ruby: &Ruby, rb_self: &Worker) -> Result<Option<Value>, Error> {
-        match rb_self.checkout()? {
-            Some((server, item)) => item_value(ruby, &server, &rb_self.slot, item).map(Some),
-            None => Ok(None),
-        }
+    pub fn take_one(ruby: &Ruby, rb_self: &Worker) -> Result<Value, Error> {
+        rb_self.checkout(ruby, Worker::waiting, |server, item| {
+            item_value(ruby, server, &rb_self.slot, item)
+        })
     }
 
     /// Up to `max` items: the first as take_one takes it (an event or a wake alone), then
     /// requests from the shared queue without blocking; a lane worker takes one at a time.
-    pub fn take_batch(ruby: &Ruby, rb_self: &Worker, max: usize) -> Result<Option<RArray>, Error> {
-        let Some((server, first)) = rb_self.checkout()? else {
-            return Ok(None);
-        };
+    pub fn take_batch(ruby: &Ruby, rb_self: &Worker, max: usize) -> Result<Value, Error> {
+        rb_self.checkout(ruby, Worker::waiting, |server, first| {
+            rb_self.batch(ruby, server, first, max)
+        })
+    }
 
+    /// `first`, and after a request, up to `max` in all from the shared queue.
+    fn batch(
+        &self,
+        ruby: &Ruby,
+        server: &Arc<ServerInner>,
+        first: Item,
+        max: usize,
+    ) -> Result<Value, Error> {
         let batch = ruby.ary_new_capa(max.max(1));
         let request = matches!(first, Item::Ctx(_));
-        batch.push(item_value(ruby, &server, &rb_self.slot, first)?)?;
-        if !request {
-            return Ok(Some(batch));
-        }
-        for _ in 1..max {
-            match server.req_rx.try_recv() {
-                Ok(ctx) => batch.push(admit(ruby, &server, &rb_self.slot, ctx)?)?,
-                Err(_) => break,
+        batch.push(item_value(ruby, server, &self.slot, first)?)?;
+        if request {
+            for _ in 1..max {
+                match server.req_rx.try_recv() {
+                    Ok(ctx) => batch.push(admit(ruby, server, &self.slot, ctx)?)?,
+                    Err(_) => break,
+                }
             }
         }
-        Ok(Some(batch))
+        Ok(batch.as_value())
     }
 
     /// [server id, slot id, generation]: all a Waker needs.
@@ -237,7 +300,23 @@ impl Worker {
 
     /// The worker leaves its slot; its wakers stop waking.
     pub fn release(rb_self: &Worker) {
-        rb_self.slot.release();
+        let slot = &rb_self.slot;
+        // Once only, and never once the slot is another worker's.
+        if !rb_self.holds() {
+            return;
+        }
+        slot.load.let_go();
+        if slot.life.let_go(rb_self.generation) {
+            slot.release();
+        }
+    }
+
+    /// Kino::Native::Worker#crashed: answer what it held and retire its slot (WorkerSlot::crash)
+    /// while it still holds it, before its release.
+    pub fn crashed(rb_self: &Worker) {
+        if let Some(server) = rb_self.server.upgrade().filter(|_| rb_self.holds()) {
+            rb_self.slot.crash(&server);
+        }
     }
 
     /// Its serve returned: lingering_loops reports `label` once the loop is overdue to return too.
@@ -264,24 +343,29 @@ impl Worker {
         let Some(server) = self.server.upgrade() else {
             return Ok(ruby.qnil().as_value());
         };
+        // By the Symbol's identity: reading its name takes the VM's lock (symbols.rs).
+        let symbols = crate::symbols::get();
         let room = match args.first() {
             None => Room::All,
-            Some(&only) => match magnus::Symbol::try_convert(only)?.name()?.as_ref() {
-                "events" => Room::Events,
-                "requests" => Room::Requests,
-                other => {
-                    return Err(Error::new(
-                        ruby.exception_arg_error(),
-                        format!("{native} takes :events or :requests, not :{other}"),
-                    ))
-                }
-            },
+            Some(&only) if symbols.events.is(only) => Room::Events,
+            Some(&only) if symbols.requests.is(only) => Room::Requests,
+            Some(&only) => {
+                let other = magnus::Symbol::try_convert(only)?.name()?;
+                return Err(Error::new(
+                    ruby.exception_arg_error(),
+                    format!("{native} takes :events or :requests, not :{other}"),
+                ));
+            }
         };
+        crate::shared_gvl::pass_in_loop(&server, &self.slot)?;
         if woken {
             self.off_doorbell();
         }
         let found = Taker::new(&server, &self.slot).nonblock(room);
-        nonblock_value(ruby, &server, &self.slot, found)
+        handed(&server, &found);
+        take_value(ruby, found, |item| {
+            item_value(ruby, &server, &self.slot, item)
+        })
     }
 
     /// Disarmed first, so what is sent from now on lands without a write, for the next take.
@@ -333,8 +417,8 @@ impl Worker {
 }
 
 /// The fused hot path: answer `request` (complete response in one shot)
-/// and immediately take the next request. One FFI crossing per request
-/// once the loop is warm.
+/// and take what is already there: one FFI crossing per request while requests keep coming.
+/// False when nothing is, so the body closes before take_one waits; nil on shutdown.
 pub fn respond_and_take_one(
     ruby: &Ruby,
     request: &Request,
@@ -342,9 +426,11 @@ pub fn respond_and_take_one(
     status: u16,
     headers: RHash,
     body: RString,
-) -> Result<Option<Value>, Error> {
+) -> Result<Value, Error> {
     crate::request::respond_simple(ruby, request, status, headers, body)?;
-    Worker::take_one(ruby, &worker)
+    worker.checkout(ruby, Worker::fused, |server, item| {
+        item_value(ruby, server, &worker.slot, item)
+    })
 }
 
 /// Batch variant of the fused call.
@@ -356,7 +442,9 @@ pub fn respond_and_take(
     status: u16,
     headers: RHash,
     body: RString,
-) -> Result<Option<RArray>, Error> {
+) -> Result<Value, Error> {
     crate::request::respond_simple(ruby, request, status, headers, body)?;
-    Worker::take_batch(ruby, &worker, max)
+    worker.checkout(ruby, Worker::fused, |server, first| {
+        worker.batch(ruby, server, first, max)
+    })
 }

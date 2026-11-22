@@ -165,18 +165,25 @@ fn unsubscribe_with(wait: Wait, id: u64, topic: &[u8], prefix: Option<&[u8]>) ->
 /// At once while the lock is free, else waiting with the GVL released: waiting with it held
 /// would stop the Ractor's other threads, and under Ractors every GC, for a whole fan-out.
 /// `change` must not touch Ruby.
+/// A Ruby interrupt's raise comes back as Err (gvl::released), the change made or not.
 fn without_waiting_on_gvl<T>(change: impl Fn(Wait) -> Option<T>) -> Result<T, Error> {
+    waiting_released(change, |wait| crate::gvl::released(wait, None))
+}
+
+/// without_waiting_on_gvl with its release passed in: tests stand in for the VM.
+fn waiting_released<T, E>(
+    change: impl Fn(Wait) -> Option<T>,
+    release: impl FnOnce(&dyn Fn() -> T) -> Result<T, E>,
+) -> Result<T, E> {
     if let Some(done) = change(Wait::Try) {
         return Ok(done);
     }
-    crate::gvl::without_gvl(
-        || change(Wait::Block).expect("a blocking lock always comes"),
-        None,
-    )
+    release(&|| change(Wait::Block).expect("a blocking lock always comes"))
 }
 
 /// Every subscription of socket `id`, from its unregister once it was marked gone. On a Ruby
 /// thread (a handshake refused once registered) it waits as subscribe does.
+/// With an interrupt pending it waits GVL held (gvl::released_or_held): the subscriptions must go.
 pub fn forget(id: u64) {
     let change = |wait| {
         let mut registry = lock(wait)?;
@@ -186,8 +193,10 @@ pub fn forget(id: u64) {
         Some(())
     };
     if Ruby::get().is_ok() {
-        // Only a panic fails it, and the panic hook has reported that.
-        let _ = without_waiting_on_gvl(change);
+        if change(Wait::Try).is_none() {
+            // Only a panic fails it, and the panic hook has reported that.
+            let _ = crate::gvl::released_or_held(|| change(Wait::Block));
+        }
     } else {
         change(Wait::Block);
     }
@@ -490,6 +499,52 @@ mod tests {
         assert!(
             fanout.publish(b"t", &[b'x'; 100], Opcode::Text),
             "fanned out, the publishes give their bytes back, and any publish fits an empty queue"
+        );
+    }
+
+    #[test]
+    fn a_raise_into_a_subscribe_waiting_on_a_fan_out_comes_back_and_leaves_the_topics_free() {
+        let _serial = serial_blocking();
+        let mut socket = QueuedSocket::new(8);
+        let topic = Bytes::from_static(b"a_raise_into_a_waiting_subscribe");
+        let fan_out = REGISTRY.read();
+        let id = socket.id;
+        let subscriber = std::thread::spawn({
+            let topic = topic.clone();
+            move || {
+                let empty = Bytes::new();
+                let change =
+                    |wait| subscribe_with(wait, id, &topic, &empty, &empty, WhenFull::Close);
+                // In place of the VM: a Thread#raise came as it waited.
+                let mut vm = crate::testing::InPlace {
+                    release: |_: &std::sync::atomic::AtomicBool, wait: &mut dyn FnMut()| wait(),
+                    interrupts: || Err("Thread#raise"),
+                };
+                waiting_released(change, |wait| {
+                    crate::gvl::released_by(&mut vm, &false.into(), wait)
+                })
+            }
+        });
+        eventually_blocking("the subscribe to wait for the fan-out", || {
+            REGISTRY.try_read().is_none().then_some(())
+        });
+
+        drop(fan_out);
+        let subscribed = subscriber.join().expect("subscriber thread");
+
+        assert_eq!(subscribed, Err("Thread#raise"));
+        assert!(
+            REGISTRY.try_write().is_some(),
+            "the raise must leave the topics' lock free"
+        );
+        assert!(
+            publish(&topic, b"after"),
+            "the next take of the lock goes through"
+        );
+        assert_eq!(
+            socket.next_frame(),
+            frame(b"\x81\x05after"),
+            "the change made before the raise stands"
         );
     }
 }

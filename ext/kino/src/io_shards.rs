@@ -165,6 +165,7 @@ fn spawn_shard(
         "shard",
         move |runtime, ready_tx| {
             // Shards run until final teardown, unlike the acceptor.
+            let _ = server.io_runtime.set(runtime.handle().clone());
             let _ = ready_tx.send(Ok(()));
             runtime.block_on(shard_loop(rx, acceptor, server, load, &mut shutdown_rx));
         },

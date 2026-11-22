@@ -48,9 +48,9 @@ const BRIDGES_WIND_DOWN: Duration = Duration::from_millis(100);
 pub fn close_bridges(_ruby: &Ruby, server_id: u64) -> Result<(), Error> {
     if let Some(server) = registry::try_get(server_id) {
         crate::hijack::close(&server, crate::hijack::Closed::All);
-        let running = server.bridges_running.clone();
-        crate::gvl::without_gvl(
-            move || {
+        let running = &server.bridges_running;
+        crate::gvl::released(
+            || {
                 let deadline = std::time::Instant::now() + BRIDGES_WIND_DOWN;
                 while running.load(Ordering::SeqCst) > 0 && std::time::Instant::now() < deadline {
                     std::thread::sleep(Duration::from_millis(1));
@@ -73,7 +73,7 @@ pub fn queue_stats(server_id: u64) -> (usize, usize, usize) {
 /// The worker on this slot crashed (WorkerSlot::crash).
 pub fn abort_inflight(ruby: &Ruby, server_id: u64, worker_id: usize) -> Result<(), Error> {
     if let Some(server) = registry::try_get(server_id) {
-        server.slot(ruby, worker_id)?.crash();
+        server.slot(ruby, worker_id)?.crash(&server);
     }
     Ok(())
 }

@@ -112,11 +112,12 @@ pub enum WsEvent {
 
 impl WsEvent {
     pub fn into_ruby(self, ruby: &Ruby) -> Result<magnus::Value, Error> {
+        let symbols = crate::symbols::get();
         let ary = ruby.ary_new_capa(3);
         let (id, kind) = match self {
             WsEvent::Message { id, data, text } => {
                 ary.push(id)?;
-                ary.push(ruby.to_symbol("message"))?;
+                ary.push(symbols.message.value())?;
                 let s = ruby.str_from_slice(&data);
                 if text {
                     s.enc_associate(ruby.utf8_encindex())?;
@@ -124,12 +125,12 @@ impl WsEvent {
                 ary.push(s)?;
                 return Ok(ary.as_value());
             }
-            WsEvent::Shutdown { id } => (id, "shutdown"),
-            WsEvent::Drained { id } => (id, "drained"),
-            WsEvent::Close { id } => (id, "close"),
+            WsEvent::Shutdown { id } => (id, symbols.shutdown),
+            WsEvent::Drained { id } => (id, symbols.drained),
+            WsEvent::Close { id } => (id, symbols.close),
         };
         ary.push(id)?;
-        ary.push(ruby.to_symbol(kind))?;
+        ary.push(kind.value())?;
         Ok(ary.as_value())
     }
 }

@@ -144,18 +144,21 @@ module Kino
     # one leaves it stopped. Either way the error is raised here and by
     # #wait.
     #
-    # @param timeout [Numeric, nil] drain deadline in seconds (default:
+    # @param timeout [Numeric, nil] drain deadline in seconds, not negative;
+    #   Float::INFINITY waits for the drain however long it takes (default:
     #   the configured shutdown_timeout)
     # @return [nil]
+    # @raise [ArgumentError] when timeout is NaN, negative or not a number,
+    #   whether the server runs or not
     def shutdown(timeout: nil)
+      seconds = timeout.nil? ? @shutdown_timeout : drain_seconds(timeout, :timeout)
       return unless @started
       return wait unless claim_shutdown
 
       stopped_accepting = false
       failure = nil
       begin
-        # First, so that a bad timeout raises before anything has stopped.
-        deadline = Kino.monotonic + (timeout || @shutdown_timeout)
+        deadline = Kino.monotonic + seconds
         @pool_scaler&.stop
         @quarantine_monitor&.stop
         Native.stop_accepting(@id)
@@ -348,7 +351,8 @@ module Kino
 
     # Queue, timeouts and sizes, the WebSocket budgets, and logging.
     def configure_limits(settings)
-      @queue_depth = Integer(settings[:queue_depth])
+      # 0 would hand requests only to a worker already waiting, and 503 the rest.
+      @queue_depth = positive_integer(settings[:queue_depth], :queue_depth)
       @queue_timeout_ms = (Float(settings[:queue_timeout]) * 1000).round
       @request_timeout_ms = settings[:request_timeout] ? (Float(settings[:request_timeout]) * 1000).round : 0
       @max_connections = settings[:max_connections] ? Integer(settings[:max_connections]) : default_max_connections
@@ -359,7 +363,7 @@ module Kino
       @websocket_max = settings[:websocket_max] && positive_integer(settings[:websocket_max], :websocket_max)
       @websocket_ping_interval_ms = milliseconds(settings[:websocket_ping_interval], :websocket_ping_interval)
       @log_requests = !!settings[:log_requests]
-      @shutdown_timeout = settings[:shutdown_timeout]
+      @shutdown_timeout = drain_seconds(settings[:shutdown_timeout], :shutdown_timeout)
     end
 
     # The I/O runtime, TLS, HTTP/2, the pidfile and the control plane.
@@ -445,6 +449,14 @@ module Kino
       return number if number&.positive?
 
       raise ArgumentError, "#{name} must be a positive Integer (got #{value.inspect})"
+    end
+
+    # Seconds to drain: infinity is no deadline; negative and NaN (no clock passes it) are refused.
+    def drain_seconds(value, name)
+      number = Float(value, exception: false)
+      return number if number && !number.nan? && !number.negative?
+
+      raise ArgumentError, "#{name} must be a non-negative number of seconds (got #{value.inspect})"
     end
 
     # Seconds as whole milliseconds: nil and 0 mean off (0); anything above zero is at least 1.

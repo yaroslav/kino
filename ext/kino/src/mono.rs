@@ -14,6 +14,12 @@ pub fn mono_us() -> u64 {
     MONO_EPOCH.get_or_init(Instant::now).elapsed().as_micros() as u64 + 1
 }
 
+/// mono_us at `at`, for a caller that read the clock already (1 for a moment before the epoch).
+pub fn us_at(at: Instant) -> u64 {
+    let epoch = *MONO_EPOCH.get_or_init(Instant::now);
+    at.saturating_duration_since(epoch).as_micros() as u64 + 1
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

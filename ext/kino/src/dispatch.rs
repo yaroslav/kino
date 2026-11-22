@@ -6,14 +6,16 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use crate::registry::{BoxedCtx, LaneItem, ServerInner};
+use crate::request::RequestCtx;
+use crate::response::plain_response;
 use crate::slot::{WorkerSlot, LANE_DEPTH};
 
 #[cfg(test)]
 mod tests;
 
-/// One dispatch attempt: Break(sent) once it is over, sent or with every lane closed;
-/// Continue hands the request back, every open lane full, for another attempt.
-type Attempt = ControlFlow<bool, BoxedCtx>;
+/// One dispatch attempt: Break once it is over, sent (Ok) or handed back with every lane closed
+/// (Err); Continue hands the request back, every open lane full, for another attempt.
+type Attempt = ControlFlow<Result<(), BoxedCtx>, BoxedCtx>;
 
 /// A send down a list of lanes: Break once a lane took the request, Continue with it back.
 type Unsent = ControlFlow<(), BoxedCtx>;
@@ -29,9 +31,9 @@ fn try_dispatch(server: &ServerInner, ctx: BoxedCtx) -> Attempt {
     let pass = Pass { start, others };
     let mut any_open = false;
     match send(&slots, pass, &mut any_open, ctx) {
-        Unsent::Break(()) => Attempt::Break(true),
+        Unsent::Break(()) => Attempt::Break(Ok(())),
         Unsent::Continue(ctx) if any_open => Attempt::Continue(ctx), // overload: every open lane is full
-        Unsent::Continue(_) => Attempt::Break(false),                // draining: all lanes closed
+        Unsent::Continue(ctx) => Attempt::Break(Err(ctx)),           // draining: all lanes closed
     }
 }
 
@@ -173,11 +175,7 @@ const LANE_RETRY: Duration = Duration::from_micros(500);
 pub(crate) async fn enqueue(server: &ServerInner, ctx: BoxedCtx) -> bool {
     let timeout = Duration::from_millis(server.config.queue_timeout_ms);
     if server.config.lanes {
-        let attempt = match server.config.worker_loop {
-            true => wait_in_line(server, ctx, timeout).await,
-            false => retry_for_lane_room(server, ctx, timeout).await,
-        };
-        return matches!(attempt, Attempt::Break(true));
+        return matches!(to_lane(server, ctx, timeout).await, Attempt::Break(Ok(())));
     }
     // Cloned per request, so a keep-alive connection cannot hold the queue open during drain.
     let Some(tx) = server.req_tx.lock().clone() else {
@@ -192,6 +190,14 @@ pub(crate) async fn enqueue(server: &ServerInner, ctx: BoxedCtx) -> bool {
             tokio::time::timeout(timeout, tx.send_async(ctx)).await,
             Ok(Ok(()))
         ),
+    }
+}
+
+/// Into a lane, waiting for room as the server's kind of loop does.
+async fn to_lane(server: &ServerInner, ctx: BoxedCtx, timeout: Duration) -> Attempt {
+    match server.config.worker_loop {
+        true => wait_in_line(server, ctx, timeout).await,
+        false => retry_for_lane_room(server, ctx, timeout).await,
     }
 }
 
@@ -230,4 +236,38 @@ async fn retry_for_lane_room(
         }
         tokio::time::sleep(LANE_RETRY).await;
     }
+}
+
+/// A crashed worker's request that waited in its lane goes to the other workers' lanes, or waits
+/// for room as a new arrival would, and is turned away as one is.
+pub(crate) fn redispatch(server: &ServerInner, ctx: BoxedCtx) {
+    match try_dispatch(server, ctx) {
+        Attempt::Break(Ok(())) => {}
+        Attempt::Break(Err(ctx)) => turn_away(server, &ctx),
+        Attempt::Continue(ctx) => wait_for_lane_room(server, ctx),
+    }
+}
+
+/// Waits for lane room on the server's I/O runtime (the crash path must not wait), up to
+/// queue_timeout; with no runtime running yet, its client gets its 500 now.
+fn wait_for_lane_room(server: &ServerInner, ctx: BoxedCtx) {
+    let serving = crate::registry::try_get(server.id).zip(server.io_runtime.get());
+    if let Some((server, runtime)) = serving {
+        runtime.spawn(async move {
+            let timeout = Duration::from_millis(server.config.queue_timeout_ms);
+            let (Attempt::Break(Err(ctx)) | Attempt::Continue(ctx)) =
+                to_lane(&server, ctx, timeout).await
+            else {
+                return;
+            };
+            turn_away(&server, &ctx);
+        });
+    }
+}
+
+/// The 503 a turned-away arrival gets, counted as rejected.
+fn turn_away(server: &ServerInner, ctx: &RequestCtx) {
+    server.counters.rejected.fetch_add(1, Ordering::Relaxed);
+    ctx.responder
+        .send_response(plain_response(503, "Service Unavailable\n"));
 }

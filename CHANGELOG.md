@@ -88,7 +88,41 @@
   once its connections are gone, so crashes no longer grow the
   per-worker rows of `stats`, `/stats` and `/metrics`, and with
   `lanes true` a request that arrives while a crashed worker is being
-  replaced waits for a worker instead of getting a 503.
+  replaced waits for a worker instead of getting a 503. A worker thread
+  that ends without being asked to, `Thread#kill` included, is a crash
+  in both modes. A crashed worker's queued requests go to the other
+  workers as new arrivals, their `queue_timeout` starting over, rather
+  than get a 500, and a request a worker let go of unanswered gets its
+  500 as soon as the worker comes back for its next request or leaves.
+- Every listener and every worker is hardened. Changes that may need
+  action: a `queue_depth` below 1 fails at boot; `on_worker_exit` gets
+  a `Kino::Error` for a killed worker thread, where it got nil; over
+  TLS, a client that speaks other than what it chose by ALPN is no
+  longer served; a `Thread#raise` into an idle worker crashes it, and
+  it is respawned. A connection that has not sent its first bytes (with
+  HTTP/2, the whole preface) 15 s after the accept is closed, and one
+  that has sent nothing as soon as the drain begins, where with HTTP/2
+  on it used to stay open for good. An HTTP/2 peer that is gone no
+  longer holds its connection: one silent for 30 s gets a ping, and is
+  closed unless it answers within 20 s. With no request waiting, an
+  answer's body is closed as soon as the answer is out, not when the
+  next request arrives, and every body is closed exactly once; a
+  `close` that raises no longer loses the request taken with its answer.
+- Kino's listener now asks for the longest accept queue the kernel
+  allows (`net.core.somaxconn`, 4096 on current Linux) where it had 128,
+  so on Linux a burst of new connections no longer loses SYNs and waits
+  a second to retry. While Kino is not accepting, that many clients now
+  wait connected: overload shows as a slow first byte, and a health
+  check that only opens a TCP connection passes for longer. macOS, at
+  128 by default, is unchanged.
+- A server booting on a unix socket path, its listener's or its control
+  plane's, no longer waits on Linux when a live server there has a full
+  accept queue: it is refused at once. A crashed server's socket is
+  still reclaimed at the next boot; a path that holds something other
+  than a socket is now refused, where Linux used to delete it. On macOS
+  a boot can still take the path of a live server whose accept queue is
+  full, and two boots at the same instant on a stale path can both bind
+  it; a `pidfile` the two share prevents both.
 - In ractor mode the default worker count is now the CPU count capped
   at `RUBY_MAX_CPU` (8 unless set), so a default boot no longer warns
   on machines with more than 8 cores. An explicit `workers` is
@@ -109,6 +143,10 @@
   throughput and mean latency, but with four clients on a 0.6 ms
   endpoint the median rose from 1.2 to 2.4 ms while the 99th percentile
   fell from 56 to 3 ms.
+- `rack.input` reads cost less: each read takes its bytes from an
+  offset into what Kino pulled from the client, sharing them or filling
+  the caller's buffer, where it used to cut and copy them. A 500 KiB
+  upload read 4 KiB at a time spends about a sixth of the time it did.
 - Fixed `Server.run`, the `kino` executable and the Rack handler
   waiting for the workers to exit rather than for the shutdown to end:
   after INT or TERM the process could exit with its pidfile and socket
@@ -118,6 +156,11 @@
   exiting at all. They now return once the shutdown has ended and
   raise its error if it failed, so the process exits non-zero. A
   `shutdown` called during another now waits for it.
+- Fixed `Server#shutdown` with a `timeout:` that is NaN, negative or not
+  a number: it is now refused with an `ArgumentError` before the
+  shutdown begins, leaving the server serving and no `Server#wait`
+  seeing the error, and such a `shutdown_timeout` fails at boot.
+  `Float::INFINITY` still waits for the drain however long it takes.
 - Fixed a worker that waited for its next request leaving for good when
   another thread called `Thread#wakeup` or `Thread#run` on it: it took
   the wake for a shutdown, nothing replaced it, and requests sent its
@@ -140,10 +183,45 @@
   ractor mode, the client now gets a 500 at once and a fresh thread
   takes its place, counted in `respawns` and
   `kino_worker_respawns_total`.
+- Fixed `SERVER_PORT` for a request whose `Host` (or HTTP/2
+  `:authority`) names no port: it is now the port of the listener that
+  took the request (80 on a unix socket), where a process running more
+  than one server reported the port of whichever saw that host first.
+- Fixed a complete response going out with the app's `Content-Length`
+  when that disagreed with its body: on a kept-alive HTTP/1.1
+  connection, the rest of a longer body was read as the next response,
+  or a shorter one swallowed the start of the next, and over HTTP/2 the
+  client got a mismatched length. A complete body now goes out with its
+  own length, and an app's own `Transfer-Encoding` on it is dropped
+  (beside a `Content-Length` it used to make Kino close the connection
+  unanswered); an app that compresses its body says so in
+  `Content-Encoding`.
+- Fixed HTTP/2 answers that may carry no body: one to a HEAD request,
+  Kino's own 500, 503 and 504 included, sent its body, and so did a 204
+  or 304 the app streamed, while a 204 sent a `Content-Length`; clients
+  built on nghttp2, such as curl, refuse either as a protocol error.
+  Such answers now carry no body, and a 204 no length.
 - Fixed a streamed response cut short, as the app raised mid-stream or
   its worker crashed, sometimes reaching its client as nothing at all,
   head included, rather than as what was written followed by the cut,
   over HTTP/1.1 and HTTP/2 alike.
+- Fixed requests in threaded mode waiting for seconds under sustained
+  load. A worker that kept finding requests queued held the GVL until
+  Ruby's 100 ms timer took it away, most often in the middle of a
+  request, which then waited for every other worker thread's 100 ms:
+  over two seconds with 8 workers of 3 threads. A request handed to an
+  idle worker could wait as long. A worker now lets the threads waiting
+  for the GVL run between two requests once it has held it for a
+  millisecond, plus the request it was running. On 8 CPUs the slowest
+  response of a CPU-bound endpoint went from 2.3 s to 26 ms at the same
+  throughput, while its median rose from 2.2 to 3.4 ms (with `lanes
+  true`, where a request waits for its own worker, from 0.16 to 3.7 ms).
+  Where workers otherwise rarely hand the GVL over it costs throughput:
+  plain-text responses gave up 5% with `io_shards true`, and 2% under a
+  `worker_loop` (1% with 16 clients), whose waits in its own scheduler
+  Kino does not see, so it may pass the GVL again right after one. Ractor
+  mode with more than one thread per worker gets the same bound; with
+  one, the default, it is unchanged.
 
 ## [0.7.2] - 2026-10-24
 

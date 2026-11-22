@@ -37,6 +37,9 @@ pub struct ServerConfig {
     pub lanes: bool,
     /// Each worker runs its own loop under the app's fiber scheduler (lanes only).
     pub worker_loop: bool,
+    /// Worker threads share a GVL (:threaded mode, or `threads` past one in a Ractor), which each
+    /// passes between items once it has held it long (shared_gvl.rs).
+    pub shared_gvl: bool,
     /// False pins every connection to HTTP/1.
     pub http2: bool,
     pub log_requests: bool,
@@ -75,6 +78,7 @@ impl TryFrom<RHash> for ServerConfig {
             },
             lanes: optional(hash, "lanes")?.unwrap_or(false),
             worker_loop: optional(hash, "worker_loop")?.unwrap_or(false),
+            shared_gvl: false,
             // Default true guards embedders calling the native layer directly.
             http2: optional(hash, "http2")?.unwrap_or(true),
             log_requests: optional(hash, "log_requests")?.unwrap_or(false),
@@ -97,6 +101,12 @@ impl TryFrom<RHash> for ServerConfig {
             control_token: optional(hash, "control_token")?,
             unix_path: None,
         };
+        // Ruby refuses this up front: a queue of none would turn every request away.
+        if config.queue_depth == 0 {
+            let ruby = Ruby::get_with(hash);
+            let error = "queue_depth must be a positive Integer (got 0)";
+            return Err(Error::new(ruby.exception_arg_error(), error));
+        }
         // Guards embedders calling the native layer directly; Ruby refuses this up front.
         if config.worker_loop && !config.lanes {
             let ruby = Ruby::get_with(hash);
@@ -106,6 +116,7 @@ impl TryFrom<RHash> for ServerConfig {
         // Absent or below the floor means a fixed pool.
         let topology = &mut config.topology;
         topology.max_workers = topology.max_workers.max(topology.workers);
+        config.shared_gvl = topology.mode == "threaded" || topology.threads > 1;
         Ok(config)
     }
 }

@@ -149,6 +149,41 @@ RSpec.describe "Rack 3 compliance" do
     end
   end
 
+  describe "a Rack 3 streaming body that responds to close" do
+    each_mode do |mode|
+      it "is closed once its call returned or raised, while a partial hijack's callable is left to the app", :quiet do
+        streams = Ractor.make_shareable(ReportingStreamingBody.new(reports.port, false))
+        raises = Ractor.make_shareable(ReportingStreamingBody.new(reports.port, true))
+        hijack = Ractor.make_shareable(ReportingHijack.new(reports.port))
+        ignored = Ractor.make_shareable(ReportingIgnoredBody.new(reports.port))
+        app = Ractor.shareable_proc do |env|
+          case env["PATH_INFO"]
+          when "/raise" then [200, {}, raises]
+          when "/partial" then [200, {"content-length" => "8", "rack.hijack" => hijack}, ignored]
+          else [200, {}, streams]
+          end
+        end
+        # rack.hijack is offered on a request that asks to upgrade.
+        get = lambda do |port, path, connection = "Connection: close"|
+          raw_exchange(port, "GET #{path} HTTP/1.1\r\nHost: kino\r\n#{connection}\r\n\r\n")
+        end
+
+        with_server(app, mode: mode, workers: 1, threads: 1) do |_host, port|
+          expect(get.call(port, "/")).to start_with("HTTP/1.1 200").and(include("streamed"))
+          expect(reports.next(timeout: 2, awaiting: "close of the streaming body")).to eq(:body_closed)
+
+          expect(get.call(port, "/raise")).to include("streamed")
+          expect(reports.next(timeout: 2, awaiting: "close of the body that raised")).to eq(:body_closed)
+
+          expect(get.call(port, "/partial", "Upgrade: chat\r\nConnection: Upgrade")).to include("hijacked")
+          expect(reports.next(timeout: 2, awaiting: "close of the ignored body")).to eq(:ignored_body_closed)
+        end
+
+        expect(reports).to be_empty, "a body closed twice, or the server closed the hijack callable"
+      end
+    end
+  end
+
   describe "a stream closed while another thread writes to it" do
     # /stream's body writes 12.5 MiB from a thread of its own, which
     # blocks on a client that reads nothing, then closes the stream from
@@ -226,4 +261,35 @@ RSpec.describe "Rack 3 compliance" do
       end
     end
   end
+end
+
+# A Rack 3 streaming body that writes "streamed", raising after it when
+# `raises`, and reports its close on `port`.
+ReportingStreamingBody = Data.define(:port, :raises) do
+  def call(stream)
+    stream.write("streamed")
+    raise "the streaming body failed" if raises
+    stream.close
+  end
+
+  def close = port << :body_closed
+end
+
+# A partial hijack's callable that responds to close too: the app's to
+# close, as the hijacked stream is.
+ReportingHijack = Data.define(:port) do
+  def call(stream)
+    stream.write("hijacked")
+    stream.close
+  end
+
+  def close = port << :hijack_closed
+end
+
+# The body a partial hijack's response carries, which the server ignores
+# but closes.
+ReportingIgnoredBody = Data.define(:port) do
+  def to_ary = []
+
+  def close = port << :ignored_body_closed
 end

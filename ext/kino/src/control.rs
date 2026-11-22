@@ -77,6 +77,11 @@ const CONTROL_DEADLINE: Duration = Duration::from_secs(5);
 /// Concurrent monitoring connections; probes and scrapers need a
 /// handful, connections past the cap are dropped at accept.
 const CONTROL_MAX_CONNECTIONS: usize = 16;
+/// The TCP control listener's accept queue, pinned at std's 128: monitors connect a few at a
+/// time, and past it, at a stuck control thread, a probe fails at connect rather than wait on a
+/// handshake nobody answers. A unix control socket keeps the kernel's maximum: on Linux a full
+/// unix queue holds a blocking connect rather than fail it.
+const CONTROL_BACKLOG: libc::c_int = 128;
 
 /// A bound control listener: TCP with its resolved port, or a unix socket
 /// with its path.
@@ -93,6 +98,7 @@ pub fn bind_control(addr: &str) -> std::io::Result<ControlBind> {
         Ok(ControlBind::Unix(listener, path.to_path_buf()))
     } else {
         let listener = std::net::TcpListener::bind(addr)?;
+        let _ = crate::listen::set_backlog(&listener, CONTROL_BACKLOG);
         listener.set_nonblocking(true)?;
         let port = listener.local_addr()?.port();
         Ok(ControlBind::Tcp(listener, port))

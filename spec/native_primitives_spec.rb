@@ -67,6 +67,53 @@ RSpec.describe "native primitives" do
     end
   end
 
+  # A raise into a thread that waits without the GVL comes out of the
+  # native as any exception does, and leaves nothing held behind it.
+  describe "Thread#raise into a native's wait" do
+    it "raises out of Kino.sleep's wait within a tick, and it sleeps again afterwards" do
+      slept = Thread::Queue.new
+      thread = Thread.new do
+        Kino.sleep(30)
+      rescue => e
+        slept << e
+        Kino.sleep(0.05)
+        :slept_again
+      end
+      wait_for("the thread asleep in Kino.sleep") { thread.status == "sleep" }
+      error = nil
+      raised = timed do
+        thread.raise(RuntimeError, "raised into a sleep")
+        error = slept.pop(timeout: 1)
+      end
+
+      expect(raised).to be < 0.5, "the raise took #{raised.round(2)} s to come out of Kino.sleep"
+      expect(error&.backtrace&.first).to include("Kino::Native.sleep_chunk")
+      expect(thread.value).to eq(:slept_again)
+    end
+
+    it "raises out of the shutdown's wait for hijacked connections, and the server serves on and stops" do
+      with_server(->(_env) { [200, {}, ["ok"]] }) do |host, port, server|
+        id = server.instance_variable_get(:@id)
+        # Delivered at the wait itself: deferred until a blocking point,
+        # which the native's release is.
+        error = Thread.new do
+          Thread.handle_interrupt(RuntimeError => :on_blocking) do
+            Thread.current.raise(RuntimeError, "raised into the wait")
+            Kino::Native.close_bridges(id)
+          end
+          nil
+        rescue => e
+          e
+        end.value
+
+        expect(error&.message).to eq("raised into the wait")
+        expect(error.backtrace.first).to include("Kino::Native.close_bridges")
+        expect(Net::HTTP.get(host, "/", port)).to eq("ok")
+        expect(timed { server.shutdown }).to be < 2
+      end
+    end
+  end
+
   describe "panic containment" do
     it "surfaces a native panic as a RuntimeError instead of killing the process" do
       expect { Kino::Native._test_panic }.to raise_error(

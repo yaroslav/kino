@@ -5,6 +5,11 @@
 Warning[:experimental] = false
 
 require "kino"
+require "net/http"
+
+# Net::HTTP sends an idempotent request again, once, when its connection
+# fails; a request the server lost would then pass unseen.
+Net::HTTP.default_configuration = {max_retries: 0}
 
 Dir[File.join(__dir__, "support", "**", "*.rb")].each { |f| require f }
 

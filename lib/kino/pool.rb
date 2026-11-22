@@ -8,6 +8,9 @@ module Kino
   # critical section of its change. Quarantine: `replace` marks slots first; a crash or exit
   # meanwhile withholds them from the bank, and `unmark` releases them if the quarantine fails.
   class Pool
+    # The crash of a worker thread killed short of its loop's end, which no rescue sees.
+    KILLED = "the worker's thread was killed"
+
     def initialize(server_id, app, workers:, threads:, batch: 1, hooks: nil, on_worker_exit: nil)
       @server_id = server_id
       @app = app

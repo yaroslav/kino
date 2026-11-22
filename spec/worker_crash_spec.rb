@@ -73,10 +73,6 @@ RSpec.describe "worker crashes" do
     end
   end
 
-  def get_response(port, path)
-    Net::HTTP.start("127.0.0.1", port, read_timeout: 5) { |http| http.get(path) }
-  end
-
   # On "/crash", once `gate` (if any) opens, crashes its worker thread,
   # or with `ractor: true` takes its whole ractor down.
   def gated_crash_app(gate, ractor: false)
@@ -240,7 +236,7 @@ RSpec.describe "worker crashes" do
     end
 
     it "leaves alone the worker that took over a crashed worker's slot when a retirement or quarantine meant " \
-      "for the crashed one comes late", :quiet do
+    "for the crashed one comes late", :quiet do
       with_server(crashing_app, mode: mode, workers: 1, threads: 1) do |_host, port, server|
         id = server_id(server)
         expect(get_response(port, "/").body).to eq("ok")
@@ -290,7 +286,7 @@ RSpec.describe "worker crashes" do
     end
 
     it "gives a crashed thread's slot back to the bank when quarantine replaces its worker before the crash " \
-      "is recovered", :quiet do
+    "is recovered", :quiet do
       held = Thread::Queue.new
       resume = Thread::Queue.new
       with_server(crashing_app, mode: mode, workers: 1, threads: 2) do |_host, port, server|
@@ -366,6 +362,43 @@ RSpec.describe "worker crashes" do
         end
 
         expect(log).to include("worker-0 crashed; respawning at once · Exception: took its ractor down (")
+      end
+
+      it "counts one respawn when its ractor's main thread is killed as a crashed thread's replacement is on its way" do
+        app = Ractor.shareable_proc do |env|
+          raise Exception, "crashed at /boom" if env["PATH_INFO"] == "/boom" # rubocop:disable Lint/RaiseException
+          Thread.main.kill.then { Kino.sleep(5) } if env["PATH_INFO"] == "/kill-main"
+          [200, {}, ["ok"]]
+        end
+        capture_native_stderr do
+          with_server(app, mode: mode, workers: 1, threads: 2) do |_host, port, server|
+            expect(get(port, "/")).to eq("ok")
+            # The crashed thread's slot leaves the bank, then is held on its way to the thread.
+            pool = server.instance_variable_get(:@pool)
+            claimed, resume, answered = Array.new(3) { Thread::Queue.new }
+            allow(pool).to receive(:claim_slot).and_wrap_original do |claim, *args, &block|
+              claim.call(*args, &block).tap do |id|
+                claimed << id
+                resume.pop(timeout: 5)
+              end
+            end
+            allow(pool).to receive(:answer).and_wrap_original do |answer, *args|
+              answer.call(*args)
+            ensure
+              answered << true
+            end
+
+            expect(get_response(port, "/boom").code).to eq("500")
+            expect(claimed.pop(timeout: 5)).not_to be_nil, "no slot was claimed for the crashed thread"
+            expect(get_response(port, "/kill-main").code).to eq("500")
+            wait_for("the killed ractor respawned") { get(port, "/") == "ok" }
+            resume << :go
+            expect(answered.pop(timeout: 5)).to be(true)
+            expect(server.stats[:respawns]).to eq(1), "the replacement thread never ran, yet counted"
+          ensure
+            resume&.close
+          end
+        end
       end
 
       it "backs off respawning a worker ractor that dies as it boots, and stops waiting at shutdown" do
@@ -561,46 +594,37 @@ RSpec.describe "Ruby interrupts into an idle worker" do
           end
         end
 
-        # A StandardError raised out of the take that rode a response is
-        # that request's, as any failure of its delivery is: logged and
-        # handed to on_error; out of any other take, it crashes the worker.
-        # The request sent right after it lands within the tick of the wait
-        # the raise woke, which takes it with the raise pending.
-        it "answers a request sent right after Thread#raise into an idle worker, and keeps serving" do
-          log = capture_native_stderr do
-            with_poked_server(mode, lanes) do |server, _exits|
-              expect(get(server.port, "/poke/raise")).to eq("ok")
-              expect(reports.next(awaiting: "report of its raise")).to eq(:poked)
-              client = client_socket(server.port)
-              client.write("GET / HTTP/1.1\r\nHost: kino\r\n\r\n")
+        # An idle worker waits in a take that rode no answer (its last
+        # answer found nothing waiting, and closed its body first), so a
+        # StandardError raised out of it crashes the worker, as out of any
+        # take that rode no answer; the replacement answers the request
+        # sent right after it, which the wait the raise woke put back.
+        {"raise" => [RuntimeError, "raised into an idle worker"],
+         "crash" => [Exception, "crashed an idle worker"]}.each do |how, (error_class, message)|
+          it "respawns an idle worker that Thread#raise crashed with #{error_class}, whose replacement answers " \
+            "the request sent right after it" do
+            log = capture_native_stderr do
+              with_poked_server(mode, lanes) do |server, exits|
+                expect(get(server.port, "/poke/#{how}")).to eq("ok")
+                expect(reports.next(awaiting: "report of its raise")).to eq(:poked)
+                client = client_socket(server.port)
+                client.write("GET / HTTP/1.1\r\nHost: kino\r\n\r\n")
 
-              answer = client.wait_readable(2) ? client.readpartial(4096) : "no answer within 2 s"
-              expect(answer).to start_with("HTTP/1.1 200")
-              expect(server.stats[:served]).to eq(2), "the request was taken more than once"
-              expect(Array.new(2) { get(server.port, "/") }).to all(eq("ok"))
-            ensure
-              client&.close
+                answer = client.wait_readable(2) ? client.readpartial(4096) : "no answer within 2 s"
+                expect(answer).to start_with("HTTP/1.1 200")
+                error = exits.pop(timeout: 5)
+                expect([error.class, error&.message]).to eq([error_class, message])
+                wait_for("the replacement counted") { server.stats[:respawns] == 1 }
+                expect(server.stats[:served]).to eq(2), "the request was taken more than once"
+                expect(Array.new(2) { get(server.port, "/") }).to all(eq("ok"))
+                expect(server.stats[:respawns]).to eq(1)
+              ensure
+                client&.close
+              end
             end
+
+            expect(log).to include("crashed").and(include("#{error_class}: #{message}"))
           end
-
-          expect(log).to include("RuntimeError: raised into an idle worker")
-        end
-
-        it "replaces an idle worker that Thread#raise crashed" do
-          log = capture_native_stderr do
-            with_poked_server(mode, lanes) do |server, exits|
-              expect(get(server.port, "/poke/crash")).to eq("ok")
-              expect(reports.next(awaiting: "report of its raise")).to eq(:poked)
-
-              error = exits.pop(timeout: 5)
-              expect(error.class).to eq(Exception)
-              expect(error.message).to eq("crashed an idle worker")
-              wait_for("the replacement") { server.stats[:respawns] == 1 }
-              expect(Array.new(3) { get(server.port, "/") }).to all(eq("ok"))
-            end
-          end
-
-          expect(log).to include("Exception: crashed an idle worker")
         end
       end
     end
@@ -776,5 +800,508 @@ class UncopyableCrash < Exception # rubocop:disable Lint/InheritException
   def initialize(message)
     super
     @callback = proc {}
+  end
+end
+
+# Thread#kill ends a worker's thread with no exception for any rescue to
+# see. Done by the app (in :ractor mode from a thread inside the worker's
+# Ractor), it crashes the worker all the same: what the worker held is
+# answered at once, and a new worker takes its place.
+RSpec.describe "a worker thread the app kills" do
+  def killed = "the worker's thread was killed"
+
+  # GET /kill leaves a thread behind that kills the worker thread serving
+  # it once that thread waits: for its next request, or under a
+  # worker_loop, with each of its jobs waiting. With ?held, the request
+  # itself waits 5 s, and is killed in that wait, never answered by the
+  # app. /kill-main kills its worker Ractor's main thread instead, and
+  # waits 5 s. /sleep waits 2 s (a fiber's wait under a worker_loop);
+  # anything else is "ok".
+  def killing_app
+    Ractor.shareable_proc do |env|
+      case env["PATH_INFO"]
+      when "/kill"
+        worker = Thread.current
+        Thread.new do
+          sleep 0.002 while worker.alive? && worker.status != "sleep"
+          sleep 0.005
+          worker.kill
+        end
+        sleep 5 if env["QUERY_STRING"] == "held"
+        [200, {}, ["ok"]]
+      when "/kill-main"
+        Thread.main.kill
+        sleep 5
+        [200, {}, ["not killed"]]
+      when "/sleep"
+        sleep 2
+        [200, {}, ["slept"]]
+      else
+        [200, {}, ["ok"]]
+      end
+    end
+  end
+
+  # killing_app on `workers` workers of `threads` threads; yields the
+  # port, the server and its worker exits (on_worker_exit's errors), and
+  # returns what the server logged.
+  def with_killing_server(mode, workers: 1, threads: 1, **opts)
+    exits = Thread::Queue.new
+    capture_native_stderr do
+      with_server(killing_app, mode: mode, workers: workers, threads: threads, **opts,
+        on_worker_exit: ->(_worker, error) { exits << error }) do |_, port, server|
+        yield port, server, exits
+      end
+    end
+  end
+
+  # GET /die waits at `gate`, then kills its worker's thread (`how`
+  # :kill) or raises an exception that is no StandardError; /sleep waits
+  # 3 s; anything else is "ok".
+  def dying_app(gate, how)
+    Ractor.shareable_proc do |env|
+      case env["PATH_INFO"]
+      when "/die"
+        gate.wait(10)
+        Thread.current.kill if how == :kill
+        raise Exception, "died at its gate" # rubocop:disable Lint/RaiseException
+      when "/sleep"
+        sleep 3
+        [200, {}, ["slept"]]
+      else
+        [200, {}, ["ok"]]
+      end
+    end
+  end
+
+  # A worker Ractor of 2 threads under a worker_loop, whose main thread a
+  # request kills while another is in flight, then served for a second:
+  # what came of it, as a JSON line.
+  def main_kill_scenario
+    <<~RUBY
+      #{scenario_prelude}
+      app = Ractor.shareable_proc do |env|
+        case env["PATH_INFO"]
+        when "/kill-main"
+          Thread.main.kill
+          sleep 5
+          [200, {}, ["not killed"]]
+        when "/sleep"
+          sleep 2
+          [200, {}, ["slept"]]
+        else
+          [200, {}, ["ok"]]
+        end
+      end
+      worker_loop = Ractor.shareable_proc do |worker|
+        Sync { |task| worker.serve(concurrency: 8) { |job| task.async { job.call } } }
+      end
+      opts = {mode: :ractor, workers: 1, threads: 2, worker_loop: worker_loop}
+      exits = Thread::Queue.new
+      server = Kino::Server.new(app, **opts, on_worker_exit: ->(_worker, error) { exits << error }).start
+      get = lambda do |path, within|
+        response = Net::HTTP.start("127.0.0.1", server.port, read_timeout: within, max_retries: 0) { |http| http.get(path) }
+        [response.code, response.body]
+      rescue Net::ReadTimeout
+        ["no answer within \#{within} s"]
+      end
+      now = -> { Process.clock_gettime(Process::CLOCK_MONOTONIC) }
+      until server.stats[:worker_status].size == 2 && get.call("/", 1) == %w[200 ok]
+        sleep 0.01
+      end
+      slots = server.stats[:worker_status].map { it[:index] }
+      sleeping = Thread.new { get.call("/sleep", 5) }
+      sleep 0.01 until server.stats[:in_flight] == 1
+      started = now.call
+      killed = get.call("/kill-main", 2)
+      took = now.call - started
+      error = exits.pop(timeout: 5)
+      answers = Array.new(10) { sleep 0.1; get.call("/", 1) }
+      rows = server.stats[:worker_status]
+      result = {
+        killed: killed, took: took, slept: sleeping.value, error: [error.class.name, error&.message],
+        answers: answers, later: Array.new(exits.size) { exits.pop.inspect }, respawns: server.stats[:respawns],
+        retired: rows.map { it[:retired] }, taken: rows.map { it[:index] }, slots: slots
+      }
+      server.shutdown
+      puts JSON.generate(result)
+    RUBY
+  end
+
+  each_mode do |mode|
+    # Killed idle (waiting for its next request), then killed in a
+    # request it holds, never answered by the app.
+    it "replaces a worker killed idle or in a request, as a crash, answers what it held at once, and serves on" do
+      log = with_killing_server(mode) do |port, server, exits|
+        expect(get_response(port, "/kill", within: 1)).to have_attributes(code: "200", body: "ok")
+        error = exits.pop(timeout: 5)
+        20.times do |n|
+          answer = get_response(port, "/", within: 1)
+          expect([answer.code, answer.body]).to eq(%w[200 ok]), "request #{n + 1} after the kill got #{answer.inspect}"
+        end
+        expect([error.class, error&.message]).to eq([Kino::Error, killed]), "on_worker_exit got #{error.inspect}"
+
+        answer = nil
+        took = timed { answer = get_response(port, "/kill?held", within: 2) }
+        expect(answer.code).to eq("500")
+        expect(took).to be < 0.5, "the 500 came #{took.round(2)} s after the request"
+        expect(Array.new(3) { get(port, "/", within: 1) }).to all(eq("ok"))
+        expect(server.stats).to include(respawns: 2)
+        took = timed { server.shutdown }
+        expect(took).to be < 1, "the shutdown took #{took.round(2)} s"
+      end
+
+      expect(log.scan("crashed; respawning at once · Kino::Error: #{killed}").size).to eq(2), log
+    end
+
+    it "crashes a worker_loop worker killed: what it held is answered at once, and a new worker serves" do
+      with_killing_server(mode, worker_loop: async_loop(8)) do |port, server, _exits|
+        held = Array.new(2) do
+          client_socket(port).tap { |socket| socket.write("GET /sleep HTTP/1.1\r\nhost: x\r\n\r\n") }
+        end
+        wait_for("both requests in flight") { server.stats[:in_flight] == 2 }
+
+        # Its connection ends with its answer, before the kill.
+        expect(raw_exchange(port, "GET /kill HTTP/1.1\r\nhost: x\r\nconnection: close\r\n\r\n"))
+          .to start_with("HTTP/1.1 200 OK\r\n")
+        statuses = nil
+        took = timed { statuses = held.map { |socket| read_response(socket, within: 1).first } }
+        expect(statuses).to all(start_with("HTTP/1.1 500 "))
+        expect(took).to be < 0.5, "the 500s came #{took.round(2)} s after the kill"
+        expect(server.stats[:worker_status].sum { it[:in_flight] }).to eq(0)
+
+        # Its replacement serves from here on.
+        wait_for("the killed worker replaced", timeout: 1) { server.stats[:respawns] == 1 }
+        expect(get_response(port, "/", within: 1)).to have_attributes(code: "200", body: "ok")
+        took = timed { server.shutdown }
+        expect(took).to be < 1, "the shutdown took #{took.round(2)} s"
+      ensure
+        held&.each(&:close)
+      end
+    end
+
+    it "counts no crash for the worker threads a process exit ends without a shutdown" do
+      status, _, output = run_bounded(<<~RUBY)
+        #{scenario_prelude}
+        app = Ractor.shareable_proc { |_env| [200, {}, ["ok"]] }
+        server = Kino::Server.new(app, mode: :#{mode}, workers: 2, threads: 2,
+          on_worker_exit: ->(worker, error) { $stderr.puts "on_worker_exit(\#{worker}, \#{error.inspect})" }).start
+        $stderr.puts "served: \#{Net::HTTP.get(URI("http://127.0.0.1:\#{server.port}/"))}"
+      RUBY
+
+      expect(status).to be_success, output
+      expect(output).to include("served: ok")
+      expect(output).not_to include("crashed")
+      expect(output).not_to include("replacement thread")
+      expect(output.scan(/on_worker_exit\(\d+, (.*)\)/).flatten.uniq - ["nil"]).to be_empty, output
+    end
+
+    it "turns away with a 503, counted as rejected, a dead worker's queued request that finds no lane room " \
+      "within queue_timeout, as a new arrival is" do
+      FileGate.closed do |gate|
+        log = capture_native_stderr do
+          with_server(dying_app(gate, :raise), mode: mode, workers: 2, threads: 1, lanes: true,
+            queue_timeout: 0.3) do |_, port, server|
+            # No replacement makes room: the pool's recovery of the crash
+            # waits until the queued requests are answered.
+            pool = server.instance_variable_get(:@pool)
+            resume = Thread::Queue.new
+            allow(pool).to receive(:forget_slots).and_wrap_original do |forget, *args|
+              resume.pop(timeout: 5)
+              forget.call(*args)
+            end
+            # A worker's own count: the server counts a request in flight
+            # before a worker has taken it, and a worker yet to take one
+            # takes the next ones too.
+            holding = -> { server.stats[:worker_status].map { |worker| worker[:in_flight] } }
+            busy = Thread.new { get_response(port, "/sleep") }
+            wait_for("one worker busy") { holding.call.sum == 1 }
+            # Its client outwaits every wait below, so one that times out
+            # fails as itself.
+            dying = Thread.new { get_response(port, "/die", within: 12) }
+            wait_for("the other worker at its gate") { holding.call == [1, 1] }
+            # Three behind each: the busy worker's lane has room for one
+            # of the dying worker's, and the other two wait for more.
+            queued = Array.new(6) do |n|
+              Thread.new { [get_response(port, "/#{n}").code, monotonic] }
+            end
+            depths = -> { server.stats[:lane_depths] }
+            wait_for("three queued behind each worker", detail: -> { depths.call.inspect }) { depths.call == [3, 3] }
+
+            opened = monotonic
+            gate.open
+            expect(dying.value.code).to eq("500")
+            turned_away = queued.map(&:value).select { |answer| answer.first == "503" }
+            resume << :go
+            expect(turned_away.size).to eq(2), "#{turned_away.size} of the queued requests got a 503"
+            late = turned_away.map { |_, at| (at - opened).round(2) }.max
+            expect(late).to be_between(0.3, 1.5), "the 503s came #{late} s after the worker died"
+            expect(server.stats[:rejected]).to eq(2)
+            expect(busy.value).to have_attributes(code: "200", body: "slept")
+          ensure
+            gate.open
+            resume&.close
+            [busy, dying, *queued].compact.each(&:join)
+          end
+        end
+        expect(log).to include("crashed")
+      end
+    end
+
+    it "answers within 0.5 s a request sent after an idle worker was killed, its sibling busy" do
+      with_killing_server(mode, workers: 2, lanes: true) do |port, server, exits|
+        busy = Thread.new { get_response(port, "/sleep") }
+        # A worker's own count: the server counts a request in flight
+        # before a worker has taken it, and the worker killed next could
+        # take it then.
+        wait_for("the sibling busy") do
+          server.stats[:worker_status].any? { |worker| worker[:in_flight].positive? }
+        end
+        expect(get_response(port, "/kill", within: 1)).to have_attributes(code: "200", body: "ok")
+        exits.pop(timeout: 5)
+
+        answer = nil
+        took = timed { answer = get_response(port, "/", within: 2) }
+        expect(answer).to have_attributes(code: "200", body: "ok")
+        expect(took).to be < 0.5, "the answer came #{took.round(2)} s after the request"
+        expect(busy.value).to have_attributes(code: "200", body: "slept")
+      ensure
+        busy&.join
+      end
+    end
+
+    if mode == :ractor
+      # In a Ruby of its own, bounded: a VM that faults or wedges as a
+      # Ractor ends fails here, by name.
+      # One thread in Kino's loop is "500s what a dying worker ractor
+      # held" above.
+      it "replaces a worker Ractor whose main thread was killed, as one crash, for good " \
+        "(a worker_loop of 2 threads, a request in flight beside it)" do
+        status, out, log = run_bounded(main_kill_scenario)
+        expect(status).to be_success, log
+        result = JSON.parse(out.lines.last)
+
+        expect(result["killed"].first).to eq("500")
+        expect(result["took"]).to be < 0.5, "the 500 came #{result["took"].round(2)} s after the request"
+        expect(result["slept"].first).to eq("500")
+        # The old Ractor's threads end before its replacement takes
+        # their slots: for a second on, each request is answered.
+        expect(result["answers"]).to all(eq(%w[200 ok]))
+        expect(result["error"]).to eq(["Kino::Error", "the worker ractor's main thread was killed"])
+        expect(result["later"]).to be_empty, "on_worker_exit fired again: #{result["later"]}"
+        expect(result["respawns"]).to eq(1)
+        expect(result["retired"]).to all(be(false))
+        expect(result["taken"]).to eq(result["slots"]),
+          "the replacement took slots #{result["taken"]}, not the killed Ractor's #{result["slots"]}"
+        expect(log.scan(/worker-\d crashed/).size).to eq(1), log
+      end
+    else
+      it "counts no crash for a worker thread the shutdown kills past its deadline" do
+        log = with_killing_server(mode) do |port, server, exits|
+          stuck = Thread.new { get_response(port, "/sleep") }
+          wait_for("the request in flight") { server.stats[:in_flight] == 1 }
+
+          server.shutdown(timeout: 0.3)
+          expect(stuck.value.code).to eq("500")
+          wait_for("the killed thread's exit") { !exits.empty? }
+          expect(exits.pop).to be_nil, "a straggler the shutdown killed went to on_worker_exit as a crash"
+        end
+
+        expect(log).not_to include("crashed")
+      end
+    end
+  end
+end
+
+# A body that tells what the server does with it, complete (ProbeBody::Complete) or streamed
+# (ProbeBody::Streamed). Its close fails with `on_close` :fails, as a middleware's after-response
+# hook that raises would; else it reports :closed on `port`, after a :closing and a wait at
+# `on_close` when that is a gate: an app's after-response work that hangs until the gate opens.
+ProbeBody = Data.define(:chunks, :port, :on_close) do
+  def initialize(chunks:, port: nil, on_close: nil) = super
+
+  def close
+    raise "the body's close failed" if on_close == :fails
+
+    if on_close
+      port << :closing
+      on_close.wait(10)
+    end
+    port << :closed
+  end
+end
+
+# Its chunks cannot be read when they are :unreadable (to_ary raises), or hold what is no String.
+class ProbeBody::Complete < ProbeBody
+  def to_ary = chunks.equal?(:unreadable) ? raise("the body's to_ary failed") : chunks
+end
+
+class ProbeBody::Streamed < ProbeBody
+  def each(&) = chunks.each(&)
+end
+
+RSpec.describe "a request that rode the fused answer of one whose body fails to close" do
+  # GET /first waits at `gate`, then answers with a body whose close
+  # fails; anything else is "second".
+  def failing_close_app(gate)
+    body = Ractor.make_shareable(ProbeBody::Complete.new(chunks: ["first"], on_close: :fails))
+    Ractor.shareable_proc do |env|
+      gate.wait(10) if env["PATH_INFO"] == "/first"
+      [200, {}, (env["PATH_INFO"] == "/first") ? body : ["second"]]
+    end
+  end
+
+  each_mode do |mode|
+    it "is served, and the close failure is the first request's, reported once" do
+      errors = reports.port
+      on_error = Ractor.shareable_proc { |e, env| errors << [e.message, env["PATH_INFO"]] }
+      FileGate.closed do |gate|
+        log = capture_native_stderr do
+          with_server(failing_close_app(gate), mode: mode, workers: 1, threads: 1, on_error: on_error) do |_, port, server|
+            first = Thread.new { get_response(port, "/first") }
+            wait_for("the first request in flight") { server.stats[:in_flight] == 1 }
+            second = client_socket(port)
+            second.write("GET /second HTTP/1.1\r\nHost: kino\r\n\r\n")
+            wait_for("the second request queued behind it") { server.stats[:queued] == 1 }
+
+            gate.open
+            expect(first.value.body).to eq("first")
+            answer = second.wait_readable(2) ? read_response(second) : ["no answer within 2 s"]
+            expect(answer.first).to eq("HTTP/1.1 200 OK")
+            expect(answer.last).to eq("second")
+            expect(reports.next(awaiting: "on_error")).to eq(["the body's close failed", "/first"])
+            expect(server.stats[:respawns]).to eq(0), "nothing crashed"
+          ensure
+            gate.open
+            first&.join
+            second&.close
+          end
+        end
+        expect(log.scan("the body's close failed").size).to eq(1), log
+        expect(reports).to be_empty, "on_error fired more than once"
+      end
+    end
+  end
+end
+
+RSpec.describe "a body whose answer raises before it is out" do
+  # Each way an answer goes out: the fused respond-and-take, a complete
+  # answer sent apart from the take (an after_request_complete hook is
+  # set), and a streamed one; with the body each takes, and whether the
+  # server has the hook.
+  ways = {
+    "fused answer" => [ProbeBody::Complete, false],
+    "complete answer sent before its hook" => [ProbeBody::Complete, true],
+    "streamed answer" => [ProbeBody::Streamed, false]
+  }
+
+  each_mode do |mode|
+    ways.each do |way, (kind, hooked)|
+      # /bad's head cannot be built, so sending it raises, as the fused
+      # take does when a Thread#raise comes back with it; /good's goes
+      # out. The closes are counted once the server is shut down, when
+      # every way has closed every body it took.
+      it "closes the body of a #{way} once, whether its head can be built or not", :quiet do
+        body = Ractor.make_shareable(kind.new(chunks: ["body"], port: reports.port))
+        app = Ractor.shareable_proc do |env|
+          (env["PATH_INFO"] == "/bad") ? [200, {"x-bad" => "a\nb"}, body] : [200, {}, body]
+        end
+        opts = hooked ? {after_request_complete: Ractor.shareable_proc { |_env, _status| }} : {}
+        with_server(app, mode: mode, workers: 1, threads: 1, **opts) do |_, port, _server|
+          expect(get_response(port, "/bad").code).to eq("500")
+          expect(reports.next(timeout: 2, awaiting: "close of the body it could not send")).to eq(:closed)
+          expect(Array.new(2) { get(port, "/good") }).to all(eq("body"))
+        end
+
+        expect(Array.new(2) { reports.next(timeout: 2, awaiting: "close of a body it sent") }).to all(eq(:closed))
+        expect(reports).to be_empty, "a body closed more than once"
+      end
+    end
+  end
+end
+
+RSpec.describe "a body whose close fails after its answer did" do
+  ways = {
+    "complete answer sent before its hook" => [ProbeBody::Complete, true],
+    "streamed answer" => [ProbeBody::Streamed, false]
+  }
+
+  each_mode do |mode|
+    ways.each do |way, (kind, hooked)|
+      # The answer's head cannot be built, so sending it raises; then
+      # the body's close raises too.
+      it "reports both failures of a #{way}, the answer's not lost behind the close's", :quiet do
+        errors = reports.port
+        on_error = Ractor.shareable_proc { |e, _env| errors << e.message }
+        body = Ractor.make_shareable(kind.new(chunks: ["body"], on_close: :fails))
+        app = Ractor.shareable_proc { |_env| [200, {"x-bad" => "a\nb"}, body] }
+        opts = hooked ? {after_request_complete: Ractor.shareable_proc { |_env, _status| }} : {}
+        with_server(app, mode: mode, workers: 1, threads: 1, on_error: on_error, **opts) do |_, port, _server|
+          expect(get_response(port, "/").code).to eq("500")
+          reported = Array.new(2) { reports.next(timeout: 2, awaiting: "both failures reported") }
+          expect(reported).to include("the body's close failed")
+          expect(reported.uniq.size).to eq(2), "on_error got #{reported}"
+        end
+        expect(reports).to be_empty, "more failures reported than happened"
+      end
+    end
+  end
+end
+
+# Its chunks are joined by the same Ruby in either mode: ractor mode pins it.
+RSpec.describe "a complete body whose chunks cannot be read" do
+  [[false, :to_ary], [true, :chunk]].each do |hooked, fails|
+    it "is closed once, and its client gets a 500 (#{hooked ? "sent before its hook" : "fused"}, " \
+      "#{(fails == :to_ary) ? "to_ary raises" : "a chunk is no String"})", :quiet do
+      chunks = (fails == :to_ary) ? :unreadable : ["a", 1]
+      body = Ractor.make_shareable(ProbeBody::Complete.new(chunks: chunks, port: reports.port))
+      app = Ractor.shareable_proc { |env| (env["PATH_INFO"] == "/bad") ? [200, {}, body] : [200, {}, ["ok"]] }
+      opts = hooked ? {after_request_complete: Ractor.shareable_proc { |_env, _status| }} : {}
+      with_server(app, mode: :ractor, workers: 1, threads: 1, **opts) do |_, port, _server|
+        expect(get_response(port, "/bad").code).to eq("500")
+        expect(reports.next(timeout: 2, awaiting: "close of the body it could not read")).to eq(:closed)
+        expect(get(port, "/")).to eq("ok")
+      end
+      expect(reports).to be_empty, "the body closed more than once"
+    end
+  end
+end
+
+RSpec.describe "a fused answer's body" do
+  each_mode do |mode|
+    it "closes before its next request, on a worker that has nothing to take next", :quiet do
+      body = Ractor.make_shareable(ProbeBody::Complete.new(chunks: ["answered"], port: reports.port))
+      app = Ractor.shareable_proc { |_env| [200, {}, body] }
+      with_server(app, mode: mode, workers: 1, threads: 1) do |_, port, _server|
+        2.times do
+          expect(get(port, "/")).to eq("answered")
+          # With no next request, a body that closes only at the next take never does.
+          expect(reports.next(timeout: 2, awaiting: "close of the body with no request behind it")).to eq(:closed)
+        end
+      end
+      expect(reports).to be_empty, "a body closed more than once"
+    end
+
+    # /stuck's body reports when its close begins, then waits at `gate`;
+    # anything else answers "sibling".
+    it "keeps its worker busy while it closes, so a close that hangs reads as a wedge and requests go to " \
+      "a sibling", :quiet do
+      FileGate.closed do |gate|
+        stuck = Ractor.make_shareable(ProbeBody::Complete.new(chunks: ["answered"], port: reports.port, on_close: gate))
+        app = Ractor.shareable_proc { |env| (env["PATH_INFO"] == "/stuck") ? [200, {}, stuck] : [200, {}, ["sibling"]] }
+        with_server(app, mode: mode, workers: 2, threads: 1, lanes: true) do |_, port, server|
+          expect(get(port, "/stuck", within: 1)).to eq("answered")
+          expect(reports.next(awaiting: "the stuck close to begin")).to eq(:closing)
+
+          wait_for("the worker in the close to read as busy", timeout: 2) do
+            server.stats[:worker_status].any? { |row| row[:in_flight] == 1 && row[:busy_ms].positive? }
+          end
+          expect(get(port, "/", within: 1)).to eq("sibling")
+        ensure
+          gate.open
+        end
+        expect(reports.next(awaiting: "the close to end")).to eq(:closed)
+      end
+    end
   end
 end

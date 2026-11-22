@@ -8,6 +8,7 @@ use crate::registry::ServerInner;
 
 /// The dispatcher prefers awake lanes, so a hot worker never pays a futex wake.
 #[derive(Default)]
+#[repr(align(128))]
 pub struct Park {
     pub parked: AtomicBool,
     /// ServerInner::park_seq at its last park (0 = never); among idle workers the last is warmest.
@@ -17,6 +18,8 @@ pub struct Park {
     /// Socket events since a take last looked at the lane, a wake counting as a whole run
     /// (queue::OWN_RUN), so neither a flooding socket nor a self-waking hook starves requests.
     pub own_run: AtomicU32,
+    /// Owner only: when it last got the GVL back from a park or a pass (mono us), for shared_gvl.
+    gvl_since_us: AtomicU64,
 }
 
 impl Park {
@@ -45,6 +48,18 @@ impl Park {
             doorbell.disarm();
             self.unpark();
         }
+    }
+
+    /// Its worker got a shared GVL back, from a park or a pass, at `now` (mono us).
+    #[inline]
+    pub fn got_gvl(&self, now: u64) {
+        self.gvl_since_us.store(now, Ordering::Relaxed);
+    }
+
+    /// Since when its worker has held a shared GVL (mono us).
+    #[inline]
+    pub fn held_gvl_since(&self) -> u64 {
+        self.gvl_since_us.load(Ordering::Relaxed)
     }
 
     #[inline]

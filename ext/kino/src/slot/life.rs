@@ -6,10 +6,14 @@ use parking_lot::Mutex;
 
 /// Which worker is on the slot, and how it is to leave.
 #[derive(Default)]
+#[repr(align(128))]
 pub struct Life {
     /// Moves on whenever a worker leaves the slot or the slot goes to a new one, so a Waker
     /// or a retirement meant for one worker cannot reach a later one.
     pub generation: AtomicU64,
+    /// Generation plus one of the worker handle holding the slot (queue::Worker) until it lets
+    /// go, else 0, as a Ractor's threads may outlive Ractor#value (hold, holds, let_go).
+    pub holder: AtomicU64,
     /// Set by the scaler, or by abort: dispatch skips the slot and the take loop ends at its
     /// next idle tick. Cleared by reset_under.
     pub retired: AtomicBool,
@@ -27,6 +31,30 @@ pub struct Life {
 impl Life {
     pub fn generation(&self) -> u64 {
         self.generation.load(Ordering::SeqCst)
+    }
+
+    /// A worker's handle takes the slot at its generation, which it returns: the handle's name
+    /// for its hold.
+    pub fn hold(&self) -> u64 {
+        let generation = self.generation();
+        self.holder.store(generation + 1, Ordering::SeqCst);
+        generation
+    }
+
+    /// Whether the handle that took the slot at `generation` still holds it.
+    pub fn holds(&self, generation: u64) -> bool {
+        self.holder.load(Ordering::SeqCst) == generation + 1
+    }
+
+    /// That handle lets go, once: false when it held the slot no more.
+    pub fn let_go(&self, generation: u64) -> bool {
+        let (held, seq) = (generation + 1, Ordering::SeqCst);
+        self.holder.compare_exchange(held, 0, seq, seq).is_ok()
+    }
+
+    /// Whether any handle holds the slot: its last worker's keeps it from the next.
+    pub fn is_held(&self) -> bool {
+        self.holder.load(Ordering::SeqCst) != 0
     }
 
     /// Exact under the lane lock (see WorkerSlot::retire_at), and for the worker's own exit.

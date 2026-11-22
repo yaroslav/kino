@@ -121,11 +121,8 @@ fn wakes_until_its_worker_takes_one_ring_one_doorbell_and_count_once() {
     assert!(slot.wake(), "so can one already due to wake");
     let bells = slot.lane.rx.as_ref().expect("lane").len();
     assert_eq!(bells, 1, "two wakes ring one doorbell");
-    let taken = worker.checkout().expect("take");
-    assert!(
-        matches!(taken, Some((_, Item::Wake))),
-        "the worker takes :wake"
-    );
+    let taken = worker.waiting(&server).expect("take");
+    assert_eq!(kind(&taken), "wake", "the worker takes :wake");
     let again = ready(&server, &slot);
     assert_eq!(again, "nothing", "the two wakes are taken as one");
     assert_eq!(
@@ -292,7 +289,7 @@ fn what_a_worker_loop_worker_waits_for_rings_its_doorbell() {
         ("a socket event, its lane full", Room::Events, LANE_DEPTH, |_, slot, _| { socket_sends(slot, 0); slot.notify() }, "event"),
         ("a job's end, a request waiting", Room::Events, 1, |_, _, worker| Worker::ring(worker), "nothing"),
         ("the drain closing the lanes", Room::All, 0, |server, _, _| server.close_queues(), "the end"),
-        ("its worker crashing", Room::All, 0, |_, slot, _| slot.abort(crate::response::Cut::Crash), "the end"),
+        ("its worker crashing", Room::All, 0, |_, slot, _| drop(slot.abort(crate::response::Cut::Crash)), "the end"),
     ];
     for (arrival, room, waiting, arrive, takes) in rows {
         let server = TestServer::worker_loop().workers(1).build();
@@ -548,4 +545,48 @@ fn the_shutdowns_interrupt_ends_a_parked_take_whatever_the_vm_has_pending() {
         matches!(taken, Ok(None)),
         "a wait after the shutdown's interrupt must end as a shutdown"
     );
+}
+
+/// What a worker's checkout took: the request, admitted as take_one admits it (the env aside),
+/// its handle kept as Ruby would keep it.
+fn checked_out(server: &ServerInner, worker: &Worker, slot: &Arc<WorkerSlot>) -> BoxedCtx {
+    let taken = worker.waiting(server).expect("take");
+    let mut ctx = super::testing::expect_request(taken);
+    super::worker::enlist(server, slot, &mut ctx);
+    ctx
+}
+
+#[test]
+fn a_worker_coming_back_for_more_answers_what_it_took_and_left_unanswered() {
+    let server = TestServer::lanes().workers(1).build();
+    let slot = slot(&server, 0);
+    let worker = Worker::new(&server, 0, slot.clone());
+    let (left, mut left_client) = crate::request::test_ctx_with_client();
+    let (answered, mut answered_client) = crate::request::test_ctx_with_client();
+    for ctx in [left, answered, crate::request::test_ctx()] {
+        assert!(slot
+            .send_lane(crate::registry::LaneItem::Request(ctx))
+            .is_ok());
+    }
+
+    let left = checked_out(&server, &worker, &slot);
+    let answered = checked_out(&server, &worker, &slot);
+    assert_eq!(
+        left_client
+            .try_recv()
+            .expect("an answer as the worker came back, its handle still alive")
+            .status(),
+        500
+    );
+    assert!(answered
+        .responder
+        .send_response(crate::response::plain_response(200, "ok")));
+    let _last = checked_out(&server, &worker, &slot);
+
+    assert_eq!(
+        answered_client.try_recv().expect("its answer").status(),
+        200,
+        "an answered request is left alone"
+    );
+    drop((left, answered));
 }

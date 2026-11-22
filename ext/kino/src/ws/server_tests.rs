@@ -738,7 +738,7 @@ async fn a_crashed_workers_sockets_close_with_1011_whatever_their_readers_waited
         }
 
         assert_eq!(
-            slot(&server, 0).crash(),
+            slot(&server, 0).crash(&server),
             1,
             "the crashed worker had one socket"
         );

@@ -1,0 +1,10 @@
+# The GVL is released through gvl::call alone and passed through gvl::pass
+# alone: gvl.rs runs the VM's interrupts in protected calls, so a raise
+# never jumps over Rust frames. A release or a pass anywhere else would.
+disallowed-methods = [
+    { path = "rb_sys::rb_thread_call_without_gvl", reason = "release the GVL through crate::gvl" },
+    { path = "rb_sys::rb_thread_call_without_gvl2", reason = "release the GVL through crate::gvl" },
+    { path = "rb_sys::rb_nogvl", reason = "release the GVL through crate::gvl" },
+    { path = "rb_sys::rb_thread_schedule", reason = "pass the GVL through crate::gvl::pass" },
+    { path = "magnus::Ruby::thread_schedule", reason = "pass the GVL through crate::gvl::pass" },
+]

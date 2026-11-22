@@ -4,6 +4,9 @@
 //! module that talks to rb-sys directly. Everything blocking (queue pops,
 //! body reads/writes) must release the GVL through here, so other Ruby threads
 //! in the same ractor keep running and the VM can interrupt us via the UBF.
+//! Every release is rb_thread_call_without_gvl2, which checks no interrupts: Kino runs them in
+//! protected calls (released, park), so a raise comes back as Err, never jumping over Rust frames.
+//! The one other GVL hand-over, `pass`, is rb_thread_schedule in a protected call too.
 
 use std::any::Any;
 use std::ffi::c_void;
@@ -17,6 +20,7 @@ use magnus::{Error, Ruby};
 /// needs to interrupt the blocking region (Thread#kill, VM shutdown, ...).
 /// Implementations must be async-signal-safe in spirit: no locks, no Ruby
 /// API. Its flag stays borrowed for as long as the release it is handed to runs.
+#[derive(Clone, Copy)]
 pub struct Ubf<'a> {
     func: unsafe extern "C" fn(*mut c_void),
     data: *mut c_void,
@@ -41,7 +45,8 @@ unsafe extern "C" fn ubf_interrupt(data: *mut c_void) {
     flag.store(true, Ordering::SeqCst);
 }
 
-/// What a release runs, then what it returned or the panic it raised.
+/// What a release runs, then what it returned or the panic it raised. A release that did not
+/// run it leaves it there.
 type Slot<F, R> = (Option<F>, Option<std::thread::Result<R>>);
 
 unsafe extern "C" fn trampoline<F, R>(arg: *mut c_void) -> *mut c_void
@@ -51,7 +56,7 @@ where
     // SAFETY: `arg` is the Slot<F, R> that `call` hands its release,
     // borrowed by nothing else until the release returns.
     let slot = unsafe { &mut *(arg as *mut Slot<F, R>) };
-    let f = slot.0.take().expect("without_gvl trampoline called twice");
+    let f = slot.0.take().expect("a release ran its work twice");
     // A panic must not unwind into the VM's C frame beneath us (that
     // aborts the process); catch it here and let the caller rethrow it
     // as a Ruby exception once the GVL is held again.
@@ -59,17 +64,12 @@ where
     std::ptr::null_mut()
 }
 
-/// rb_thread_call_without_gvl (interrupt checks around `f`) or _gvl2 (none; skips a pending one).
-type Release = unsafe extern "C" fn(
-    Option<unsafe extern "C" fn(*mut c_void) -> *mut c_void>,
-    *mut c_void,
-    rb_sys::rb_unblock_function_t,
-    *mut c_void,
-) -> *mut c_void;
-
+/// Run what `slot` holds with the GVL released, unless an interrupt is pending (without_gvl2).
 /// Always inlined, so each release stays a direct call, its slot on the caller's own frame.
 #[inline(always)]
-fn call<F, R>(release: Release, slot: &mut Slot<F, R>, ubf: Option<Ubf<'_>>)
+// The crate's one GVL release (clippy.toml bars the others).
+#[allow(clippy::disallowed_methods)]
+fn call<F, R>(slot: &mut Slot<F, R>, ubf: Option<Ubf<'_>>)
 where
     F: FnOnce() -> R,
 {
@@ -77,12 +77,11 @@ where
         Some(u) => (Some(u.func), u.data),
         None => (None, std::ptr::null_mut()),
     };
-    // SAFETY: `slot` is borrowed for as long as `release` runs, which runs
-    // `trampoline::<F, R>` on it at most once. The VM calls the unblock
-    // function only while `release` runs, which the Ubf's borrow of its
-    // data outlives.
+    // SAFETY: `slot` is borrowed for as long as the release runs, which runs `trampoline::<F, R>`
+    // on it at most once. The VM calls the unblock function only while the release runs, which
+    // the Ubf's borrow of its data outlives.
     unsafe {
-        release(
+        rb_sys::rb_thread_call_without_gvl2(
             Some(trampoline::<F, R>),
             slot as *mut Slot<F, R> as *mut c_void,
             ubf_func,
@@ -103,42 +102,85 @@ fn panic_error(payload: Box<dyn Any + Send>) -> Error {
     } else {
         "opaque panic payload".to_string()
     };
-    let ruby = Ruby::get().expect("without_gvl requires a Ruby thread");
+    let ruby = Ruby::get().expect("a release runs on a Ruby thread");
     Error::new(
         ruby.exception_runtime_error(),
         format!("Kino: panic in native blocking call: {msg}"),
     )
 }
 
+fn check_ints() -> Result<(), Error> {
+    Ruby::get()
+        .expect("a release runs on a Ruby thread")
+        .thread_check_ints()
+}
+
 /// Run `f` with the GVL released. Blocks the current Ruby thread but lets
 /// every other Ruby thread (in this ractor) run in parallel.
+/// Pending interrupts run before and after `f` in protected calls: a raise comes back as Err.
 ///
-/// `f` MUST NOT touch any Ruby API. If `ubf` fires, `f` is responsible for
-/// noticing (e.g. a message on an interrupt channel) and returning promptly;
-/// pending VM interrupts are then delivered once we're back in Ruby.
+/// `f` MUST NOT touch any Ruby API. The VM's unblock function raises `woken`, if any: `f` is
+/// responsible for noticing and returning promptly.
 ///
 /// A panic in `f` comes back as `Err` (RuntimeError with the panic
 /// message); the default panic hook still reports it to stderr first.
-pub fn without_gvl<F, R>(f: F, ubf: Option<Ubf<'_>>) -> Result<R, Error>
-where
-    F: FnOnce() -> R,
-{
-    let mut slot = (Some(f), None);
-    call(rb_sys::rb_thread_call_without_gvl, &mut slot, ubf);
-    match slot.1.expect("without_gvl block did not run") {
-        Ok(value) => Ok(value),
-        Err(payload) => Err(panic_error(payload)),
+pub fn released<R>(f: impl FnOnce() -> R, woken: Option<&AtomicBool>) -> Result<R, Error> {
+    let unread = AtomicBool::new(false);
+    released_by(&mut Released, woken.unwrap_or(&unread), f)
+}
+
+/// released, where `parker` waits: tests stand in for the VM.
+pub(crate) fn released_by<P: Parker, R>(
+    parker: &mut P,
+    woken: &AtomicBool,
+    f: impl FnOnce() -> R,
+) -> Result<R, P::Error> {
+    let mut f = Some(f);
+    loop {
+        let ran = parker.release(woken, || f.take().map(|f| f()));
+        parker.check_ints()?;
+        if let Some(ran) = ran?.flatten() {
+            return Ok(ran);
+        }
     }
 }
 
-/// Release the GVL and run `attempt` until it returns Some, or Ok(None) once `flag` rises. A
-/// pending VM interrupt raises past the caller's frames afterwards, so only the test natives use
+/// Run `f` with the GVL released, or held while an interrupt is pending: `f` always runs, and
+/// no interrupt runs here (for paths that cannot pass an error on); a panic comes back as Err.
+pub fn released_or_held<R>(f: impl FnOnce() -> R) -> Result<R, Error> {
+    let (unread, mut f) = (AtomicBool::new(false), Some(f));
+    let ran = Released
+        .release(&unread, || f.take().map(|f| f()))?
+        .flatten();
+    match f {
+        Some(f) => catch_unwind(AssertUnwindSafe(f)).map_err(panic_error),
+        None => Ok(ran.expect("a release that took its work ran it")),
+    }
+}
+
+/// Thread.pass: the threads waiting for this GVL run first, and this one returns once it holds it
+/// again, at once when none waits. Its interrupt check runs in a protected call: a raise comes
+/// back as Err.
+// rb_thread_schedule is barred for its unprotected interrupt check, which this protects.
+#[allow(clippy::disallowed_methods)]
+pub fn pass() -> Result<(), Error> {
+    magnus::rb_sys::protect(|| {
+        // SAFETY: called on a Ruby thread holding its GVL, as every caller of this crate's
+        // natives is.
+        unsafe { rb_sys::rb_thread_schedule() };
+        rb_sys::Qnil as rb_sys::VALUE
+    })?;
+    Ok(())
+}
+
+/// Release the GVL and run `attempt` until it returns Some, or Ok(None) once `flag` rises; Err
+/// when `attempt` panicked or a pending VM interrupt raised (released). Only the test natives use
 /// this: what Ruby can interrupt mid-request parks.
 pub fn interruptible<T>(
     flag: &AtomicBool,
     mut attempt: impl FnMut() -> Option<T>,
 ) -> Result<Option<T>, Error> {
-    without_gvl(
+    released(
         || loop {
             if flag.load(Ordering::SeqCst) {
                 return None;
@@ -147,7 +189,7 @@ pub fn interruptible<T>(
                 return Some(result);
             }
         },
-        Some(Ubf::interrupt(flag)),
+        Some(flag),
     )
 }
 
@@ -180,14 +222,12 @@ impl Parker for Released {
     ) -> Result<Option<R>, Error> {
         let mut slot = (Some(f), None);
         let ubf = Some(Ubf::interrupt(woken));
-        call(rb_sys::rb_thread_call_without_gvl2, &mut slot, ubf);
+        call(&mut slot, ubf);
         slot.1.map(|ran| ran.map_err(panic_error)).transpose()
     }
 
     fn check_ints(&mut self) -> Result<(), Error> {
-        Ruby::get()
-            .expect("park requires a Ruby thread")
-            .thread_check_ints()
+        check_ints()
     }
 }
 
@@ -253,7 +293,13 @@ pub enum Back<T> {
 
 #[cfg(test)]
 mod tests {
-    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+    use std::sync::Arc;
+
+    use parking_lot::Mutex;
+
+    use super::released_by;
+    use crate::testing::InPlace;
 
     #[test]
     fn ubf_sets_the_interrupt_flag() {
@@ -262,5 +308,88 @@ mod tests {
         // SAFETY: as the VM calls it, while the flag is borrowed.
         unsafe { (ubf.func)(ubf.data) };
         assert!(flag.load(Ordering::SeqCst));
+    }
+
+    /// The VM's pending interrupts, as the test sets them: none, a wake
+    /// (Thread#wakeup, which only ends the wait), or a raise.
+    #[derive(Clone, Copy, PartialEq)]
+    enum Pending {
+        Nothing,
+        Wake,
+        Raise,
+    }
+
+    /// Runs what `pending` holds, as rb_thread_check_ints would, and
+    /// takes it, counting the runs.
+    fn interrupts<'a>(
+        pending: &'a Mutex<Pending>,
+        flag: &'a AtomicBool,
+        runs: &'a AtomicUsize,
+    ) -> impl FnMut() -> Result<(), &'static str> + 'a {
+        move || {
+            runs.fetch_add(1, Ordering::SeqCst);
+            flag.store(false, Ordering::SeqCst);
+            match std::mem::replace(&mut *pending.lock(), Pending::Nothing) {
+                Pending::Raise => Err("Thread#raise"),
+                Pending::Wake | Pending::Nothing => Ok(()),
+            }
+        }
+    }
+
+    #[test]
+    fn a_raise_comes_back_with_the_work_unrun_or_its_result_dropped_and_a_wake_runs_it_once() {
+        // What the VM has pending as the release would start, and whether
+        // a raise comes as the work runs.
+        let rows = [
+            (Pending::Raise, false),
+            (Pending::Wake, false),
+            (Pending::Nothing, true),
+        ];
+        for (before, during) in rows {
+            let held = Arc::new(());
+            let (pending, flag, runs) = (
+                Mutex::new(before),
+                AtomicBool::new(before != Pending::Nothing),
+                AtomicUsize::new(0),
+            );
+            let ran_work = AtomicUsize::new(0);
+            let work = {
+                let (held, pending, ran_work) = (held.clone(), &pending, &ran_work);
+                move || {
+                    ran_work.fetch_add(1, Ordering::SeqCst);
+                    if during {
+                        *pending.lock() = Pending::Raise;
+                    }
+                    held
+                }
+            };
+
+            // A release as rb_thread_call_without_gvl2 makes it, in place: with an interrupt
+            // pending (the flag) it leaves the work where it is; else it runs it.
+            let mut parker = InPlace {
+                release: |_: &AtomicBool, run: &mut dyn FnMut()| {
+                    if !flag.load(Ordering::SeqCst) {
+                        run();
+                    }
+                },
+                interrupts: interrupts(&pending, &flag, &runs),
+            };
+            let result = released_by(&mut parker, &AtomicBool::new(false), work);
+            let (raised, ran) = (matches!(result, Err("Thread#raise")), result.is_ok());
+            drop(result);
+            let (work_runs, checks) =
+                (ran_work.load(Ordering::SeqCst), runs.load(Ordering::SeqCst));
+            match before {
+                // The interrupts run before the work and after it.
+                Pending::Wake => assert!(ran && work_runs == 1 && checks == 2, "a wake"),
+                Pending::Raise => assert!(raised && work_runs == 0, "a raise pending"),
+                Pending::Nothing => assert!(raised && work_runs == 1, "a raise as it ran"),
+            }
+            assert_eq!(
+                Arc::strong_count(&held),
+                1,
+                "what the work held, or returned, outlived it"
+            );
+        }
     }
 }

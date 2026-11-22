@@ -83,7 +83,7 @@ fn server_where(workers: &[Was]) -> (Arc<ServerInner>, Vec<QueuedSocket>) {
             }
             Retired => slot.retire(),
             Crashed => {
-                slot.crash();
+                slot.crash(&server);
             }
             Reset => {
                 slot.retire();
@@ -111,9 +111,9 @@ fn server_where(workers: &[Was]) -> (Arc<ServerInner>, Vec<QueuedSocket>) {
 /// lane is) or "closed" (every lane is).
 fn dispatch(server: &ServerInner, ctx: BoxedCtx) -> &'static str {
     match try_dispatch(server, ctx) {
-        Attempt::Break(true) => "sent",
+        Attempt::Break(Ok(())) => "sent",
         Attempt::Continue(_) => "full",
-        Attempt::Break(false) => "closed",
+        Attempt::Break(Err(_)) => "closed",
     }
 }
 
@@ -663,4 +663,56 @@ async fn a_request_that_finds_no_lane_room_within_queue_timeout_gives_up() {
         );
         assert_eq!(server.lane_room.waiting(), 0);
     }
+}
+
+#[test]
+fn a_dead_workers_late_end_never_touches_the_worker_that_took_its_slot_over() {
+    let server = TestServer::worker_loop().workers(1).build();
+    let (slot, dead) = boot(&server, 0);
+    // Its Ractor ended, and the supervisor gave up on it, while its
+    // thread still unwinds.
+    slot.crash(&server);
+    assert!(
+        slot.recycle().is_none(),
+        "the slot went to a new worker while its last one still held it"
+    );
+
+    crate::queue::Worker::crashed(&dead);
+    crate::queue::Worker::release(&dead);
+    assert!(slot.recycle().is_some(), "a slot let go of is recycled");
+    let (_, taker) = boot(&server, 0);
+    slot.load.capacity.store(8, Ordering::Relaxed);
+    let generation = slot.generation();
+    // The successor took a request it has not answered yet.
+    let (ctx, mut client) = crate::request::test_ctx_with_client();
+    assert!(slot.send_lane(LaneItem::Request(ctx)).is_ok());
+    let serving = admit_next(&server, &slot);
+
+    // Its end, come again.
+    crate::queue::Worker::crashed(&dead);
+    crate::queue::Worker::release(&dead);
+    drop(dead);
+    assert!(
+        matches!(
+            client.try_recv(),
+            Err(tokio::sync::oneshot::error::TryRecvError::Empty)
+        ),
+        "a dead worker's handle answered a request its successor serves"
+    );
+    assert_eq!(
+        slot.load.current.lock().len(),
+        1,
+        "the successor's request left its in-flight list"
+    );
+    assert_eq!(
+        (
+            slot.life.retired.load(Ordering::SeqCst),
+            slot.load.capacity.load(Ordering::Relaxed),
+            slot.generation()
+        ),
+        (false, 8, generation),
+        "a dead worker's handle retired, emptied or moved on the slot its successor holds"
+    );
+    assert_eq!(dispatch(&server, test_ctx()), "sent");
+    drop((serving, taker));
 }

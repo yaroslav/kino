@@ -193,7 +193,11 @@ RSpec.describe "graceful shutdown" do
 
     it "keeps serving, scaling included, after a shutdown that fails before it stops accepting" do
       boot(mode, slow_app, max_workers: 2) do |server, dir|
-        expect { server.shutdown(timeout: "soon") }.to raise_error(TypeError)
+        # The shutdown fails at its first step, before anything stopped.
+        scaler = server.instance_variable_get(:@pool_scaler)
+        allow(scaler).to receive(:stop).and_raise(RuntimeError, "the pool scaler would not stop")
+        expect { server.shutdown }.to raise_error(RuntimeError, "the pool scaler would not stop")
+        allow(scaler).to receive(:stop).and_call_original
 
         # Queue pressure still grows the pool.
         burst = Array.new(3) { request_in_background(dir) }
@@ -202,6 +206,29 @@ RSpec.describe "graceful shutdown" do
         server.shutdown
         expect(File.exist?("#{dir}/kino.pid")).to be(false)
       end
+    end
+
+    it "refuses a timeout that is NaN, negative or not a number to its caller alone, and serves on" do
+      app = Ractor.shareable_proc { |_env| [200, {"content-type" => "text/plain"}, ["ok"]] }
+      bad = [Float::NAN, -1, "soon"]
+      refusal = ->(timeout) { /timeout must be a non-negative number of seconds \(got #{Regexp.escape(timeout.inspect)}\)/ }
+      server = Kino::Server.new(app, mode: mode, workers: 1, threads: 1)
+      # Not started yet, the server refuses one all the same.
+      bad.each { |timeout| expect { server.shutdown(timeout:) }.to raise_error(ArgumentError, refusal.call(timeout)) }
+      server.start
+      waiter = Thread.new do
+        server.wait
+        :ended
+      end
+      wait_for("a caller waiting on the server") { waiter.status == "sleep" }
+
+      bad.each { |timeout| expect { server.shutdown(timeout:) }.to raise_error(ArgumentError, refusal.call(timeout)) }
+
+      expect(Net::HTTP.get_response("127.0.0.1", "/", server.port).code).to eq("200")
+      server.shutdown
+      expect(waiter.value).to eq(:ended)
+    ensure
+      server&.shutdown(timeout: 0)
     end
 
     # A signal's shutdown runs on a thread of its own, beside the main
