@@ -12,5 +12,8 @@ doc/benchmarks.md
 doc/rails-on-ractors.md
 doc/websockets.md
 doc/worker-loop.md
+doc/configuration.md
+doc/operations.md
+doc/streaming.md
 CHANGELOG.md
 LICENSE.txt

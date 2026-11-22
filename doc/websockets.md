@@ -363,7 +363,7 @@ request has a connection of its own to hand over.
 - **Partial hijack**: a callable in the `rack.hijack` response header
   gets the response stream once the head is out, as a Rack 3 streaming
   body does, and `after_request_complete` fires once it returns. As for
-  any [streamed response](../README.md#streaming-responses), a write
+  any [streamed response](streaming.md#streaming-responses), a write
   raises `Kino::ClientGone` once the client has gone.
 - **A 101 with a callable**: a 101 answered with a partial hijack, or
   with a Rack 3 streaming body (`[101, headers, ->(io) { }]`), goes out

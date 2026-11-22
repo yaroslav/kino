@@ -193,7 +193,7 @@ Whatever blocks the thread instead holds every fiber on the worker:
 
 Body I/O otherwise behaves as in Kino's own loop. A write raises
 `Kino::ClientGone` once the client has gone or Kino has cut the stream
-(see [Streaming responses](../README.md#streaming-responses)), and a
+(see [Streaming responses](streaming.md#streaming-responses)), and a
 body read still waiting on its client when shutdown passes its deadline
 raises `RuntimeError` ("Kino: request interrupted during shutdown").
 Beyond that:
